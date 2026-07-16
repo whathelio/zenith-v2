@@ -1,0 +1,37 @@
+# CFTC 合约配置 — TFF (Traders in Financial Futures) + Disaggregated
+# 修改此文件可增删合约，无需改代码
+
+# API endpoints
+cftc_tff_url: "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+cftc_disagg_url: "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+
+# TFF: Equity, Fixed Income, Interest Rates, FX/Crypto
+tff:
+  # 股指
+  - {name: "标普500",        cftc: "E-MINI S&P 500 -",   section: "股指",   yf: "^GSPC"}
+  - {name: "纳斯达克100",    cftc: "NASDAQ MINI",          section: "股指",   yf: "^NDX"}
+  - {name: "罗素2000",       cftc: "RUSSELL E-MINI",       section: "股指",   yf: "^RUT"}
+  - {name: "MSCI新兴市场",   cftc: "MSCI EM INDEX",        section: "股指",   yf: "EEM"}
+  - {name: "MSCI发达市场",   cftc: "MSCI EAFE",            section: "股指",   yf: "EFA"}
+  - {name: "日经225",        cftc: "NIKKEI STOCK AVERAGE", section: "股指",   yf: "^N225"}
+  # 债券
+  - {name: "2年期美债",      cftc: "UST 2Y NOTE",          section: "债券",   yf: "ZT=F"}
+  - {name: "10年期美债",     cftc: "UST 10Y NOTE",         section: "债券",   yf: "ZN=F"}
+  - {name: "超长期美债",     cftc: "ULTRA UST BOND",       section: "债券",   yf: "UB=F"}
+  # 利率
+  - {name: "联邦基金",       cftc: "FED FUNDS",            section: "利率",   yf: "ZQ=F"}
+  # 外汇/加密
+  - {name: "欧元/美元",      cftc: "EURO FX - CHICAGO",             section: "外汇/加密", yf: "EURUSD=X"}
+  - {name: "英镑/美元",      cftc: "BRITISH POUND",                 section: "外汇/加密", yf: "GBPUSD=X"}
+  - {name: "日元/美元",      cftc: "JAPANESE YEN",                  section: "外汇/加密", yf: "JPYUSD=X"}
+  - {name: "澳元/美元",      cftc: "AUSTRALIAN DOLLAR",             section: "外汇/加密", yf: "AUDUSD=X"}
+  - {name: "比特币",         cftc: "BITCOIN - CHICAGO MERCANTILE",  section: "外汇/加密", yf: "BTC-USD"}
+
+# Disaggregated: Energy, Metals, Agriculture
+disagg:
+  - {name: "WTI原油",   cftc: "WTI-PHYSICAL",       section: "能源",   yf: "CL=F"}
+  - {name: "天然气",    cftc: "NAT GAS NYME",       section: "能源",   yf: "NG=F"}
+  - {name: "铜",        cftc: "COPPER- #1",         section: "金属",   yf: "HG=F"}
+  - {name: "黄金",      cftc: "GOLD - COMMODITY",   section: "金属",   yf: "GC=F"}
+  - {name: "白银",      cftc: "SILVER - COMMODITY", section: "金属",   yf: "SI=F"}
+  - {name: "玉米",      cftc: "CORN - CHICAGO",     section: "农产品", yf: "ZC=F"}

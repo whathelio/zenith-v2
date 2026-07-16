@@ -1,0 +1,43 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+envs/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Frontend build artifacts are KEPT (dist/) so users can run without Node.js
+
+# User data
+data/*.db
+data/*.sqlite
+data/.deps_installed
+data/logs/
+data/distill/
+data/code_temp/
+
+# Config (may contain API keys)
+config/config.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

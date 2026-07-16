@@ -1,0 +1,26 @@
+# Zenith v2 配置文件
+# 首次使用请修改 api_key 为你的 API Key
+# 支持 SiliconFlow / OpenAI 兼容接口
+
+# 必填：你的 API Key
+api_key: ""
+
+# API 地址（默认 SiliconFlow）
+api_base: "https://api.siliconflow.cn/v1"
+
+# 模型名称
+model: "deepseek-ai/DeepSeek-V3"
+
+# 生成参数
+temperature: 0.7
+max_tokens: 4096
+
+# 记忆提取频率（每隔 N 轮对话）
+memory_extract_interval: 5
+
+# 自动蒸馏（对话结束自动提取经验/决定/知识）
+auto_distill_enabled: true
+
+# 市场分析（每日 07:00 自动运行）
+market_analysis_enabled: true
+market_analysis_time: "07:00"
