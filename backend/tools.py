@@ -8,6 +8,7 @@ from .database import sch_add, sch_list, sch_update, note_add, note_list, note_u
 from .database import prediction_list, prediction_get_hit_rate
 from .database import skill_add, skill_get, skill_increment_usage
 from . import knowledge_service
+from .config import is_code_execution_enabled
 
 logger = logging.getLogger("zenith.tools")
 
@@ -711,6 +712,11 @@ def _handle_list_notes(args: dict) -> dict:
 
 
 async def _handle_execute_code(args: dict) -> dict:
+    if not is_code_execution_enabled():
+        return {
+            "success": False,
+            "result": "代码执行已禁用。在 config.yaml 设 code_execution_enabled: true 启用（仅限本地单用户，多用户部署见 SECURITY.md）",
+        }
     from .code_runner import run
     r = await run(args.get("code", ""))
     return {"success": r["success"], "result": r["output"]}

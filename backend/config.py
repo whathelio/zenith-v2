@@ -25,7 +25,7 @@ SYSTEM_PROMPT = (
     "2. 记忆管理 — 自动记录重要信息，后续对话中引用\n"
     "3. 日程管理 — 发现日程意图自动提议记录\n"
     "4. 笔记管理 — 捕捉值得保存的想法和观点\n"
-    "5. 代码执行 — 安全沙箱中运行 Python 代码\n"
+    "5. 代码执行 — 在代码运行器中执行 Python 代码（非隔离，仅限本地单用户）\n"
     "6. 上下文压缩 — 长对话自动生成摘要\n"
     "7. 网页访问 — 读取网页内容或主动联网搜索最新信息\n"
     "8. 内容总结 — 分析任意链接（文章/B站/GitHub/视频），生成结构化摘要\n"
@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "system_prompt": SYSTEM_PROMPT,
     "code_exec_timeout": 30,
     "max_code_output": 10000,
+    # 代码执行开关（默认关闭。开源仓库面向未知部署者，需显式开启。
+    # 本地单用户可在 config.yaml 设为 true。多用户部署必须先用 Docker 隔离，见 SECURITY.md）
+    "code_execution_enabled": False,
     "context_compress_threshold": 20,
     "memory_extract_interval": 5,
     "auto_distill_enabled": True,
@@ -127,3 +130,8 @@ def get_max_tokens() -> int:
 
 def get_system_prompt() -> str:
     return load_config().get("system_prompt", DEFAULT_CONFIG["system_prompt"])
+
+
+def is_code_execution_enabled() -> bool:
+    """代码执行是否启用。默认关闭，需在 config.yaml 显式设 code_execution_enabled: true。"""
+    return bool(load_config().get("code_execution_enabled", False))

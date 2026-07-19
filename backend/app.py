@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
 from .database import conv_update_summary
-from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG
+from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled
 from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
 from .llm_client import chat_stream, plan_time, call_llm
 from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate
@@ -1751,6 +1751,14 @@ async def apply_skill_improvement(sid: int, data: dict = Body(default=None)):
 
 @app.post("/api/code/run")
 async def run_code(data: dict = Body(default=None)):
+    if not is_code_execution_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={
+                "success": False,
+                "output": "代码执行已禁用。在 config.yaml 设 code_execution_enabled: true 启用（仅限本地单用户，多用户部署见 SECURITY.md）",
+            },
+        )
     from .code_runner import run
     return await run(data.get("code", ""), timeout=data.get("timeout", 30))
 

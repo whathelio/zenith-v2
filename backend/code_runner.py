@@ -1,4 +1,11 @@
-"""Zenith v2 Python 代码沙箱 — subprocess + tempfile + timeout"""
+"""Zenith v2 Python 代码运行器（非沙箱）
+
+⚠️ 安全警告：本模块仅在子进程中执行代码，不提供任何真正的隔离。
+   - 子进程继承主服务全部权限（可读写任意文件、执行系统命令）
+   - 无内存/CPU/磁盘配额（仅 timeout 限制）
+   - 无网络隔离（可 import socket/requests 外带数据）
+   仅适用于本地单用户场景。多用户/公网部署必须改用 Docker 隔离，见 SECURITY.md。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +19,8 @@ TEMP = Path(__file__).parent.parent / "data" / "code_temp"
 
 async def run(code: str, timeout: int = 30) -> dict:
     """
-    在隔离的 subprocess 中安全执行 Python 代码。
+    在子进程中执行 Python 代码（非隔离）。
+    调用前必须已检查 config.is_code_execution_enabled()。
     Returns: {"success": bool, "output": str}
     """
     TEMP.mkdir(parents=True, exist_ok=True)

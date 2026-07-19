@@ -21,6 +21,11 @@ memory_extract_interval: 5
 # 自动蒸馏（对话结束自动提取经验/决定/知识）
 auto_distill_enabled: true
 
+# 代码执行（默认关闭）
+# ⚠️ 代码运行器不是沙箱，无任何隔离。仅限本地单用户启用。
+# 多用户/公网部署必须用 Docker 隔离，详见 SECURITY.md
+code_execution_enabled: false
+
 # 市场分析（每日 07:00 自动运行）
 market_analysis_enabled: true
 market_analysis_time: "07:00"
