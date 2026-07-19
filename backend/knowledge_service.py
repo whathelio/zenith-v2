@@ -95,12 +95,22 @@ async def list_tasks(status: Optional[str] = None, limit: int = 20) -> dict:
 
 async def ingest_pdf(filename: str, content: bytes) -> dict:
     """转发 PDF 上传到 api_gateway /ingest。"""
-    async with httpx.AsyncClient(timeout=120.0) as c:
-        r = await c.post(
-            f"{KNOWLEDGE_API_BASE}/ingest",
-            headers=_headers(),
-            files={"file": (filename, content, "application/pdf")},
-        )
-        if r.status_code >= 400:
-            return {"error": r.text, "code": f"HTTP_{r.status_code}"}
-        return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            r = await c.post(
+                f"{KNOWLEDGE_API_BASE}/ingest",
+                headers=_headers(),
+                files={"file": (filename, content, "application/pdf")},
+            )
+            if r.status_code >= 400:
+                return {"error": r.text, "code": f"HTTP_{r.status_code}"}
+            return r.json()
+    except httpx.ConnectError as e:
+        logger.warning("knowledge ingest gateway down: %s", e)
+        return {"error": "知识库服务未启动", "code": "GATEWAY_DOWN"}
+    except httpx.TimeoutException as e:
+        logger.warning("knowledge ingest timeout: %s", e)
+        return {"error": "知识库服务响应超时", "code": "GATEWAY_TIMEOUT"}
+    except Exception as e:
+        logger.exception("knowledge ingest failed: %s", e)
+        return {"error": str(e), "code": "INGEST_ERROR"}

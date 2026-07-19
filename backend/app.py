@@ -344,8 +344,17 @@ async def knowledge_ingest(file: UploadFile = File(...)):
     """上传 PDF → 审查 → 入库（转发到 api_gateway）"""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "仅支持 PDF")
-    content = await file.read()
-    return await knowledge_service.ingest_pdf(file.filename, content)
+    try:
+        content = await file.read()
+        result = await knowledge_service.ingest_pdf(file.filename, content)
+    except Exception as e:
+        logger.exception("knowledge ingest failed")
+        return JSONResponse(status_code=502, content={"error": str(e), "code": "INGEST_FAILED"})
+    if result.get("code") in ("GATEWAY_DOWN", "GATEWAY_TIMEOUT"):
+        return JSONResponse(status_code=502, content=result)
+    if result.get("error"):
+        return JSONResponse(status_code=502, content=result)
+    return result
 
 
 @app.post("/api/open-url")

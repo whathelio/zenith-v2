@@ -616,7 +616,17 @@ export const api = {
     const fd = new FormData()
     fd.append('file', file)
     const res = await fetch(BASE + '/knowledge/ingest', { method: 'POST', body: fd })
-    return res.json()
+    const text = await res.text()
+    let json: any
+    try {
+      json = text ? JSON.parse(text) : {}
+    } catch {
+      throw new Error(`上传失败：服务返回非 JSON 响应 (${res.status})`)
+    }
+    if (!res.ok) {
+      throw new Error(json.error || `上传失败 (${res.status})`)
+    }
+    return json
   },
 }
 
