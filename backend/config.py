@@ -135,3 +135,28 @@ def get_system_prompt() -> str:
 def is_code_execution_enabled() -> bool:
     """代码执行是否启用。默认关闭，需在 config.yaml 显式设 code_execution_enabled: true。"""
     return bool(load_config().get("code_execution_enabled", False))
+
+
+_DOCKER_AVAILABLE_CACHE = None
+
+
+def docker_available() -> bool:
+    """Docker 是否安装且守护进程运行中。用于 code_runner 选择执行路径。
+
+    缓存结果避免每次执行代码都检测。
+    """
+    global _DOCKER_AVAILABLE_CACHE
+    if _DOCKER_AVAILABLE_CACHE is not None:
+        return _DOCKER_AVAILABLE_CACHE
+    import subprocess
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        _DOCKER_AVAILABLE_CACHE = True
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        _DOCKER_AVAILABLE_CACHE = False
+    return _DOCKER_AVAILABLE_CACHE
