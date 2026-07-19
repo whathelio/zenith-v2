@@ -1649,3 +1649,238 @@ textarea.form-input {
   -webkit-appearance: none;
   margin: 0;
 }
+
+/* ──────────────────────────────────────────
+   Chat Layout (ChatView 纳入 AppLayout 后)
+   ────────────────────────────────────────── */
+.chat-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.chat-conv-panel {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--color-border);
+  background: var(--color-bg-sidebar);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  overflow: hidden;
+  transition: width 0.2s ease;
+}
+.chat-conv-panel.collapsed {
+  width: 36px;
+  align-items: center;
+  padding: 6px 4px;
+}
+.conv-toggle {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 8px;
+  width: 28px;
+  height: 28px;
+  line-height: 1;
+}
+.conv-toggle:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.chat-conv-panel.collapsed .conv-toggle {
+  width: 28px;
+}
+.conv-new-icon {
+  background: var(--color-accent-primary);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 700;
+  width: 28px;
+  height: 28px;
+  line-height: 1;
+}
+.conv-new-icon:hover {
+  background: var(--color-accent-secondary);
+}
+.conv-dots {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  margin-top: 4px;
+  overflow-y: auto;
+  flex: 1;
+}
+.conv-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+  cursor: pointer;
+  opacity: 0.5;
+}
+.conv-dot:hover { opacity: 0.8; }
+.conv-dot.active {
+  background: var(--color-accent-primary);
+  opacity: 1;
+}
+.conv-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+.conv-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.conv-item {
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  transition: background 0.15s;
+}
+.conv-item:hover {
+  background: var(--color-bg-hover);
+}
+.conv-item.active {
+  background: var(--color-accent-primary);
+  color: #fff;
+}
+.conv-item-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.conv-item-meta {
+  font-size: 10px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.conv-item-del {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--color-accent-danger);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+}
+.conv-item:hover .conv-item-del {
+  display: inline;
+}
+.conv-item.active .conv-item-del {
+  color: #fff;
+  opacity: 0.7;
+}
+
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--color-bg-app);
+}
+.chat-toolbar {
+  height: 40px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--color-bg-panel);
+  flex-shrink: 0;
+}
+.chat-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 提议紧凑列表 — 左侧面板用 */
+.proposal-compact {
+  background: var(--color-bg-panel);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.proposal-compact-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-accent-secondary);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.proposal-compact-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--color-text-primary);
+  border-bottom: 1px solid var(--color-border);
+}
+.proposal-compact-item:last-child {
+  border-bottom: none;
+}
+.proposal-compact-item-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proposal-compact-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 6px;
+  line-height: 1.4;
+}
+.proposal-compact-btn.confirm {
+  color: var(--color-accent-success);
+  border-color: var(--color-accent-success);
+}
+.proposal-compact-btn.reject {
+  color: var(--color-accent-danger);
+  border-color: var(--color-accent-danger);
+}
+.proposal-compact-btn:hover {
+  background: var(--color-bg-hover);
+}

@@ -4,9 +4,10 @@ from __future__ import annotations
 import re
 import json
 import logging
-from .database import sch_add, sch_list, sch_update, note_add, note_list, mem_search
+from .database import sch_add, sch_list, sch_update, note_add, note_list, note_update, note_get, mem_search, mem_add, mem_del, mem_list
 from .database import prediction_list, prediction_get_hit_rate
 from .database import skill_add, skill_get, skill_increment_usage
+from . import knowledge_service
 
 logger = logging.getLogger("zenith.tools")
 
@@ -212,62 +213,6 @@ TOOLS_SCHEMA = [
             }
         }
     },
-    # --- 市场分析工具 ---
-    {
-        "type": "function",
-        "function": {
-            "name": "query_market",
-            "description": "查询当前现货黄金市场状态，包括价格、CFTC持仓、宏观指标、今日事件等。用户问黄金/市场/持仓/CFTC时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "focus": {"type": "string", "description": "关注方向: gold/cftc/macro/all", "enum": ["gold", "cftc", "macro", "all"]},
-                    "detail": {"type": "string", "description": "详细程度: summary/detailed", "enum": ["summary", "detailed"]}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cftc_positioning",
-            "description": "获取最新的CFTC黄金持仓分析，包括净持仓、z-score、flow state、拥挤度等。用户问持仓/仓位/资金流向时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "contract": {"type": "string", "description": "合约名，默认gold（可选：wti/铜/白银/标普500等）"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "analyze_gold",
-            "description": "生成现货黄金综合分析报告，包含影响因素、事件预测、操作建议。用户要求做市场分析或要看报告时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "track_predictions",
-            "description": "查看昨日市场预测的验证结果和命中率统计。用户问预测准不准/命中率/验证时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "查看哪天的预测，默认昨天，格式YYYY-MM-DD"}
-                },
-                "required": []
-            }
-        }
-    },
     # --- 教程模式工具 ---
     {
         "type": "function",
@@ -374,7 +319,20 @@ TOOLS_SCHEMA = [
             }
         }
     },
-    # --- 统一蒸馏工具 ---
+    {
+        "type": "function",
+        "function": {
+            "name": "distill_note",
+            "description": "蒸馏一条 raw 便签：根据记忆模块的偏好/方法，将其分流为整理后的笔记、日程或记忆。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "integer", "description": "要蒸馏的便签/笔记 ID"}
+                },
+                "required": ["note_id"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -470,6 +428,52 @@ TOOLS_SCHEMA = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "consolidate_memories",
+            "description": "整理/合并/去重记忆库：分析记忆库中的重复或相似条目，生成待执行的合并/删除建议清单。需要先经过用户确认，不会自动删除。当用户提到'合并记忆'、'去重记忆'、'整理记忆库'等意图时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type_": {
+                        "type": "string",
+                        "description": "过滤类型: personal_info/preference/event/decision/fact/experience，空表示全部"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "搜索关键词，限定只整理相关记忆"
+                    },
+                    "auto_apply": {
+                        "type": "boolean",
+                        "description": "是否直接执行（默认 false，需用户确认）"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sync_calendar",
+            "description": "同步外部财经日历到本地缓存。拉取未来一段时间的财经事件（如非农、CPI、FOMC等）及其真实公布时间，用于后续创建日程时自动校准。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "同步未来多少天，默认 7 天"
+                    },
+                    "min_star": {
+                        "type": "integer",
+                        "description": "最小事件星级，默认 2（1-3）"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
     # --- 智能分类工具 (P0) ---
     {
         "type": "function",
@@ -492,6 +496,44 @@ TOOLS_SCHEMA = [
             }
         }
     },
+    # ── 知识库工具（转发到外部 api_gateway） ──
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_docs",
+            "description": "从本地知识库检索与问题相关的文献片段。适用：用户问论文/书籍/文献内容、要求总结资料、查原文出处。不用于记录日程或笔记。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "检索问题"},
+                    "top_k": {"type": "integer", "description": "返回片段数，默认5"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_wiki",
+            "description": "查询 LLM Wiki 专题知识库，返回带引用的综述回答。适用：用户问已编译的主题/概念/综述。不用于原始文献片段检索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Wiki 查询问题"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kb_stats",
+            "description": "返回本地知识库统计：向量片段数、已处理文献数、OCR 回退数。用于用户问知识库状态。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
 ]
 
 
@@ -502,7 +544,7 @@ async def execute_tool(name: str, args: dict) -> dict:
     """
     try:
         if name == "add_schedule":
-            return _handle_add_schedule(args)
+            return await _handle_add_schedule(args)
         elif name == "add_note":
             return _handle_add_note(args)
         elif name == "list_schedule":
@@ -525,14 +567,6 @@ async def execute_tool(name: str, args: dict) -> dict:
             return await _handle_web_search(args)
         elif name == "analyze_content":
             return await _handle_analyze_content(args)
-        elif name == "query_market":
-            return await _handle_query_market(args)
-        elif name == "cftc_positioning":
-            return await _handle_cftc_positioning(args)
-        elif name == "analyze_gold":
-            return await _handle_analyze_gold()
-        elif name == "track_predictions":
-            return await _handle_track_predictions(args)
         elif name == "create_tutorial":
             return _handle_create_tutorial(args)
         elif name == "scan_file_safety":
@@ -557,15 +591,27 @@ async def execute_tool(name: str, args: dict) -> dict:
             return await _handle_distill_daily(args)
         elif name == "distill_weekly":
             return await _handle_distill_weekly(args)
+        elif name == "consolidate_memories":
+            return await _handle_consolidate_memories(args)
+        elif name == "sync_calendar":
+            return await _handle_sync_calendar(args)
         elif name == "smart_classify":
             return await _handle_smart_classify(args)
+        elif name == "distill_note":
+            return await _handle_distill_note(args)
+        elif name == "retrieve_docs":
+            return await _handle_retrieve_docs(args)
+        elif name == "query_wiki":
+            return await _handle_query_wiki(args)
+        elif name == "kb_stats":
+            return await _handle_kb_stats(args)
         else:
             return {"success": False, "result": f"未知工具: {name}"}
     except Exception as e:
         return {"success": False, "result": str(e)}
 
 
-def _handle_add_schedule(args: dict) -> dict:
+async def _handle_add_schedule(args: dict) -> dict:
     title = args["title"]
     priority = "normal"
 
@@ -575,9 +621,33 @@ def _handle_add_schedule(args: dict) -> dict:
         priority = pmap[m.group(1)]
         title = title[m.end():]
 
+    # 解析自然语言时间
+    raw_time = args.get("time", "")
+    from .llm_client import extract_datetime
+    start_time = await extract_datetime(raw_time) if raw_time else ""
+
+    # 外部财经事件时间校准
+    try:
+        from .calendar_sync import get_external_event_time
+        external = get_external_event_time(title)
+        if external and external.get("event_time"):
+            start_time = external["event_time"]
+    except Exception as e:
+        logger.debug("add_schedule external calibration failed: %s", e)
+
+    # 冲突检测与自动错峰
+    conflict = _find_time_conflict(start_time)
+    if conflict:
+        original_time = start_time
+        start_time = _suggest_alternative_time(start_time)
+        logger.info(
+            "add_schedule conflict resolved: conflict_with=%s, original=%s, new=%s",
+            conflict.get("id"), original_time, start_time,
+        )
+
     sid = sch_add({
         "title": title,
-        "start_time": args.get("time", ""),
+        "start_time": start_time,
         "description": args.get("note", ""),
         "source": "ai_detect",
         "status": "proposed",
@@ -585,7 +655,7 @@ def _handle_add_schedule(args: dict) -> dict:
     })
     return {
         "success": True,
-        "result": f"日程提议已生成 (ID:{sid})：[{priority}] {title} @ {args.get('time','')}",
+        "result": f"日程提议已生成 (ID:{sid})：[{priority}] {title} @ {start_time or raw_time}",
         "confirm": True,
         "confirm_type": "schedule",
         "confirm_id": sid,
@@ -751,146 +821,6 @@ async def _handle_analyze_content(args: dict) -> dict:
     parts.append(f"\n{result.get('summary', '(无摘要)')}")
     result["result"] = "\n".join(parts)
     return result
-
-
-# ---------------------------------------------------------------------------
-# Market Analysis Handlers
-# ---------------------------------------------------------------------------
-
-async def _handle_query_market(args: dict) -> dict:
-    """查询市场状态"""
-    from .macro_data import get_macro_service
-    from .database import macro_indicator_list_latest, market_report_get_latest
-
-    focus = args.get("focus", "all")
-    detail = args.get("detail", "summary")
-
-    result_parts = []
-
-    # 宏观指标
-    if focus in ("all", "macro", "gold"):
-        indicators = macro_indicator_list_latest(limit=15)
-        if indicators:
-            result_parts.append("📊 当前市场指标：")
-            for ind in indicators:
-                arrow = "↑" if ind.get('change_pct') and float(ind.get('change_pct', 0)) > 0 else "↓"
-                result_parts.append(f"  {ind['indicator']}: {ind['value']} {arrow}{ind.get('change_pct', '')}%")
-        else:
-            result_parts.append("（宏观数据暂未更新，请刷新数据）")
-
-    # 最新分析报告
-    if focus in ("all", "gold"):
-        latest = market_report_get_latest()
-        if latest:
-            result_parts.append(f"\n📋 最新报告 ({latest['report_date']}):")
-            result_parts.append(f"  黄金价格: {latest.get('gold_price', 'N/A')}")
-            if detail == "detailed" and latest.get('analysis_text'):
-                # 截取前500字
-                text = latest['analysis_text'][:500]
-                result_parts.append(f"  分析摘要: {text}...")
-            else:
-                if latest.get('daily_advice'):
-                    result_parts.append(f"  日内建议: {latest['daily_advice'][:200]}")
-
-    return {"success": True, "result": "\n".join(result_parts)}
-
-
-async def _handle_cftc_positioning(args: dict) -> dict:
-    """获取 CFTC 持仓分析"""
-    from .cftc_service import get_cftc_service
-
-    contract = args.get("contract", "gold")
-    svc = get_cftc_service()
-
-    try:
-        await svc.fetch_incremental()
-        all_data = await svc.get_positioning_json()
-    except Exception as e:
-        logger.error(f"CFTC fetch failed: {e}")
-        return {"success": False, "result": f"CFTC数据获取失败: {e}"}
-
-    # 按合约筛选
-    if contract == "gold":
-        filtered = [d for d in all_data if 'GOLD' in d.get('contract', '').upper() or d.get('contract') == '黄金']
-    elif contract == "wti":
-        filtered = [d for d in all_data if 'WTI' in d.get('contract', '').upper() or d.get('contract') == 'WTI原油']
-    else:
-        filtered = [d for d in all_data if contract.lower() in d.get('contract', '').lower()]
-
-    if not filtered:
-        filtered = all_data  # fallback: show all
-
-    lines = ["📈 CFTC持仓分析："]
-    lines.append(f"数据截止: {svc._report_date or 'N/A'} | 新鲜度: {svc.check_freshness()}")
-    for d in filtered[:8]:
-        direction_arrow = "↗" if d.get('net', 0) > 0 else "↘"
-        lines.append(
-            f"  [{d['category']}] {d['contract']}: "
-            f"净{d.get('net', 'N/A')}{direction_arrow} | z={d.get('net_z', 'N/A')} | "
-            f"flow={d.get('flow_state', '')} | 拥挤={d.get('crowding', '正常')} | "
-            f"周变化={d.get('net_ww', 'N/A')} | 价格={d.get('price_chg', 'N/A')}%"
-        )
-
-    return {"success": True, "result": "\n".join(lines)}
-
-
-async def _handle_analyze_gold() -> dict:
-    """触发市场分析"""
-    from .market_analyzer import get_market_analyzer
-
-    analyzer = get_market_analyzer()
-    try:
-        result = await analyzer.run_daily_analysis()
-        lines = [
-            f"✅ 分析完成！报告ID: {result['report_id']}",
-            f"报告日期: {result['report_date']}",
-            f"黄金价格: {result.get('gold_price', 'N/A')}",
-            f"预测条数: {result.get('predictions_count', 0)}",
-        ]
-        analysis = result.get('analysis', {})
-        if analysis.get('daily_advice'):
-            lines.append(f"日内建议: {analysis['daily_advice'][:200]}")
-        if analysis.get('weekly_advice'):
-            lines.append(f"周度建议: {analysis['weekly_advice'][:200]}")
-        if analysis.get('summary'):
-            lines.append(f"核心结论: {analysis['summary'][:200]}")
-        return {"success": True, "result": "\n".join(lines)}
-    except Exception as e:
-        logger.error(f"Market analysis failed: {e}")
-        return {"success": False, "result": f"分析失败: {e}"}
-
-
-async def _handle_track_predictions(args: dict) -> dict:
-    """查看预测追踪"""
-    from .market_analyzer import get_market_analyzer
-    from datetime import datetime, timedelta
-
-    date = args.get("date", "")
-    if not date:
-        date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    # 获取命中率统计
-    hit_rate = prediction_get_hit_rate(days=30)
-
-    # 获取指定日期的预测
-    preds = prediction_list(date=date)
-
-    lines = [f"🎯 预测追踪 ({date})："]
-    lines.append(f"近30天命中率: {hit_rate['hit']}/{hit_rate['total']} = {hit_rate['hit_rate']}%")
-
-    if preds:
-        lines.append("\n预测详情：")
-        for p in preds:
-            status_icon = "✅" if p.get('verified') == 'verified' and p.get('predicted_direction') == p.get('actual_direction') else "❌" if p.get('verified') == 'verified' else "⏳"
-            lines.append(
-                f"  {status_icon} {p['event_name']}: "
-                f"预测={p['predicted_direction']} 实际={p.get('actual_direction', '待验证')} "
-                f"力度={p.get('predicted_strength', 0)}⭐"
-            )
-    else:
-        lines.append("（该日无预测记录）")
-
-    return {"success": True, "result": "\n".join(lines)}
 
 
 # ---------------------------------------------------------------------------
@@ -1214,28 +1144,69 @@ async def _handle_distill_daily(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 SMART_CLASSIFY_PROMPT = """\
-你是一个智能分类器，请对用户输入进行一次分析，输出以下结构化JSON（不要加markdown代码块，直接输出JSON）：
+你是一个智能分类器，请对用户输入进行一次分析，输出以下结构化JSON（不要加markdown代码块，直接输出JSON）。
+
+当前时间：{current_datetime}
 
 {
   "classification": {
     "is_plan": false,
     "is_thought": false,
     "is_skill": false,
+    "is_memory": false,
     "keywords": ["关键词1", "关键词2"]
+  },
+  "plan": {
+    "start_time": "YYYY-MM-DDTHH:MM:SS+08:00 或空字符串",
+    "end_time": "YYYY-MM-DDTHH:MM:SS+08:00 或空字符串",
+    "location": "地点（可选）",
+    "priority": "low|normal|high"
+  },
+  "memory_info": null,
+  "skill_card": null,
+  "summary": "一句话摘要"
+}
+
+分类规则（四个字段互相独立，可同时为 true）：
+- is_plan: 用户在安排/确认一个日程、会议、提醒、任务等时间相关事件 → true
+- is_thought: 用户在表达想法、观点、待整理的信息、感受 → true
+- is_skill: 用户描述了一个可重复的操作流程、方法论、步骤化的技巧 → true
+- is_memory: 用户陈述了应当长期记住的客观信息（个人信息/偏好/事实/决定/经验） → true
+- keywords: 提取2-5个核心关键词
+
+is_memory 判定细则（命中任一即 true）：
+- personal_info: 姓名/住址/生日/联系方式等个人档案信息
+- preference: 明确的喜好或习惯（"我喜欢…"、"我习惯…"、"我不吃辣"）
+- fact: 客观事实陈述（"比特币减半在2024年4月"）
+- decision: 已做的决定（"我决定每周日复盘"、"我选方案B"）
+- experience: 可复用的经验/教训（注意：如果是步骤化方法论，应同时 is_skill=true）
+
+如果 is_plan=true，必须同时输出 plan 字段，并基于"当前时间"推算 start_time。
+示例（假设当前时间为 2026-07-18 00:22:52）：
+  用户输入："明天下午三点开会" → start_time 应填 "2026-07-19T15:00:00+08:00"
+  用户输入："提醒我周末买菜" → start_time 可填 "2026-07-19T09:00:00+08:00"
+  用户输入："下周一汇报" → start_time 应填 "2026-07-21T09:00:00+08:00"
+  用户输入没有时间信息 → start_time 为空字符串
+
+如果 is_memory=true，必须同时输出 memory_info：
+{
+  "classification": {..., "is_memory": true},
+  "plan": {...},
+  "memory_info": {
+    "type": "personal_info|preference|fact|decision|experience",
+    "content": "精炼后的记忆内容（去掉口语化冗余）",
+    "importance": 1-5,
+    "keywords": "关键词,逗号分隔"
   },
   "skill_card": null,
   "summary": "一句话摘要"
 }
 
-分类规则：
-- is_plan: 用户在安排/确认一个日程、会议、提醒等时间相关事件 → true
-- is_thought: 用户在表达想法、观点、偏好、感受 → true
-- is_skill: 用户描述了一个可重复的操作流程、方法论、步骤化的技巧 → true
-- keywords: 提取2-5个核心关键词
-
 如果 is_skill=true，必须同时输出 skill_card：
 {
   "classification": {..., "is_skill": true},
+  "plan": {...},
+  "memory_info": null,
   "skill_card": {
     "name": "技能名称（简短）",
     "trigger_scene": "什么时候应该用这个技能",
@@ -1245,7 +1216,12 @@ SMART_CLASSIFY_PROMPT = """\
   "summary": "一句话摘要"
 }
 
-如果不是技能，skill_card 必须为 null。
+混合示例："我决定每周日做复盘，步骤是先看日程再看笔记最后写总结"
+→ is_plan=false, is_thought=false, is_skill=true, is_memory=true (decision)
+→ memory_info.type=decision, content="决定每周日做复盘"
+→ skill_card 描述复盘步骤
+
+非技能、非记忆时，skill_card 和 memory_info 必须为 null。
 
 只输出JSON，不要加任何解释文字。"""
 
@@ -1282,17 +1258,403 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"无法从响应中提取 JSON: {text[:200]}")
 
 
+# 录入时去重辅助 — 用 SequenceMatcher 比对现有记忆，相似度>阈值返回已有记忆 ID（不删除）
+def _find_duplicate_memory(
+    content: str,
+    keywords: str = "",
+    mem_type: str = "",
+    threshold: float = 0.7,
+) -> int | None:
+    """检查 memory 内容是否已存在相似条目。
+
+    Args:
+        content: 待检查的记忆内容
+        keywords: 关键词字符串（逗号分隔），用于搜索候选
+        mem_type: 记忆类型，相同类型优先匹配
+        threshold: 相似度阈值 (0-1)，>=threshold 视为重复
+
+    Returns:
+        已存在的记忆 ID（若有重复），否则 None
+    """
+    if not content or not content.strip():
+        return None
+    from difflib import SequenceMatcher
+    from .database import mem_search as _mem_search, mem_list as _mem_list
+
+    # 1. 收集候选：按关键词搜索 + 按类型列出最近 30 条
+    candidates: list[dict] = []
+    seen_ids: set[int] = set()
+    kws = [k.strip() for k in (keywords or "").split(",") if k.strip()]
+    for kw in kws[:3]:
+        for m in _mem_search(kw)[:8]:
+            mid = m.get("id")
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                candidates.append(m)
+    # 按类型补充
+    if mem_type:
+        for m in _mem_list(type_=mem_type)[:30]:
+            mid = m.get("id")
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                candidates.append(m)
+    else:
+        for m in _mem_list()[:30]:
+            mid = m.get("id")
+            if mid not in seen_ids:
+                seen_ids.add(mid)
+                candidates.append(m)
+
+    # 2. 比对相似度
+    content_norm = content.strip().lower()
+    best_id: int | None = None
+    best_ratio: float = 0.0
+    for m in candidates:
+        existing = (m.get("content") or "").strip().lower()
+        if not existing:
+            continue
+        # 同类型加权（让同类型更容易命中）
+        ratio = SequenceMatcher(None, content_norm, existing).ratio()
+        if m.get("type") == mem_type and mem_type:
+            ratio = min(1.0, ratio + 0.05)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_id = m.get("id")
+
+    if best_ratio >= threshold and best_id is not None:
+        logger.debug("memory dedup hit: ratio=%.3f, existing_id=%s", best_ratio, best_id)
+        return best_id
+    return None
+
+
+def _find_time_conflict(start_time: str, end_time: str = "", exclude_id: int | None = None, buffer_minutes: int = 5) -> dict | None:
+    """检查给定时间段是否与已有日程冲突。
+
+    返回冲突日程的 dict，无冲突返回 None。
+    """
+    if not start_time:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        from .timezone import now_tz
+        dt = datetime.fromisoformat(start_time)
+        # 简单默认 duration = 30min
+        end_dt = datetime.fromisoformat(end_time) if end_time else dt + timedelta(minutes=30)
+        # 前后各留 buffer
+        window_start = dt - timedelta(minutes=buffer_minutes)
+        window_end = end_dt + timedelta(minutes=buffer_minutes)
+
+        # 只检查未来 14 天内的日程，避免全表扫描
+        range_end = (now_tz() + timedelta(days=14)).isoformat()
+        candidates = sch_list(date_from=window_start.isoformat(), date_to=range_end, status="confirmed")
+        for s in candidates:
+            sid = s.get("id")
+            if exclude_id is not None and sid == exclude_id:
+                continue
+            s_start = s.get("start_time", "")
+            if not s_start:
+                continue
+            try:
+                s_dt = datetime.fromisoformat(s_start)
+                s_end = s_dt + timedelta(minutes=30)
+            except Exception:
+                continue
+            # 重叠判断
+            if s_dt < window_end and s_end > window_start:
+                return dict(s)
+    except Exception as e:
+        logger.debug("time conflict check failed: %s", e)
+    return None
+
+
+def _suggest_alternative_time(start_time: str, duration_minutes: int = 30, step_minutes: int = 30, max_try: int = 5) -> str:
+    """当检测到时间冲突时，向后顺延寻找可用时间段。"""
+    from datetime import datetime, timedelta
+    try:
+        dt = datetime.fromisoformat(start_time)
+    except Exception:
+        return start_time
+    for _ in range(max_try):
+        dt += timedelta(minutes=step_minutes)
+        end = dt + timedelta(minutes=duration_minutes)
+        if _find_time_conflict(dt.isoformat(), end.isoformat()) is None:
+            return dt.isoformat()
+    # 都冲突则返回原时间（由上层决定）
+    return start_time
+
+
+async def _distill_raw_note(
+    note_id: int,
+    text: str,
+    classification: dict,
+    plan_info: dict,
+    conv_id: str = "",
+    recorded_at: str = "",
+) -> dict:
+    """第二阶段：根据记忆模块的偏好/方法，对 raw note 进行蒸馏分流。
+    输出：整理后的笔记、日程、或记忆。
+    """
+    from .llm_client import call_llm, extract_datetime
+    from .database import mem_search, mem_list, sch_add, note_update, note_get, mem_add
+
+    actions = []
+    created_ids = {}
+
+    # 1. 检索相关记忆：偏好 + 方法（experience）
+    keywords = classification.get("keywords", [])
+    related_mems = []
+    for kw in keywords[:3]:
+        related_mems.extend(mem_search(kw)[:5])
+    # 去重并优先取 preference / experience
+    seen = set()
+    filtered_mems = []
+    for m in related_mems:
+        mid = m.get("id")
+        if mid in seen:
+            continue
+        seen.add(mid)
+        if m.get("type") in ("preference", "experience"):
+            filtered_mems.append(m)
+    # 补充最近的 preference / experience
+    for m in mem_list(type_="preference")[:10]:
+        if m.get("id") not in seen:
+            filtered_mems.append(m)
+    for m in mem_list(type_="experience")[:10]:
+        if m.get("id") not in seen:
+            filtered_mems.append(m)
+
+    memory_context = []
+    for i, m in enumerate(filtered_mems[:20], 1):
+        t = m.get("type", "")
+        c = m.get("content", "")[:200]
+        mid = m.get("id")
+        memory_context.append(f"{i}. [ID:{mid}][{t}] {c}")
+    memory_text = "\n".join(memory_context) if memory_context else "（暂无相关偏好或方法记忆）"
+
+    prompt = f"""你是一个个人知识管理助手。请根据以下用户原始便签内容和相关记忆偏好/方法，判断该便签最适合被整理成哪种形式。
+
+规则：
+- 如果包含时间、会议、提醒、任务等可执行安排 → 输出为 schedule（日程）
+- 如果是想法、观点、待整理的信息 → 输出为 note（已整理笔记）
+- 如果是个人偏好、重要事实、可复用经验 → 输出为 memory（记忆）
+- 同一内容可能同时产生多种类型，请在 JSON 中列出
+
+【去重关键规则】
+- 仔细对照下方"相关记忆偏好/方法"，若已有记忆在语义上覆盖了便签内容（表述可不同但含义相同），memory.should_create 必须设为 false
+- 例如：已有"我喜欢喝咖啡"，新便签"我每天必须喝咖啡" → should_create=false
+- 例如：已有"比特币减半在2024年4月"，新便签"BTC 减半日期是 2024-04-20" → should_create=false
+- 仅当便签带来新的、未覆盖的信息时才 should_create=true
+
+输出 JSON 格式（不要加 markdown 代码块）：
+{{
+  "decision": {{
+    "note": {{ "should_refine": true/false, "title": "整理后的标题", "content": "整理后的内容（可保留原文）", "tags": ["标签1"] }},
+    "schedule": {{ "should_create": true/false, "title": "日程标题", "start_time": "YYYY-MM-DDTHH:MM:SS+08:00", "priority": "low|normal|high", "description": "描述" }},
+    "memory": {{ "should_create": true/false, "type": "preference|experience|fact|decision", "content": "记忆内容", "importance": 1-5, "keywords": "关键词,逗号分隔", "duplicate_of": null }}
+  }},
+  "reason": "分流理由（一句话）"
+}}
+
+若 memory.should_create=false 且原因是已存在相似记忆，可在 memory.duplicate_of 填入已有记忆的真实 ID（如上方 [ID:12] 的 12），否则为 null。
+
+原始便签：
+{text}
+
+相关记忆偏好/方法：
+{memory_text}
+
+只输出 JSON，不要其他内容。"""
+
+    try:
+        response = await call_llm(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1500,
+            response_format={"type": "json_object"},
+        )
+        result_text = response.get("content", "") if isinstance(response, dict) else str(response)
+        parsed = _extract_json(result_text)
+    except Exception as e:
+        logger.error(f"_distill_raw_note LLM failed: {e}")
+        # LLM 失败时，保守处理：保持 raw note 不变
+        return {"actions": [], "created_ids": {}}
+
+    decision = parsed.get("decision", {})
+    from .timezone import now_tz
+    now_iso = recorded_at or now_tz().isoformat()
+
+    # 2. 创建整理后的笔记
+    note_part = decision.get("note", {})
+    if note_part.get("should_refine"):
+        note_update(note_id, {
+            "title": note_part.get("title", text[:30]),
+            "content": note_part.get("content", text),
+            "tags": ",".join(note_part.get("tags", [])),
+            "status": "proposed",
+            "stage": "refined",
+            "distilled_at": now_iso,
+        })
+        actions.append(f"整理笔记 (ID:{note_id})")
+
+    # 3. 创建日程
+    schedule_part = decision.get("schedule", {})
+    if schedule_part.get("should_create"):
+        start_time = schedule_part.get("start_time", "")
+        if not start_time and plan_info.get("start_time"):
+            start_time = plan_info.get("start_time")
+        if not start_time:
+            start_time = await extract_datetime(text)
+
+        title = schedule_part.get("title", text[:50])
+
+        # 3a. 外部财经事件时间校准（仅当标题匹配金融事件时）
+        try:
+            from .calendar_sync import get_external_event_time
+            external = get_external_event_time(title)
+            if external and external.get("event_time"):
+                logger.info(
+                    "schedule time calibrated by external calendar: title=%s, old=%s, new=%s",
+                    title, start_time, external["event_time"],
+                )
+                start_time = external["event_time"]
+        except Exception as e:
+            logger.debug("external calendar calibration failed: %s", e)
+
+        # 3b. 时间冲突检测与自动错峰
+        conflict = _find_time_conflict(start_time)
+        if conflict:
+            original_time = start_time
+            start_time = _suggest_alternative_time(start_time)
+            logger.info(
+                "schedule conflict resolved: title=%s, conflict_with=%s, original=%s, new=%s",
+                title, conflict.get("id"), original_time, start_time,
+            )
+
+        priority = schedule_part.get("priority", plan_info.get("priority", "normal"))
+        if priority not in ("low", "normal", "high"):
+            priority = "normal"
+        sid = sch_add({
+            "title": title,
+            "start_time": start_time,
+            "description": schedule_part.get("description", text),
+            "source": "smart_classify_distill",
+            "status": "proposed",
+            "priority": priority,
+        })
+        actions.append(f"日程提议 (ID:{sid})")
+        created_ids["schedule_id"] = sid
+
+        # 把日程 ID 关联回原 note
+        distilled_into = []
+        import json as _json
+        try:
+            distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
+        except Exception:
+            distilled_into = []
+        if isinstance(distilled_into, list):
+            distilled_into.append({"type": "schedule", "id": sid})
+        else:
+            distilled_into = [{"type": "schedule", "id": sid}]
+        note_update(note_id, {
+            "stage": "distilled",
+            "distilled_at": now_iso,
+            "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+        })
+
+    # 4. 创建记忆（带录入时去重检查 — 不删除已有）
+    memory_part = decision.get("memory", {})
+    if memory_part.get("should_create"):
+        mem_type = memory_part.get("type", "fact")
+        if mem_type not in ("personal_info", "preference", "event", "decision", "fact", "experience"):
+            mem_type = "fact"
+        mem_content = memory_part.get("content", text[:200])
+        mem_keywords = memory_part.get("keywords", ",".join(keywords))
+        mem_importance = memory_part.get("importance", 3)
+        try:
+            mem_importance = int(mem_importance)
+        except (TypeError, ValueError):
+            mem_importance = 3
+        mem_importance = max(1, min(5, mem_importance))
+
+        # 4a. 先看 LLM 是否标注了 duplicate_of（直接跳过创建）
+        dup_of = memory_part.get("duplicate_of")
+        dup_id: int | None = None
+        if dup_of is not None:
+            try:
+                dup_id = int(dup_of)
+            except (TypeError, ValueError):
+                dup_id = None
+
+        # 4b. LLM 没标或标错时，用 SequenceMatcher 兜底查重（相似度>0.7 跳过创建）
+        if dup_id is None:
+            dup_id = _find_duplicate_memory(mem_content, mem_keywords, mem_type)
+
+        if dup_id is not None:
+            actions.append(f"记忆已存在 (ID:{dup_id})，跳过创建")
+            created_ids["memory_id"] = dup_id
+            # 关联回原 note（即使没创建新记忆，也记录"应映射到这条已有记忆"）
+            import json as _json
+            try:
+                distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
+            except Exception:
+                distilled_into = []
+            if isinstance(distilled_into, list):
+                distilled_into.append({"type": "memory", "id": dup_id, "deduped": True})
+            else:
+                distilled_into = [{"type": "memory", "id": dup_id, "deduped": True}]
+            note_update(note_id, {
+                "stage": "distilled",
+                "distilled_at": now_iso,
+                "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+            })
+        else:
+            mem_id = mem_add(
+                type_=mem_type,
+                content=mem_content,
+                importance=mem_importance,
+                keywords=mem_keywords,
+                source_conv_id=conv_id,
+                recorded_at=recorded_at or now_iso,
+                distilled_from=note_id,
+            )
+            actions.append(f"记忆 (ID:{mem_id})")
+            created_ids["memory_id"] = mem_id
+
+            # 把记忆 ID 关联回原 note
+            import json as _json
+            try:
+                distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
+            except Exception:
+                distilled_into = []
+            if isinstance(distilled_into, list):
+                distilled_into.append({"type": "memory", "id": mem_id})
+            else:
+                distilled_into = [{"type": "memory", "id": mem_id}]
+            note_update(note_id, {
+                "stage": "distilled",
+                "distilled_at": now_iso,
+                "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+            })
+
+    return {"actions": actions, "created_ids": created_ids}
+
+
 async def _handle_smart_classify(args: dict) -> dict:
-    """智能分类：一次 LLM 调用完成分类+技能提取+摘要，自动创建对应数据"""
+    """智能分类：第一阶段，所有输入先作为 raw note 初次记录。
+    同时给出分类意图，为后续蒸馏分流做准备。"""
     from .llm_client import call_llm
+    from .timezone import now_tz
 
     text = args.get("text", "").strip()
     conv_id = args.get("conv_id", "")
     if not text:
         return {"success": False, "result": "text 不能为空"}
 
+    # 注入当前时间到 prompt（用 str.replace 避免 JSON 花括号冲突）
+    current_dt = now_tz().strftime("%Y-%m-%d %H:%M:%S %A")
+    prompt = SMART_CLASSIFY_PROMPT.replace("{current_datetime}", current_dt)
     messages = [
-        {"role": "system", "content": SMART_CLASSIFY_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": text},
     ]
 
@@ -1317,37 +1679,27 @@ async def _handle_smart_classify(args: dict) -> dict:
 
     classification = parsed.get("classification", {})
     skill_card = parsed.get("skill_card")
+    memory_info = parsed.get("memory_info")
     summary = parsed.get("summary", "")
+    plan_info = parsed.get("plan", {}) or {}
 
-    # 根据分类结果自动创建数据
-    actions = []
-    created_ids = {}
+    # 1. 所有输入先作为 raw note（便签）记录
+    recorded_at = now_tz().isoformat()
+    keywords = ",".join(classification.get("keywords", []))
+    nid = note_add({
+        "title": summary or text[:30],
+        "content": text,
+        "tags": keywords,
+        "source": "smart_classify",
+        "status": "proposed",
+        "stage": "raw",
+        "recorded_at": recorded_at,
+    })
 
-    # is_plan → 创建日程
-    if classification.get("is_plan"):
-        sid = sch_add({
-            "title": summary or text[:50],
-            "start_time": "",
-            "description": text,
-            "source": "smart_classify",
-            "status": "proposed",
-        })
-        actions.append(f"日程提议 (ID:{sid})")
-        created_ids["schedule_id"] = sid
+    actions = [f"便签记录 (ID:{nid})"]
+    created_ids = {"note_id": nid}
 
-    # is_thought → 创建笔记
-    if classification.get("is_thought"):
-        nid = note_add({
-            "title": summary or text[:30],
-            "content": text,
-            "tags": ",".join(classification.get("keywords", [])),
-            "source": "smart_classify",
-            "status": "proposed",
-        })
-        actions.append(f"笔记提议 (ID:{nid})")
-        created_ids["note_id"] = nid
-
-    # is_skill → 创建技能卡片 + 经验记忆
+    # 2. 如果是技能，直接创建技能卡片（技能需要立即被确认/使用）
     if classification.get("is_skill") and skill_card:
         sk_id = skill_add({
             "name": skill_card.get("name", summary),
@@ -1359,34 +1711,101 @@ async def _handle_smart_classify(args: dict) -> dict:
         actions.append(f"技能卡片 (ID:{sk_id})")
         created_ids["skill_id"] = sk_id
 
-        # 同时存一条 experience 类型的记忆
-        from .database import mem_add
+        # 同时生成一条经验记忆（来源于技能）
         mem_id = mem_add(
             type_="experience",
             content=f"技能: {skill_card.get('name', '')} — {skill_card.get('trigger_scene', '')}",
             importance=4,
             keywords=",".join(skill_card.get("tags", []) + classification.get("keywords", [])),
             source_conv_id=conv_id,
+            recorded_at=recorded_at,
+            distilled_from=nid,
         )
         actions.append(f"经验记忆 (ID:{mem_id})")
+        created_ids["memory_id"] = mem_id
 
-    # 如果没有任何分类命中，至少存一条记忆
-    if not actions and summary:
-        from .database import mem_add
-        mem_id = mem_add(
-            type_="fact",
-            content=summary,
-            importance=2,
-            keywords=",".join(classification.get("keywords", [])),
-            source_conv_id=conv_id,
+    # 2.5 is_memory 快路径：立即入记忆库（跳过 raw 蒸馏阶段）
+    #     若 is_skill=true 且 memory_info.type=experience，跳过（避免和技能经验记忆重复）
+    elif classification.get("is_memory") and memory_info:
+        mem_type = memory_info.get("type", "fact")
+        if mem_type not in ("personal_info", "preference", "event", "decision", "fact", "experience"):
+            mem_type = "fact"
+        mem_content = memory_info.get("content", text[:200])
+        mem_keywords = memory_info.get("keywords", keywords)
+        mem_importance = memory_info.get("importance", 3)
+        try:
+            mem_importance = int(mem_importance)
+        except (TypeError, ValueError):
+            mem_importance = 3
+        mem_importance = max(1, min(5, mem_importance))
+
+        # 录入时去重检查（不删除已有记忆）：相似度>0.7 跳过创建
+        dup_id = _find_duplicate_memory(mem_content, mem_keywords, mem_type)
+        if dup_id is not None:
+            actions.append(f"记忆已存在 (ID:{dup_id})，跳过创建")
+            created_ids["memory_id"] = dup_id
+        else:
+            mem_id = mem_add(
+                type_=mem_type,
+                content=mem_content,
+                importance=mem_importance,
+                keywords=mem_keywords,
+                source_conv_id=conv_id,
+                recorded_at=recorded_at,
+                distilled_from=nid,
+            )
+            actions.append(f"记忆 (ID:{mem_id})")
+            created_ids["memory_id"] = mem_id
+
+        # 把记忆 ID 关联回原 note
+        import json as _json
+        try:
+            distilled_into = _json.loads(note_get(nid).get("distilled_into", "[]") or "[]")
+        except Exception:
+            distilled_into = []
+        mid_for_link = created_ids.get("memory_id")
+        if isinstance(distilled_into, list):
+            distilled_into.append({"type": "memory", "id": mid_for_link})
+        else:
+            distilled_into = [{"type": "memory", "id": mid_for_link}]
+        note_update(nid, {
+            "stage": "distilled",
+            "distilled_at": recorded_at,
+            "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+        })
+
+    # 3. 对 plan 类型立即进行蒸馏分流（时间敏感）
+    if classification.get("is_plan"):
+        distill_result = await _distill_raw_note(
+            nid,
+            text,
+            classification,
+            plan_info,
+            conv_id=conv_id,
+            recorded_at=recorded_at,
         )
-        actions.append(f"事实记忆 (ID:{mem_id})")
+        created_ids.update(distill_result.get("created_ids", {}))
+        actions.extend(distill_result.get("actions", []))
+
+    # 4. is_thought 自动蒸馏（不再停留 raw 阶段等待手动）
+    #    若同时 is_plan=true，plan 蒸馏已经覆盖了内容，跳过避免重复
+    if classification.get("is_thought") and not classification.get("is_plan"):
+        distill_result = await _distill_raw_note(
+            nid,
+            text,
+            classification,
+            plan_info,
+            conv_id=conv_id,
+            recorded_at=recorded_at,
+        )
+        created_ids.update(distill_result.get("created_ids", {}))
+        actions.extend(distill_result.get("actions", []))
 
     # 构建返回结果
     result_lines = [
         "🧠 智能分类结果:",
-        f"  分类: plan={classification.get('is_plan')} | thought={classification.get('is_thought')} | skill={classification.get('is_skill')}",
-        f"  关键词: {', '.join(classification.get('keywords', []))}",
+        f"  分类: plan={classification.get('is_plan')} | thought={classification.get('is_thought')} | skill={classification.get('is_skill')} | memory={classification.get('is_memory')}",
+        f"  关键词: {keywords}",
         f"  摘要: {summary}",
     ]
     if skill_card:
@@ -1395,6 +1814,8 @@ async def _handle_smart_classify(args: dict) -> dict:
             f"  触发场景: {skill_card.get('trigger_scene', '')}",
             f"  步骤数: {len(skill_card.get('steps', []))}",
         ])
+    if memory_info:
+        result_lines.append(f"  记忆类型: {memory_info.get('type', 'fact')}")
     if actions:
         result_lines.append(f"\n  已自动创建: {' | '.join(actions)}")
 
@@ -1403,9 +1824,48 @@ async def _handle_smart_classify(args: dict) -> dict:
         "result": "\n".join(result_lines),
         "classification": classification,
         "skill_card": skill_card,
+        "memory_info": memory_info,
         "summary": summary,
         "actions": actions,
         "created_ids": created_ids,
+    }
+
+
+async def _handle_distill_note(args: dict) -> dict:
+    """工具入口：手动蒸馏一条 raw note。"""
+    note_id = args.get("note_id")
+    if not note_id:
+        return {"success": False, "result": "note_id 不能为空"}
+
+    from .database import note_get
+    note = note_get(note_id)
+    if not note:
+        return {"success": False, "result": f"笔记 ID:{note_id} 不存在"}
+
+    text = note.get("content", "")
+    if not text:
+        return {"success": False, "result": "笔记内容为空，无法蒸馏"}
+
+    # 构造一个基础分类用于蒸馏
+    classification = {"keywords": note.get("tags", "").split(",") if note.get("tags") else []}
+    plan_info = {}
+
+    result = await _distill_raw_note(
+        note_id=note_id,
+        text=text,
+        classification=classification,
+        plan_info=plan_info,
+        recorded_at=note.get("recorded_at", ""),
+    )
+
+    actions = result.get("actions", [])
+    if not actions:
+        return {"success": True, "result": "未产生新的整理/日程/记忆。", "created_ids": result.get("created_ids", {})}
+
+    return {
+        "success": True,
+        "result": f"蒸馏完成：{' | '.join(actions)}",
+        "created_ids": result.get("created_ids", {}),
     }
 
 
@@ -1440,3 +1900,366 @@ async def _handle_distill_weekly(args: dict) -> dict:
         lines.append(f"  txt文件: {txt_path}")
 
     return {"success": True, "result": "\n".join(lines), "txt_content": txt, "txt_path": txt_path, **result}
+
+
+# ═══════════════════════════════════════════════════════
+# 记忆整理 / 合并 / 去重（用户确认后执行）
+# ═══════════════════════════════════════════════════════
+
+_CONSOLIDATE_INTENT_PROMPT = """\
+判断以下用户消息是否想要"整理/合并/去重记忆库"。只输出 JSON，不要解释。
+
+{
+  "trigger": false,
+  "type": "none",
+  "scope": "all",
+  "reason": "一句话判断理由"
+}
+
+字段说明：
+- trigger: true 仅当用户明确想整理/合并/去重记忆库（如：合并记忆、去重记忆、整理记忆库、清理重复记忆）
+- trigger: false 当"合并"指其他事物（合并文件/表格/单元格/项目计划等）
+- type: "merge" | "dedup" | "organize" | "none" 之一
+- scope: "all" | 记忆类型（personal_info/preference/event/decision/fact/experience）| 关键词
+
+只输出 JSON。"""
+
+
+_CONSOLIDATE_PLAN_PROMPT = """\
+请对以下记忆库数据进行分析，找出明显的重复、相似和可能过时的条目，输出待执行的整理计划 JSON。
+
+{
+  "total": 253,
+  "merge_groups": [
+    {"keep_id": 12, "delete_ids": [34, 56], "reason": "内容高度相似", "merged_content": "合并后的内容"}
+  ],
+  "outdated": [
+    {"id": 78, "reason": "信息已过时"}
+  ],
+  "notes": "补充说明"
+}
+
+merge_groups 规则：
+- keep_id: 保留的记忆 ID（重要度更高或创建时间更早的）
+- delete_ids: 需要删除的重复记忆 ID 列表
+- 只列出相似度 >= 0.85 的强重复组
+- 不要猜测不存在的 ID；如果无法确定，宁可不列
+
+outdated 规则：
+- 只列出明显过时的客观信息（如旧价格、已取消的计划、临时信息）
+- 必须带真实记忆 ID，没有 ID 的不要列
+
+记忆数据格式：
+[ID:1][type] 内容摘要
+[ID:2][type] 内容摘要
+
+{memory_text}
+
+只输出 JSON，不要其他内容。"""
+
+
+async def detect_consolidate_intent(user_message: str) -> dict:
+    """判断用户是否想整理记忆库。"""
+    from .llm_client import call_llm
+    try:
+        response = await call_llm(
+            messages=[
+                {"role": "system", "content": _CONSOLIDATE_INTENT_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.1,
+            max_tokens=256,
+            response_format={"type": "json_object"},
+        )
+        text = response.get("content", "") if isinstance(response, dict) else str(response)
+        return _extract_json(text)
+    except Exception as e:
+        logger.warning("consolidate intent detection failed: %s", e)
+        return {"trigger": False, "type": "none", "scope": "all", "reason": str(e)}
+
+
+async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
+    """生成记忆整理计划（真实 ID）。结合自动相似度 + LLM 建议。"""
+    from .memory_engine import _similarity
+    from datetime import datetime, timedelta
+    from .llm_client import call_llm
+
+    all_mems = mem_list()
+    if type_:
+        all_mems = [m for m in all_mems if m.get("type") == type_]
+    if search:
+        all_mems = [m for m in all_mems if search in (m.get("content", "") + m.get("keywords", ""))]
+
+    # 1. 自动相似度合并候选（>= 0.85 强相似）
+    merge_groups = []
+    seen_ids = set()
+    for i, m in enumerate(all_mems):
+        if m["id"] in seen_ids:
+            continue
+        group_delete = []
+        for j in range(i + 1, len(all_mems)):
+            other = all_mems[j]
+            if other["id"] in seen_ids:
+                continue
+            if other.get("type") != m.get("type"):
+                continue
+            sim = _similarity(m.get("content", ""), other.get("content", ""))
+            if sim >= 0.85:
+                group_delete.append(other)
+                seen_ids.add(other["id"])
+        if group_delete:
+            seen_ids.add(m["id"])
+            keeper = m
+            for o in group_delete:
+                if o.get("importance", 3) > keeper.get("importance", 3):
+                    keeper = o
+            merge_groups.append({
+                "keep_id": keeper["id"],
+                "delete_ids": [o["id"] for o in group_delete if o["id"] != keeper["id"]],
+                "reason": "强相似（内容相似度>=0.85），保留重要度更高/更早的",
+                "merged_content": keeper.get("content", ""),
+            })
+
+    # 2. 30天前创建且重要度=1 的过时候选
+    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    outdated_candidates = [
+        {"id": m["id"], "reason": "长期未引用且重要度最低，建议清理"}
+        for m in all_mems
+        if m.get("importance", 3) == 1 and m.get("created_at", "")[:10] < cutoff and m["id"] not in seen_ids
+    ]
+
+    # 3. LLM 辅助建议（补充可能漏掉的相似项）
+    memory_text = "\n".join([
+        f"[ID:{m['id']}][{m.get('type','')}] {m.get('content','')[:120]}"
+        for m in all_mems[:100]
+    ])
+
+    llm_merge = []
+    llm_outdated = []
+    if all_mems and len(all_mems) >= 5:
+        try:
+            prompt = _CONSOLIDATE_PLAN_PROMPT.replace("{memory_text}", memory_text)
+            response = await call_llm(
+                messages=[{"role": "system", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1024,
+                response_format={"type": "json_object"},
+            )
+            text = response.get("content", "") if isinstance(response, dict) else str(response)
+            parsed = _extract_json(text)
+            llm_merge = parsed.get("merge_groups", [])
+            llm_outdated = parsed.get("outdated", [])
+        except Exception as e:
+            logger.warning("LLM consolidate plan failed: %s", e)
+
+    # 4. 合并自动结果和 LLM 结果（去重，以真实存在的 ID 为准）
+    existing_ids = {m["id"] for m in all_mems}
+    merged_map = {}
+
+    for g in merge_groups:
+        if g["keep_id"] not in existing_ids:
+            continue
+        delete_ids = [d for d in g["delete_ids"] if d in existing_ids and d != g["keep_id"]]
+        if delete_ids:
+            merged_map[g["keep_id"]] = merged_map.get(g["keep_id"], {"keep_id": g["keep_id"], "delete_ids": []})
+            merged_map[g["keep_id"]]["delete_ids"].extend(delete_ids)
+            merged_map[g["keep_id"]]["delete_ids"] = list(set(merged_map[g["keep_id"]]["delete_ids"]))
+
+    for g in llm_merge:
+        keep_id = g.get("keep_id")
+        if not keep_id or keep_id not in existing_ids:
+            continue
+        delete_ids = [d for d in g.get("delete_ids", []) if d in existing_ids and d != keep_id]
+        if delete_ids:
+            merged_map[keep_id] = merged_map.get(keep_id, {"keep_id": keep_id, "delete_ids": []})
+            merged_map[keep_id]["delete_ids"].extend(delete_ids)
+            merged_map[keep_id]["delete_ids"] = list(set(merged_map[keep_id]["delete_ids"]))
+
+    merged_groups = []
+    for g in merged_map.values():
+        g["reason"] = "内容相似或重复，合并保留一条"
+        g["merged_content"] = next((m.get("content", "") for m in all_mems if m["id"] == g["keep_id"]), "")
+        merged_groups.append(g)
+
+    outdated_ids = {o["id"] for o in outdated_candidates if o["id"] in existing_ids}
+    for o in llm_outdated:
+        if o.get("id") in existing_ids:
+            outdated_ids.add(o["id"])
+
+    final_outdated = [o for o in outdated_candidates if o["id"] in outdated_ids]
+    for o in llm_outdated:
+        if o.get("id") in outdated_ids and not any(x["id"] == o["id"] for x in final_outdated):
+            final_outdated.append(o)
+
+    total_after = len(all_mems) - sum(len(g["delete_ids"]) for g in merged_groups) - len(final_outdated)
+
+    return {
+        "total": len(all_mems),
+        "total_after": total_after,
+        "merge_groups": merged_groups,
+        "outdated": final_outdated,
+        "scope": type_ or search or "all",
+    }
+
+
+async def apply_consolidate_plan(plan: dict) -> dict:
+    """执行整理计划。删除重复/过时记忆，保留 keeper。"""
+    deleted_ids = []
+    failed = []
+
+    for g in plan.get("merge_groups", []):
+        keep_id = g.get("keep_id")
+        delete_ids = g.get("delete_ids", [])
+        if not keep_id or not delete_ids:
+            continue
+        for did in delete_ids:
+            try:
+                mem_del(did)
+                deleted_ids.append(did)
+            except Exception as e:
+                failed.append({"id": did, "reason": str(e)})
+
+    for o in plan.get("outdated", []):
+        oid = o.get("id")
+        if not oid:
+            continue
+        try:
+            mem_del(oid)
+            deleted_ids.append(oid)
+        except Exception as e:
+            failed.append({"id": oid, "reason": str(e)})
+
+    return {
+        "success": True,
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "failed": failed,
+    }
+
+
+def _format_consolidate_plan(plan: dict) -> str:
+    """把计划格式化成用户可读的文本。"""
+    lines = [
+        "🧹 记忆整理计划",
+        f"当前记忆数: {plan.get('total', 0)}",
+        f"整理后预计: {plan.get('total_after', 0)}",
+        "",
+    ]
+    merge_groups = plan.get("merge_groups", [])
+    if merge_groups:
+        lines.append(f"合并去重（{len(merge_groups)} 组）：")
+        for i, g in enumerate(merge_groups, 1):
+            lines.append(f"  {i}. 保留 ID:{g['keep_id']}，删除 ID:{', '.join(str(x) for x in g['delete_ids'])}")
+            lines.append(f"     理由：{g.get('reason', '')}")
+            lines.append(f"     内容：{g.get('merged_content', '')[:80]}")
+    else:
+        lines.append("未发现需要合并的重复记忆。")
+
+    outdated = plan.get("outdated", [])
+    if outdated:
+        lines.append("")
+        lines.append(f"过时清理（{len(outdated)} 条）：")
+        for i, o in enumerate(outdated, 1):
+            lines.append(f"  {i}. ID:{o['id']} — {o.get('reason', '')}")
+    else:
+        lines.append("")
+        lines.append("未发现明显过时的记忆。")
+
+    lines.extend([
+        "",
+        "回复 **确认执行** 开始整理，或回复 **跳过** 取消。",
+    ])
+    return "\n".join(lines)
+
+
+async def _handle_sync_calendar(args: dict) -> dict:
+    """工具入口：同步外部财经日历到本地缓存。"""
+    days = args.get("days", 7)
+    min_star = args.get("min_star", 2)
+    try:
+        from .calendar_sync import sync_calendar_events
+        result = await sync_calendar_events(days=days, min_star=min_star)
+        if result.get("errors"):
+            return {
+                "success": False,
+                "result": f"财经日历同步失败: {result['errors'][0]}",
+                "errors": result["errors"],
+            }
+        return {
+            "success": True,
+            "result": f"已同步 {result['synced']} 条外部财经事件（未来 {days} 天，星级≥{min_star}）。",
+            "synced": result["synced"],
+            "next_sync": result.get("next_sync", ""),
+        }
+    except Exception as e:
+        logger.error("sync_calendar tool failed: %s", e)
+        return {"success": False, "result": f"同步失败: {e}"}
+
+
+async def _handle_consolidate_memories(args: dict) -> dict:
+    """工具入口：生成或执行记忆整理计划。"""
+    type_ = args.get("type_", "")
+    search = args.get("search", "")
+    auto_apply = args.get("auto_apply", False)
+
+    if auto_apply:
+        # 直接执行模式：基于默认策略生成计划并执行
+        plan = await generate_consolidate_plan(type_=type_, search=search)
+        result = await apply_consolidate_plan(plan)
+        return {
+            "success": True,
+            "result": f"已执行记忆整理：删除 {result['deleted_count']} 条记忆。",
+            "plan": plan,
+            **result,
+        }
+
+    # 默认：只生成计划，等待用户确认
+    plan = await generate_consolidate_plan(type_=type_, search=search)
+    formatted = _format_consolidate_plan(plan)
+
+    return {
+        "success": True,
+        "result": formatted,
+        "confirm": True,
+        "confirm_type": "consolidate_memories",
+        "plan": plan,
+    }
+
+
+# ── 知识库工具处理函数 ──────────────────────────────
+async def _handle_retrieve_docs(args: dict) -> dict:
+    """RAG 检索：转发到 knowledge_service.search"""
+    question = args.get("question", "").strip()
+    if not question:
+        return {"success": False, "result": "question 不能为空"}
+    top_k = int(args.get("top_k", 5))
+    try:
+        r = await knowledge_service.search(question, top_k)
+        if "error" in r:
+            return {"success": False, "result": r["error"]}
+        return {"success": True, "result": r.get("answer", "")}
+    except Exception as e:
+        return {"success": False, "result": f"知识库检索失败: {e}"}
+
+
+async def _handle_query_wiki(args: dict) -> dict:
+    """LLM Wiki 查询：转发到 knowledge_service.wiki_query"""
+    question = args.get("question", "").strip()
+    if not question:
+        return {"success": False, "result": "question 不能为空"}
+    try:
+        r = await knowledge_service.wiki_query(question)
+        if "error" in r:
+            return {"success": False, "result": r["error"]}
+        return {"success": True, "result": r.get("answer", "")}
+    except Exception as e:
+        return {"success": False, "result": f"Wiki 查询失败: {e}"}
+
+
+async def _handle_kb_stats(args: dict) -> dict:
+    """知识库统计：通过 /tasks 间接不可用，这里返回健康与提示"""
+    try:
+        h = await knowledge_service.health()
+        return {"success": True, "result": f"知识库状态: {h.get('status', '未知')}。详细统计请运行 zotero_parse_rag_core.py --stats"}
+    except Exception as e:
+        return {"success": False, "result": f"知识库离线: {e}"}

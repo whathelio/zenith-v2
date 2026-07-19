@@ -75,7 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_type ON memories(type);
 
 
 def _migrate_schedules():
-    """迁移 schedules 表 — 新增 importance/category/impact/country/remind_before 字段。
+    """迁移 schedules 表 — 新增 importance/category/impact/country/remind_before/goal_id/recurrence/parent_id 字段。
     使用 ALTER TABLE ADD COLUMN（SQLite 支持逐字段添加）。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
@@ -90,10 +90,63 @@ def _migrate_schedules():
             ("impact", "TEXT DEFAULT ''"),
             ("country", "TEXT DEFAULT ''"),
             ("remind_before", "INTEGER DEFAULT 0"),
+            ("goal_id", "INTEGER DEFAULT NULL"),
+            ("recurrence", "TEXT DEFAULT ''"),
+            ("parent_id", "INTEGER DEFAULT NULL"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
                 c.execute(f"ALTER TABLE schedules ADD COLUMN {col_name} {col_def}")
+        c.commit()
+    finally:
+        c.close()
+
+
+def _migrate_notes():
+    """迁移 notes 表 — 新增 stage/recorded_at/distilled_at/distilled_into 字段。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(notes)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        new_cols = [
+            ("stage", "TEXT DEFAULT 'raw'"),
+            ("recorded_at", "TEXT"),
+            ("distilled_at", "TEXT"),
+            ("distilled_into", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in new_cols:
+            if col_name not in cols:
+                c.execute(f"ALTER TABLE notes ADD COLUMN {col_name} {col_def}")
+        # 旧数据初始化：stage 为 raw，recorded_at 用 created_at 回填
+        if "stage" in cols:
+            c.execute("UPDATE notes SET stage = 'raw' WHERE stage IS NULL OR stage = ''")
+        c.commit()
+    finally:
+        c.close()
+
+
+def _migrate_memories():
+    """迁移 memories 表 — 新增 recorded_at/distilled_from 字段。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(memories)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        new_cols = [
+            ("recorded_at", "TEXT"),
+            ("distilled_from", "INTEGER DEFAULT NULL"),
+        ]
+        for col_name, col_def in new_cols:
+            if col_name not in cols:
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+        # 旧数据回填：recorded_at 用 created_at
+        if "recorded_at" in cols:
+            c.execute("UPDATE memories SET recorded_at = created_at WHERE recorded_at IS NULL OR recorded_at = ''")
         c.commit()
     finally:
         c.close()
@@ -115,11 +168,47 @@ def _migrate_conversations():
         c.close()
 
 
+def _migrate_market_reports():
+    """迁移 market_reports 表 — 新增 markdown_text 列（纯文本分析报告）。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(market_reports)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        if "markdown_text" not in cols:
+            c.execute("ALTER TABLE market_reports ADD COLUMN markdown_text TEXT DEFAULT ''")
+            c.commit()
+    finally:
+        c.close()
+
+
+def _migrate_goals():
+    """迁移 goals 表 — 新增 active_days 字段（存储 JSON 数组）。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(goals)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        if "active_days" not in cols:
+            c.execute("ALTER TABLE goals ADD COLUMN active_days TEXT DEFAULT '[]'")
+            c.commit()
+    finally:
+        c.close()
+
+
 def init_db():
     # 先迁移旧数据库的 CHECK 约束（新增 experience 类型）
     _migrate_memory_types()
     _migrate_schedules()
     _migrate_conversations()
+    _migrate_market_reports()
+    _migrate_notes()
+    _migrate_memories()
+    _migrate_goals()
     with db() as c:
         c.executescript("""
 CREATE TABLE IF NOT EXISTS conversations (
@@ -146,6 +235,8 @@ CREATE TABLE IF NOT EXISTS memories (
     importance INTEGER DEFAULT 3,
     keywords TEXT,
     source_conv_id TEXT,
+    recorded_at TEXT,
+    distilled_from INTEGER DEFAULT NULL,
     created_at TEXT
 );
 
@@ -163,10 +254,42 @@ CREATE TABLE IF NOT EXISTS schedules (
     impact TEXT DEFAULT '' CHECK(impact IN ('','bullish','bearish','neutral')),
     country TEXT DEFAULT '',
     remind_before INTEGER DEFAULT 0,
+    goal_id INTEGER DEFAULT NULL,
+    recurrence TEXT DEFAULT '',
+    parent_id INTEGER DEFAULT NULL,
     source TEXT DEFAULT 'manual',
     confirmed_at TEXT,
     created_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS schedule_reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id INTEGER NOT NULL,
+    reminded_at TEXT NOT NULL,
+    FOREIGN KEY(schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sch_reminder_schedule ON schedule_reminders(schedule_id);
+
+CREATE TABLE IF NOT EXISTS schedule_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    star INTEGER DEFAULT 1,
+    previous TEXT DEFAULT '',
+    consensus TEXT DEFAULT '',
+    actual TEXT DEFAULT '',
+    revised TEXT DEFAULT '',
+    affect_txt TEXT DEFAULT '',
+    impact TEXT DEFAULT '' CHECK(impact IN ('','bullish','bearish','neutral')),
+    country TEXT DEFAULT '',
+    category TEXT DEFAULT 'economic' CHECK(category IN ('economic','market','other')),
+    source TEXT DEFAULT 'jin10',
+    source_id TEXT DEFAULT '',
+    fetched_at TEXT,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_events_time ON schedule_events(event_time);
+CREATE INDEX IF NOT EXISTS idx_schedule_events_name ON schedule_events(name);
 
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,6 +298,10 @@ CREATE TABLE IF NOT EXISTS notes (
     tags TEXT DEFAULT '',
     source TEXT DEFAULT 'manual',
     status TEXT DEFAULT 'confirmed' CHECK(status IN ('proposed','confirmed','cancelled')),
+    stage TEXT DEFAULT 'raw' CHECK(stage IN ('raw','refined','distilled')),
+    recorded_at TEXT,
+    distilled_at TEXT,
+    distilled_into TEXT DEFAULT '',
     created_at TEXT,
     updated_at TEXT
 );
@@ -195,6 +322,7 @@ CREATE TABLE IF NOT EXISTS goals (
     status TEXT DEFAULT 'active' CHECK(status IN ('active','completed','cancelled')),
     start_date TEXT,
     end_date TEXT,
+    active_days TEXT DEFAULT '[]',
     created_at TEXT,
     updated_at TEXT
 );
@@ -253,6 +381,7 @@ CREATE TABLE IF NOT EXISTS market_reports (
     analysis_text TEXT NOT NULL,
     daily_advice TEXT DEFAULT '',
     weekly_advice TEXT DEFAULT '',
+    markdown_text TEXT DEFAULT '',
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_market_date ON market_reports(report_date);
@@ -421,13 +550,14 @@ def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
 
 
 def mem_add(type_: str, content: str, importance: int = 3,
-            keywords: str = "", source_conv_id: str = "") -> int:
+            keywords: str = "", source_conv_id: str = "",
+            recorded_at: str = "", distilled_from: Optional[int] = None) -> int:
     now = _now()
     with db() as c:
         cur = c.execute(
-            "INSERT INTO memories (type, content, importance, keywords, source_conv_id, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (type_, content, importance, keywords, source_conv_id, now)
+            "INSERT INTO memories (type, content, importance, keywords, source_conv_id, recorded_at, distilled_from, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (type_, content, importance, keywords, source_conv_id, recorded_at or now, distilled_from, now)
         )
         return cur.lastrowid
 
@@ -480,8 +610,8 @@ def sch_add(data: dict) -> int:
         cur = c.execute(
             """INSERT INTO schedules
                (title, description, start_time, end_time, location, status, priority,
-                importance, category, impact, country, remind_before, source, confirmed_at, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                importance, category, impact, country, remind_before, goal_id, recurrence, parent_id, source, confirmed_at, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["title"],
                 data.get("description", ""),
@@ -495,6 +625,9 @@ def sch_add(data: dict) -> int:
                 data.get("impact", ""),
                 data.get("country", ""),
                 data.get("remind_before", 0),
+                data.get("goal_id", None),
+                data.get("recurrence", ""),
+                data.get("parent_id", None),
                 data.get("source", "manual"),
                 now if status == "confirmed" else None,
                 now,
@@ -527,7 +660,7 @@ def sch_get(sid: int) -> Optional[dict]:
     return dict(r) if r else None
 
 
-_SCHEDULE_COLUMNS = {"title", "description", "start_time", "end_time", "location", "status", "priority", "importance", "category", "impact", "country", "remind_before", "source", "confirmed_at"}
+_SCHEDULE_COLUMNS = {"title", "description", "start_time", "end_time", "location", "status", "priority", "importance", "category", "impact", "country", "remind_before", "goal_id", "recurrence", "parent_id", "source", "confirmed_at"}
 
 
 def sch_update(sid: int, data: dict):
@@ -557,16 +690,24 @@ def sch_del(sid: int):
 
 def note_add(data: dict) -> int:
     now = _now()
+    recorded = data.get("recorded_at") or now
+    stage = data.get("stage", "raw")
+    if stage not in ("raw", "refined", "distilled"):
+        stage = "raw"
     with db() as c:
         cur = c.execute(
-            "INSERT INTO notes (title, content, tags, source, status, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO notes (title, content, tags, source, status, stage, recorded_at, distilled_at, distilled_into, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 data["title"],
                 data.get("content", ""),
                 data.get("tags", ""),
                 data.get("source", "manual"),
                 data.get("status", "confirmed"),
+                stage,
+                recorded,
+                data.get("distilled_at", ""),
+                data.get("distilled_into", ""),
                 now,
                 now,
             )
@@ -608,7 +749,7 @@ def note_get(nid: int) -> Optional[dict]:
     return dict(r) if r else None
 
 
-_NOTE_COLUMNS = {"title", "content", "tags", "source", "status"}
+_NOTE_COLUMNS = {"title", "content", "tags", "source", "status", "stage", "recorded_at", "distilled_at", "distilled_into"}
 
 
 def note_update(nid: int, data: dict):
@@ -654,23 +795,42 @@ def goal_add(data: dict) -> int:
     except ValueError:
         end_date = (_dt.now() + _td(days=days)).strftime("%Y-%m-%d")
 
+    # 解析 active_days（默认空数组 JSON）
+    raw_active_days = data.get("active_days", [])
+    if isinstance(raw_active_days, (list, tuple)):
+        active_days = json.dumps(list(raw_active_days), ensure_ascii=False)
+    else:
+        active_days = str(raw_active_days) if raw_active_days else '[]'
+
     with db() as c:
         cur = c.execute(
             """INSERT INTO goals
                (title, start_value, target_value, current_value, daily_target, strategy,
-                status, start_date, end_date, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                status, start_date, end_date, active_days, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["title"],
                 sv, tv, sv,
                 daily,
                 data.get("strategy", "compound"),
                 "active",
-                start_date, end_date,
+                start_date, end_date, active_days,
                 now, now,
             )
         )
         return cur.lastrowid
+
+
+def _parse_active_days(value):
+    """将 active_days 字符串解析为 list；失败返回空数组。"""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if not value:
+        return []
+    try:
+        return json.loads(str(value))
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 def goal_list(status: str = "") -> list:
@@ -682,16 +842,23 @@ def goal_list(status: str = "") -> list:
     q += " ORDER BY created_at DESC"
     with db() as c:
         rs = c.execute(q, ps).fetchall()
-    return [dict(r) for r in rs]
+    items = [dict(r) for r in rs]
+    for item in items:
+        item["active_days"] = _parse_active_days(item.get("active_days"))
+    return items
 
 
 def goal_get(gid: int) -> Optional[dict]:
     with db() as c:
         r = c.execute("SELECT * FROM goals WHERE id = ?", (gid,)).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    item = dict(r)
+    item["active_days"] = _parse_active_days(item.get("active_days"))
+    return item
 
 
-_GOAL_COLUMNS = {"title", "start_value", "target_value", "current_value", "daily_target", "strategy", "status", "start_date", "end_date"}
+_GOAL_COLUMNS = {"title", "start_value", "target_value", "current_value", "daily_target", "strategy", "status", "start_date", "end_date", "active_days"}
 
 
 def goal_update(gid: int, data: dict):
@@ -701,9 +868,13 @@ def goal_update(gid: int, data: dict):
     for k, v in data.items():
         if k not in _GOAL_COLUMNS:
             continue
-        if v is not None:
-            fs.append(f"{k} = ?")
-            ps.append(v)
+        if v is None:
+            continue
+        # active_days 以 JSON 字符串存储
+        if k == "active_days" and isinstance(v, (list, tuple)):
+            v = json.dumps(list(v), ensure_ascii=False)
+        fs.append(f"{k} = ?")
+        ps.append(v)
     # 如果变更了 start_value/target_value/daily_target，重新计算 end_date
     if "start_value" in data or "target_value" in data or "daily_target" in data:
         g = goal_get(gid)
@@ -747,17 +918,38 @@ def goal_get_stats(gid: int) -> Optional[dict]:
     rng = tv - sv
     progress = round((cv - sv) / rng * 100, 1) if rng > 0 else 0
     from datetime import datetime as _dt
-    days_passed = max((_dt.now() - _dt.fromisoformat(g.get("start_date", _now()))).days, 1)
+    from .timezone import now_tz, DEFAULT_TIMEZONE
+    now = now_tz()
+    try:
+        start = _dt.fromisoformat(g.get("start_date", now.isoformat()))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=DEFAULT_TIMEZONE)
+    except ValueError:
+        start = now
+    try:
+        end = _dt.fromisoformat(g.get("end_date", now.isoformat()))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=DEFAULT_TIMEZONE)
+    except ValueError:
+        end = now
+    days_passed = max((now - start).days, 1)
     daily_return = 0.0
     if sv > 0:
         daily_return = round((pow(cv / sv, 1 / days_passed) - 1) * 100, 2) if days_passed > 0 else 0
+
+    # 关联日程统计
+    related_schedules = [s for s in sch_list() if s.get("goal_id") == gid]
+    completed_schedules = [s for s in related_schedules if s.get("status") == "done"]
+
     return {
         "progress": min(progress, 100),
-        "days_total": (_dt.fromisoformat(g.get("end_date", _now())) - _dt.fromisoformat(g.get("start_date", _now()))).days,
+        "days_total": (end - start).days,
         "days_passed": days_passed,
         "daily_return": daily_return,
         "remaining": max(tv - cv, 0),
         "on_track": daily_return >= float(g.get("daily_target", 5)),
+        "schedule_count": len(related_schedules),
+        "completed_schedule_count": len(completed_schedules),
     }
 
 
@@ -911,8 +1103,8 @@ def market_report_add(data: dict) -> int:
         cur = c.execute(
             """INSERT INTO market_reports
                (report_date, gold_price, factor_data, events_overdue, events_upcoming,
-                analysis_text, daily_advice, weekly_advice, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                analysis_text, daily_advice, weekly_advice, markdown_text, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["report_date"],
                 data.get("gold_price", ""),
@@ -922,6 +1114,7 @@ def market_report_add(data: dict) -> int:
                 data["analysis_text"],
                 data.get("daily_advice", ""),
                 data.get("weekly_advice", ""),
+                data.get("markdown_text", ""),
                 now,
             )
         )
@@ -1138,10 +1331,17 @@ def skill_update(sid: int, data: dict):
             continue
         if v is not None:
             # steps 和 tags 需要转 JSON 存储
-            if k == "steps" and isinstance(v, list):
-                v = _json.dumps(v)
-            elif k == "tags" and isinstance(v, list):
-                v = _json.dumps(v)
+            if k in ("steps", "tags"):
+                if isinstance(v, list):
+                    v = _json.dumps(v)
+                elif isinstance(v, str):
+                    # 如果已经是 JSON 字符串则保留，否则保持原样
+                    try:
+                        _json.loads(v)
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    v = _json.dumps(v)
             fs.append(f"{k} = ?")
             ps.append(v)
     if not fs:
@@ -1163,14 +1363,33 @@ def skill_increment_usage(sid: int):
 
 
 def skill_find_by_scene(scene: str) -> list:
-    """根据触发场景查找匹配的技能"""
+    """根据触发场景查找匹配的技能。
+
+    匹配策略：从用户输入中提取 2-3 字 n-gram，在 trigger_scene 中做子串匹配。
+    匹配 n-gram 数量越多，排名越靠前。由于技能数量少，直接在 Python 中匹配。
+    """
     import json as _json
+    import re as _re
+
+    if not scene or not scene.strip():
+        return []
+
+    # 提取用户查询的 2-3 字 n-gram（中文）和 2+ 字母词（英文）
+    query = scene.strip().lower()
+    bigrams = {query[i:i+2] for i in range(len(query) - 1) if len(query[i:i+2].strip()) == 2}
+    trigrams = {query[i:i+3] for i in range(len(query) - 2) if len(query[i:i+3].strip()) == 3}
+    en_words = set(_re.findall(r"[a-z0-9]{2,}", query))
+    query_keywords = bigrams | trigrams | en_words
+
+    if not query_keywords:
+        return []
+
+    # 获取所有已确认技能
     with db() as c:
         rs = c.execute(
-            "SELECT * FROM skills WHERE trigger_scene LIKE ? AND confirmed_by_user = 1 "
-            "ORDER BY usage_count DESC",
-            (f"%{scene}%",)
+            "SELECT * FROM skills WHERE confirmed_by_user = 1 ORDER BY usage_count DESC"
         ).fetchall()
+
     results = []
     for r in rs:
         d = dict(r)
@@ -1182,8 +1401,22 @@ def skill_find_by_scene(scene: str) -> list:
             d["tags"] = _json.loads(d.get("tags", "[]"))
         except (ValueError, TypeError):
             d["tags"] = []
+
+        trigger = (d.get("trigger_scene") or "").lower()
+        if not trigger:
+            continue
+
+        # 计算匹配的关键词数量
+        matched_keywords = {kw for kw in query_keywords if kw in trigger}
+        if not matched_keywords:
+            continue
+
+        d["_match_score"] = len(matched_keywords)
         results.append(d)
-    return results
+
+    # 按匹配分数降序，返回前 3 条
+    results.sort(key=lambda x: x.pop("_match_score", 0), reverse=True)
+    return results[:3]
 
 
 # ---------------------------------------------------------------------------
@@ -1202,8 +1435,110 @@ def settings_put(key: str, value: str):
 
 
 # ---------------------------------------------------------------------------
+# Schedule Events Cache (外部财经日历事件缓存)
+# ---------------------------------------------------------------------------
+
+def event_add_or_update(data: dict) -> int:
+    """添加或更新外部财经事件缓存。根据 source + source_id 去重，否则按 name + event_time 去重。"""
+    now = _now()
+    name = data.get("name", "").strip()
+    event_time = data.get("event_time", "").strip()
+    source = data.get("source", "jin10")
+    source_id = data.get("source_id", "").strip()
+
+    with db() as c:
+        if source_id:
+            existing = c.execute(
+                "SELECT id FROM schedule_events WHERE source = ? AND source_id = ?",
+                (source, source_id),
+            ).fetchone()
+        else:
+            existing = c.execute(
+                "SELECT id FROM schedule_events WHERE name = ? AND event_time = ?",
+                (name, event_time),
+            ).fetchone()
+
+        if existing:
+            eid = existing["id"]
+            c.execute(
+                """UPDATE schedule_events SET
+                    name = ?, event_time = ?, star = ?, previous = ?, consensus = ?,
+                    actual = ?, revised = ?, affect_txt = ?, impact = ?, country = ?,
+                    category = ?, updated_at = ?
+                WHERE id = ?""",
+                (
+                    name, event_time, data.get("star", 1), data.get("previous", ""),
+                    data.get("consensus", ""), data.get("actual", ""), data.get("revised", ""),
+                    data.get("affect_txt", ""), data.get("impact", ""), data.get("country", ""),
+                    data.get("category", "economic"), now, eid,
+                ),
+            )
+            return eid
+
+        cur = c.execute(
+            """INSERT INTO schedule_events
+                (name, event_time, star, previous, consensus, actual, revised,
+                 affect_txt, impact, country, category, source, source_id, fetched_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                name, event_time, data.get("star", 1), data.get("previous", ""),
+                data.get("consensus", ""), data.get("actual", ""), data.get("revised", ""),
+                data.get("affect_txt", ""), data.get("impact", ""), data.get("country", ""),
+                data.get("category", "economic"), source, source_id, now, now,
+            ),
+        )
+        return cur.lastrowid
+
+
+def event_list(date_from: str = "", date_to: str = "", name_search: str = "", min_star: int = 1, limit: int = 200) -> list:
+    """列出缓存的财经事件。"""
+    q = "SELECT * FROM schedule_events WHERE 1=1"
+    ps = []
+    if date_from:
+        q += " AND event_time >= ?"
+        ps.append(date_from)
+    if date_to:
+        q += " AND event_time <= ?"
+        ps.append(date_to)
+    if name_search:
+        q += " AND name LIKE ?"
+        ps.append(f"%{name_search}%")
+    if min_star:
+        q += " AND star >= ?"
+        ps.append(min_star)
+    q += " ORDER BY event_time ASC LIMIT ?"
+    ps.append(limit)
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    return [dict(r) for r in rs]
+
+
+def event_find_by_name(name: str, date_from: str = "", date_to: str = "") -> list:
+    """按事件名称模糊匹配查找。"""
+    q = "SELECT * FROM schedule_events WHERE name LIKE ?"
+    ps = [f"%{name}%"]
+    if date_from:
+        q += " AND event_time >= ?"
+        ps.append(date_from)
+    if date_to:
+        q += " AND event_time <= ?"
+        ps.append(date_to)
+    q += " ORDER BY event_time ASC LIMIT 20"
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    return [dict(r) for r in rs]
+
+
+def event_delete(eid: int):
+    """删除缓存事件。"""
+    with db() as c:
+        c.execute("DELETE FROM schedule_events WHERE id = ?", (eid,))
+
+
+# ---------------------------------------------------------------------------
 # Utils
 # ---------------------------------------------------------------------------
 
 def _now() -> str:
-    return datetime.now().isoformat()
+    from .timezone import now_tz
+    return now_tz().isoformat()

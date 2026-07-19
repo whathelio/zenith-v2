@@ -1,15 +1,24 @@
-import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { api, type Goal, type GoalStats } from '../shared/api'
+import { useState } from 'react'
+import { api, type Goal } from '../shared/api'
+import GoalDetailModal from '../components/GoalDetailModal'
+import { useCalendarGoal } from '../contexts/CalendarGoalContext'
 
+function formatMoney(v: number): string {
+  if (v >= 100000) return `${(v / 10000).toFixed(1)}万`
+  if (v >= 10000) return `${(v / 10000).toFixed(2)}万`
+  return v.toLocaleString()
+}
+
+/* ══════════════════════════════════════════
+   GoalsView — 目标列表 + 详情入口
+   ══════════════════════════════════════════ */
 export default function GoalsView() {
-  const navigate = useNavigate()
-  const [goals, setGoals] = useState<Goal[]>([])
-  const [stats, setStats] = useState<Record<number, GoalStats>>({})
-  const [loading, setLoading] = useState(false)
+  // 目标状态统一走 CalendarGoalContext（S2 灰度收敛）
+  const { goals, goalStats: stats, loadGoals: reloadGoals } = useCalendarGoal()
   const [showCreate, setShowCreate] = useState(false)
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null)
   const [showDelete, setShowDelete] = useState<Goal | null>(null)
+  const [detailGoal, setDetailGoal] = useState<Goal | null>(null)
 
   // Form
   const [formTitle, setFormTitle] = useState('')
@@ -17,25 +26,6 @@ export default function GoalsView() {
   const [formTarget, setFormTarget] = useState('')
   const [formDaily, setFormDaily] = useState('5')
   const [formCurrent, setFormCurrent] = useState('')
-
-  const loadGoals = async () => {
-    setLoading(true)
-    try {
-      const gs = await api.listGoals()
-      setGoals(gs)
-      // Load stats for each
-      const ss: Record<number, GoalStats> = {}
-      for (const g of gs) {
-        try {
-          ss[g.id] = await api.getGoalStats(g.id)
-        } catch { /* skip */ }
-      }
-      setStats(ss)
-    } catch { /* silent */ }
-    finally { setLoading(false) }
-  }
-
-  useEffect(() => { loadGoals() }, [])
 
   const openCreate = () => {
     setEditingGoal(null)
@@ -77,7 +67,7 @@ export default function GoalsView() {
         })
       }
       setShowCreate(false)
-      loadGoals()
+      reloadGoals()
     } catch (err) {
       console.error('保存失败', err)
     }
@@ -88,7 +78,8 @@ export default function GoalsView() {
     try {
       await api.deleteGoal(showDelete.id)
       setShowDelete(null)
-      loadGoals()
+      setEditingGoal(null)
+      reloadGoals()
     } catch (err) {
       console.error('删除失败', err)
     }
@@ -97,15 +88,10 @@ export default function GoalsView() {
   const handleUpdateProgress = async (g: Goal, currentValue: number) => {
     try {
       await api.updateGoal(g.id, { current_value: currentValue })
-      loadGoals()
+      reloadGoals()
     } catch (err) {
       console.error('更新进度失败', err)
     }
-  }
-
-  const formatMoney = (v: number) => {
-    if (v >= 10000) return (v / 10000).toFixed(2) + '万'
-    return v.toLocaleString()
   }
 
   return (
@@ -115,9 +101,8 @@ export default function GoalsView() {
           <span className="topbar-title">🎯 目标追踪</span>
           <div className="topbar-actions">
             <a href="/" className="btn btn-sm">🏠 主页</a>
-            <a href="/calendar" className="btn btn-sm">📅 日历</a>
-            <a href="/schedules" className="btn btn-sm">📋 日程</a>
-            <a href="/memories" className="btn btn-sm">🧠 记忆</a>
+            <a href="/calendar" className="btn btn-sm">📅 日程</a>
+            <a href="/library" className="btn btn-sm">📚 知识库</a>
             <a href="/settings" className="btn btn-sm">⚙ 设置</a>
           </div>
         </div>
@@ -129,9 +114,7 @@ export default function GoalsView() {
             </button>
           </div>
 
-          {loading ? (
-            <div className="cal-empty"><span>加载中...</span></div>
-          ) : goals.length === 0 ? (
+          {goals.length === 0 ? (
             <div className="cal-empty">
               <span style={{ fontSize: 32 }}>🎯</span>
               <span>暂无目标</span>
@@ -148,7 +131,8 @@ export default function GoalsView() {
                   <div
                     key={g.id}
                     className={`goal-card ${g.status === 'active' ? 'goal-active' : ''}`}
-                    onClick={() => openEdit(g)}
+                    onClick={() => setDetailGoal(g)}
+                    style={{ cursor: 'pointer' }}
                   >
                     <div className="goal-header">
                       <span className="goal-title">{g.title}</span>
@@ -162,7 +146,7 @@ export default function GoalsView() {
                       <div className="goal-progress-fill" style={{ width: `${Math.min(progress, 100)}%` }} />
                     </div>
                     <div className="goal-progress-text">
-                      <span>{progress}%</span>
+                      <span>{progress.toFixed(0)}%</span>
                       <span>{formatMoney(g.current_value)} / {formatMoney(g.target_value)}</span>
                     </div>
 
@@ -214,6 +198,29 @@ export default function GoalsView() {
           )}
         </div>
       </div>
+
+      {/* Goal Detail Modal */}
+      {detailGoal && (
+        <GoalDetailModal
+          goal={detailGoal}
+          stats={stats[detailGoal.id] || null}
+          onClose={() => setDetailGoal(null)}
+          onUpdate={() => {
+            reloadGoals()
+            api.getGoal(detailGoal.id).then(g => setDetailGoal(g)).catch(() => {})
+          }}
+          onEdit={() => {
+            setEditingGoal(detailGoal)
+            setFormTitle(detailGoal.title)
+            setFormStart(String(detailGoal.start_value))
+            setFormTarget(String(detailGoal.target_value))
+            setFormDaily(String(detailGoal.daily_target))
+            setFormCurrent(String(detailGoal.current_value))
+            setShowCreate(true)
+            setDetailGoal(null)
+          }}
+        />
+      )}
 
       {/* Create/Edit Modal */}
       {showCreate && (

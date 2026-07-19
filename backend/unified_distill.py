@@ -969,6 +969,41 @@ def _save_txt_plan(content: str, filename: str) -> str:
     return filepath
 
 
+# 外部归档根目录 — 每日/每周/行情蒸馏输出同步归档到此
+# 用户希望计划表/总结类内容统一放到 O:/计划书A1
+_ARCHIVE_BASE = "O:/计划书A1"
+
+
+def _archive_external(content: str, kind: str, date_str: str, filename: str) -> Optional[str]:
+    """将蒸馏内容归档到外部目录。
+
+    路径: { _ARCHIVE_BASE }/{ kind }/{ date_str }/{ filename }
+    写失败仅记录日志，不阻塞主流程。
+
+    Args:
+        content: 文本内容
+        kind: 归档类别 (daily / weekly / market / conv / schedule / memory / all)
+        date_str: 日期字符串 (YYYY-MM-DD)
+        filename: 文件名
+
+    Returns:
+        str | None: 成功返回路径，失败返回 None
+    """
+    if not content:
+        return None
+    try:
+        archive_dir = os.path.join(_ARCHIVE_BASE, kind, date_str)
+        os.makedirs(archive_dir, exist_ok=True)
+        filepath = os.path.join(archive_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"外部归档成功: {filepath}")
+        return filepath
+    except Exception as e:
+        logger.warning(f"外部归档失败（不影响主流程）: {e}")
+        return None
+
+
 def get_txt_content(result: dict) -> str:
     """从蒸馏结果中获取 txt 文本内容（不保存文件）
     
@@ -1049,6 +1084,8 @@ async def distill_daily(date: str = "", save_txt: bool = True) -> dict:
     # 5. 保存 txt 文件到每日计划目录
     if save_txt:
         result["txt_path"] = _save_txt_plan(txt_content, f"daily_{date}.txt")
+        # 同步归档到外部目录
+        _archive_external(txt_content, kind="daily", date_str=date, filename=f"daily_{date}.txt")
 
     logger.info(f"每日蒸馏完成: {date}, 已保存{saved_count}条记忆")
     return result
@@ -1137,6 +1174,8 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True) -> dict:
     # 5. 保存 txt 文件到每日计划目录
     if save_txt:
         result["txt_path"] = _save_txt_plan(txt_content, f"weekly_{week_start}.txt")
+        # 同步归档到外部目录
+        _archive_external(txt_content, kind="weekly", date_str=week_start, filename=f"weekly_{week_start}.txt")
 
     logger.info(f"每周蒸馏完成: {week_start}, 已保存{saved_count}条记忆")
     return result

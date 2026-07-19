@@ -41,6 +41,9 @@ async def chat_stream(
         "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", 4096),
         "stream": True,
     }
+    # GLM-5.2 默认开启 thinking 会消耗大量 token 导致 content 为空，显式禁用
+    if "glm" in model.lower():
+        payload["thinking"] = {"type": "disabled"}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -134,6 +137,9 @@ async def call_llm(
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # GLM-5.2 禁用 thinking 避免 token 被 reasoning 耗尽
+    if "glm" in model.lower():
+        payload["thinking"] = {"type": "disabled"}
     if tools:
         payload["tools"] = tools
     if response_format:
@@ -206,7 +212,47 @@ async def detect_schedule(user_text: str) -> list[dict]:
     return _parse_json_response(content)
 
 
-async def detect_thought(user_text: str) -> list[dict]:
+async def extract_datetime(user_text: str, reference_iso: Optional[str] = None) -> str:
+    """从用户输入中抽取日程时间，返回 ISO 格式字符串（失败返回空字符串）"""
+    from datetime import datetime
+    from .timezone import now_tz, parse_time_to_iso, DEFAULT_TIMEZONE
+
+    # 先尝试规则解析（快速、省钱）
+    parsed = parse_time_to_iso(user_text, reference=now_tz())
+    if parsed:
+        return parsed
+
+    # 规则解析失败时，再用 LLM 兜底
+    today = now_tz().strftime("%Y-%m-%d %A %H:%M")
+    prompt = f"""从用户输入中抽取日程时间。今天是 {today}，默认时区 CST (+08:00)。
+如果输入中包含时间，只返回一个 ISO 格式时间字符串（如 2026-07-18T15:00:00+08:00）。
+如果没有时间、只有日期，返回日期零时（如 2026-07-18T00:00:00+08:00）。
+如果完全无法判断，只返回空字符串 "" 。
+
+只返回时间字符串，不要加任何解释。"""
+
+    msg = await call_llm(
+        [{"role": "user", "content": f"用户说：{user_text}\n{prompt}"}],
+        temperature=0.1, max_tokens=200
+    )
+    content = msg.get("content", "").strip()
+    if content.startswith("Error:"):
+        return ""
+
+    # 清理可能的代码块或多余字符
+    content = content.strip('"').strip()
+    if not content:
+        return ""
+
+    try:
+        dt = datetime.fromisoformat(content)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=DEFAULT_TIMEZONE)
+        return dt.isoformat()
+    except ValueError:
+        # 如果 LLM 返回的是格式时间，尝试用 parse_time_to_iso 再解析
+        return parse_time_to_iso(content, reference=now_tz())
+
     """检测值得记录的想法/观点"""
     prompt = f"""判断用户输入中是否有值得记录的思考/想法/观点。
 返回 JSON 数组：[{{"title":"标题","content":"内容","tags":"逗号分隔标签"}}]

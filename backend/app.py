@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import asyncio
 import sys
 import webbrowser
@@ -14,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +23,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import database as db
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG
-from .tools import TOOLS_SCHEMA, execute_tool
+from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
 from .llm_client import chat_stream, plan_time, call_llm
 from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate
 from .confirm_flow import get_pending_proposals, confirm_proposal, reject_proposal, modify_proposal
 from .confirm_flow import TutorialFlow, list_active_tutorials
 from .context_compressor import maybe_compress
-from .schedule_reminder import check_reminders
+from .schedule_reminder import check_reminders, get_due_reminders, get_upcoming_schedules, REMINDER_PRESETS
+from .timezone import now_tz
+from .recurrence import expand_recurring
 from .file_analyzer import analyze_file_stream
 from .unified_distill import distill_conversation, distill_schedules, distill_memories, distill_all, distill_daily, distill_weekly
+from . import knowledge_service
 
 PROJECT_DIR = Path(__file__).parent.parent
 FRONTEND_DIST = PROJECT_DIR / "frontend" / "dist"
@@ -49,7 +53,6 @@ async def lifespan(app: FastAPI):
     cfg = load_config()
     if cfg.get('market_analysis_enabled', True):
         from .market_analyzer import start_market_scheduler
-        import asyncio
         scheduler_task = asyncio.create_task(start_market_scheduler())
         # yield 时保持任务运行
 
@@ -60,8 +63,28 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_daily_distill_loop())
     # 启动每周蒸馏定时任务（每周日23:00）
     asyncio.create_task(_weekly_distill_loop())
+    # 启动日程提醒后台扫描任务（每5分钟检查 remind_before 到期）
+    asyncio.create_task(_reminder_loop())
 
     yield
+
+
+async def _reminder_loop():
+    """后台每5分钟扫描 remind_before 到期提醒，并记录已提醒状态"""
+    logger = logging.getLogger("zenith.schedule")
+    while True:
+        try:
+            result = get_due_reminders()
+            due = result.get("due", [])
+            overdue = result.get("overdue", [])
+            if due or overdue:
+                logger.info(
+                    "日程提醒扫描: %d 个即将到期, %d 个已逾期",
+                    len(due), len(overdue)
+                )
+        except Exception as e:
+            logger.warning("日程提醒扫描失败: %s", e)
+        await asyncio.sleep(5 * 60)
 
 
 async def _memory_maintenance_loop():
@@ -97,9 +120,60 @@ async def _auto_distill_conv(conv_id: str):
         logging.getLogger("zenith.distill").warning("自动蒸馏失败: %s", e)
 
 
+# ===== 完成日程 → 自动提炼经验记忆 =====
+_pending_schedule_tasks: set = set()
+
+_SCHEDULE_MEMORY_PROMPT = """你是一个经验提炼助手。根据以下日程信息，生成一条简洁的经验教训记忆。
+
+输出 JSON 格式（不要额外文字）：
+{"content": "一句话经验总结（含发生了什么+学到了什么）", "importance": 1-5, "keywords": "关键词1,关键词2"}
+
+要求：
+- 内容简练，10-30字为宜
+- importance 根据事件价值评估（已完成任务3, 交易经验4-5, 重大事项4-5）
+- keywords 提取2-4个关键词"""
+
+
+async def _auto_extract_schedule_memory(sid: int, schedule: dict):
+    """后台任务：日程标记完成 → 提炼经验记忆"""
+    logger = logging.getLogger("zenith.memory")
+    title = schedule.get("title", "")
+    desc = schedule.get("description", "")
+    text_parts = [f"标题: {title}"]
+    if desc:
+        text_parts.append(f"描述: {desc}")
+    text_parts.append(f"地点: {schedule.get('location', '无')}")
+    text_parts.append(f"分类: {schedule.get('category', 'other')}")
+
+    source_text = "\n".join(text_parts)
+    try:
+        messages = [
+            {"role": "system", "content": _SCHEDULE_MEMORY_PROMPT},
+            {"role": "user", "content": source_text},
+        ]
+        result = await call_llm(messages, temperature=0.3, max_tokens=500,
+                                response_format={"type": "json_object"})
+        raw = result.get("content", "")
+        m = re.search(r'\{[\s\S]*\}', raw)
+        parsed = json.loads(m.group()) if m else json.loads(raw)
+        content = parsed.get("content", "").strip()
+        if not content:
+            logger.debug("日程#%d 完成: LLM 未生成有效记忆", sid)
+            return
+        importance = int(parsed.get("importance", 3))
+        keywords = parsed.get("keywords", "")
+
+        db.mem_add(type_="experience", content=content, importance=importance,
+                   keywords=keywords, source_conv_id=f"schedule_{sid}")
+        logger.info("日程#%d「%s」完成 → 已提炼经验记忆: %s", sid, title, content[:50])
+    except Exception as e:
+        logger.debug("日程#%d 自动提炼记忆失败: %s", sid, e)
+
+
 async def _daily_distill_loop():
     """每天 23:00 自动执行当日内容蒸馏"""
     import logging
+    from datetime import timedelta
     logger = logging.getLogger("zenith.distill")
     while True:
         now = datetime.now()
@@ -107,7 +181,7 @@ async def _daily_distill_loop():
         target = now.replace(hour=23, minute=0, second=0, microsecond=0)
         if now >= target:
             # 已过今天23点，等到明天23点
-            target = target.replace(day=target.day + 1)
+            target = target + timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         logger.info("每日蒸馏: 等待 %d 秒后执行（目标 %s）", int(wait_seconds), target.isoformat())
         await asyncio.sleep(wait_seconds)
@@ -128,6 +202,7 @@ async def _daily_distill_loop():
 async def _weekly_distill_loop():
     """每周日 23:00 自动执行当周内容蒸馏"""
     import logging
+    from datetime import timedelta
     logger = logging.getLogger("zenith.distill")
     while True:
         now = datetime.now()
@@ -139,7 +214,7 @@ async def _weekly_distill_loop():
         else:
             if days_until_sunday == 0:
                 days_until_sunday = 7  # 已过周日23点，等到下周日
-            target = (now + __import__('datetime').timedelta(days=days_until_sunday)).replace(
+            target = (now + timedelta(days=days_until_sunday)).replace(
                 hour=23, minute=0, second=0, microsecond=0)
         wait_seconds = (target - now).total_seconds()
         logger.info("每周蒸馏: 等待 %d 秒后执行（目标 %s）", int(wait_seconds), target.isoformat())
@@ -219,6 +294,60 @@ async def health():
     return {"status": "ok", "version": "2.0.0"}
 
 
+# ── 知识库薄代理（转发到外部 api_gateway） ──────────────────────
+@app.get("/api/knowledge/health")
+async def knowledge_health():
+    try:
+        return await knowledge_service.health()
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": str(e), "code": "GATEWAY_DOWN"})
+
+
+@app.post("/api/knowledge/search")
+async def knowledge_search(data: dict = Body(default=None)):
+    q = (data or {}).get("question", "").strip()
+    if not q:
+        raise HTTPException(400, "question is required")
+    top_k = int((data or {}).get("top_k", 5))
+    return await knowledge_service.search(q, top_k)
+
+
+@app.post("/api/knowledge/wiki")
+async def knowledge_wiki(data: dict = Body(default=None)):
+    q = (data or {}).get("question", "").strip()
+    if not q:
+        raise HTTPException(400, "question is required")
+    return await knowledge_service.wiki_query(q)
+
+
+@app.post("/api/knowledge/tasks")
+async def knowledge_create_task(data: dict = Body(default=None)):
+    t = (data or {}).get("type")
+    payload = (data or {}).get("payload", {})
+    if t not in ("search", "wiki", "agent"):
+        raise HTTPException(400, "type must be search|wiki|agent")
+    return await knowledge_service.create_task(t, payload)
+
+
+@app.get("/api/knowledge/tasks/{task_id}")
+async def knowledge_get_task(task_id: str):
+    return await knowledge_service.get_task(task_id)
+
+
+@app.get("/api/knowledge/tasks")
+async def knowledge_list_tasks(status: str | None = None, limit: int = 20):
+    return await knowledge_service.list_tasks(status, limit)
+
+
+@app.post("/api/knowledge/ingest")
+async def knowledge_ingest(file: UploadFile = File(...)):
+    """上传 PDF → 审查 → 入库（转发到 api_gateway）"""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "仅支持 PDF")
+    content = await file.read()
+    return await knowledge_service.ingest_pdf(file.filename, content)
+
+
 @app.post("/api/open-url")
 async def open_url(request: Request):
     """通过系统默认浏览器打开 URL"""
@@ -249,7 +378,7 @@ async def get_settings():
 
 
 @app.put("/api/settings")
-async def update_settings(data: dict):
+async def update_settings(data: dict = Body(default=None)):
     """更新配置 — 合并到现有配置，不覆盖未提供的字段"""
     existing = load_config()
     # 如果前端传回的是掩码 key，保留原有 key
@@ -265,7 +394,7 @@ async def update_settings(data: dict):
 # ═══════════════════════════════════════════════════════
 
 @app.post("/api/conversations")
-async def create_conversation(data: dict = None):
+async def create_conversation(data: dict = Body(default=None)):
     title = (data or {}).get("title", "New Chat") if data else "New Chat"
     return db.conv_create(title)
 
@@ -292,7 +421,7 @@ async def delete_conversation(conv_id: str):
 
 
 @app.put("/api/conversations/{conv_id}")
-async def rename_conversation(conv_id: str, data: dict):
+async def rename_conversation(conv_id: str, data: dict = Body(default=None)):
     """重命名对话"""
     title = data.get("title", "").strip()
     if not title:
@@ -553,6 +682,96 @@ def _parse_json_response_single(content: str) -> dict:
 
 _active_streams: dict[str, asyncio.Task] = {}  # conv_id → 后台处理任务
 
+# 对话中的待确认记忆整理计划：conv_id → {plan, message, created_at}
+_pending_consolidate: dict[str, dict] = {}
+
+
+async def _handle_consolidate_chat(
+    conv_id: str,
+    user_message: str,
+    event_queue: asyncio.Queue,
+):
+    """处理记忆整理意图：返回计划或执行结果，不走普通 LLM 流程。"""
+    # 1. 先检查是否有待执行计划 + 用户确认
+    pending = _pending_consolidate.get(conv_id)
+    confirm_words = ["确认执行", "执行", "确认", "删除", "开始整理"]
+    skip_words = ["跳过", "取消", "不", "不要", "算了"]
+    is_confirm = any(w in user_message for w in confirm_words)
+    is_skip = any(w in user_message for w in skip_words)
+
+    if pending:
+        if is_confirm and not is_skip:
+            try:
+                result = await apply_consolidate_plan(pending["plan"])
+                _pending_consolidate.pop(conv_id, None)
+                reply = (
+                    f"🧹 记忆整理已执行。\n"
+                    f"共删除 {result['deleted_count']} 条记忆（重复/过时）。\n"
+                    f"失败 {len(result['failed'])} 条。"
+                )
+                if result["deleted_ids"]:
+                    reply += f"\n删除 ID: {', '.join(str(x) for x in result['deleted_ids'])}"
+                if result["failed"]:
+                    reply += f"\n失败项: {result['failed'][:3]}"
+            except Exception as e:
+                reply = f"❌ 记忆整理执行失败: {e}"
+        elif is_skip:
+            _pending_consolidate.pop(conv_id, None)
+            reply = "已取消记忆整理。"
+        else:
+            # 用户没给明确指令，再次展示计划
+            reply = (
+                "我还在等你确认上次的记忆整理计划。\n\n"
+                + _format_consolidate_plan(pending["plan"])
+            )
+        event_queue.put_nowait(json.dumps({'type': 'text', 'content': reply}, ensure_ascii=False))
+        event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': reply, 'conversation_id': conv_id}, ensure_ascii=False))
+        db.msg_add(conv_id, "assistant", reply)
+        event_queue.put_nowait(json.dumps({'type': 'done'}))
+        event_queue.put_nowait(None)
+        return
+
+    # 2. 检测新意图
+    intent = await detect_consolidate_intent(user_message)
+    if not intent.get("trigger"):
+        # 不是整理意图，走正常流程：返回 False 让调用方继续
+        event_queue.put_nowait(None)
+        return
+
+    # 3. 生成整理计划
+    scope = intent.get("scope", "all")
+    type_ = ""
+    search = ""
+    if scope in ("personal_info", "preference", "event", "decision", "fact", "experience"):
+        type_ = scope
+    elif scope and scope != "all":
+        search = scope
+
+    plan = await generate_consolidate_plan(type_=type_, search=search)
+    formatted = _format_consolidate_plan(plan)
+
+    # 4. 如果没有任何候选，直接提示
+    if not plan.get("merge_groups") and not plan.get("outdated"):
+        reply = "🧹 我检查了记忆库，没有发现明显的重复或过时记忆，无需整理。"
+        event_queue.put_nowait(json.dumps({'type': 'text', 'content': reply}, ensure_ascii=False))
+        event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': reply, 'conversation_id': conv_id}, ensure_ascii=False))
+        db.msg_add(conv_id, "assistant", reply)
+        event_queue.put_nowait(json.dumps({'type': 'done'}))
+        event_queue.put_nowait(None)
+        return
+
+    # 5. 保存待确认计划，并返回计划给用户
+    _pending_consolidate[conv_id] = {
+        "plan": plan,
+        "message": user_message,
+        "created_at": datetime.now().isoformat(),
+    }
+    event_queue.put_nowait(json.dumps({'type': 'text', 'content': formatted}, ensure_ascii=False))
+    event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': formatted, 'conversation_id': conv_id}, ensure_ascii=False))
+    db.msg_add(conv_id, "assistant", formatted)
+    event_queue.put_nowait(json.dumps({'type': 'done'}))
+    event_queue.put_nowait(None)
+
 
 async def _process_conv(
     conv_id: str, user_message: str, messages: list, cfg: dict,
@@ -654,6 +873,40 @@ async def _process_conv(
         _active_streams.pop(conv_id, None)
 
 
+def _build_skill_injection(current_query: str) -> str:
+    """根据当前查询匹配已确认技能，返回注入到 system prompt 的文本"""
+    if not current_query or len(current_query.strip()) < 2:
+        return ""
+    try:
+        matched = db.skill_find_by_scene(current_query.strip())
+        if not matched:
+            return ""
+        # 只取已确认的技能，最多 3 条
+        confirmed = [s for s in matched if s.get("confirmed_by_user")]
+        if not confirmed:
+            return ""
+        parts = ["【已记录技能参考】"]
+        for skill in confirmed[:3]:
+            steps = skill.get("steps", [])
+            if isinstance(steps, str):
+                try:
+                    steps = json.loads(steps)
+                except Exception:
+                    steps = [steps]
+            scene = skill.get("trigger_scene", "")
+            parts.append(f"## {skill.get('name', '未命名技能')}")
+            if scene:
+                parts.append(f"触发场景：{scene}")
+            if steps:
+                parts.append("步骤：")
+                for i, step in enumerate(steps, 1):
+                    parts.append(f"  {i}. {step}")
+            parts.append("")
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
 @app.post("/api/chat")
 async def chat(request: Request):
     """SSE 流式对话 — 后台任务处理，客户端断连不影响对话完成"""
@@ -681,11 +934,35 @@ async def chat(request: Request):
     db.msg_add(conv_id, "user", user_message)
     await maybe_compress(conv_id)
 
+    # 检测/处理记忆整理意图。若命中，直接返回计划或结果，不走普通 LLM 流程。
+    event_queue = asyncio.Queue()
+    await _handle_consolidate_chat(conv_id, user_message, event_queue)
+    if event_queue.qsize() > 1:
+        # _handle_consolidate_chat 已放入内容，说明命中了 consolidate 流程
+        async def generate_consolidate():
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                yield f"data: {event}\n\n"
+        return StreamingResponse(
+            generate_consolidate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     cfg = load_config()
     system_parts = [cfg["system_prompt"]]
     memory_injection = build_memory_injection(current_query=user_message)
     if memory_injection:
         system_parts.append(memory_injection)
+    skill_injection = _build_skill_injection(current_query=user_message)
+    if skill_injection:
+        system_parts.append(skill_injection)
 
     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
     for m in db.msg_list(conv_id):
@@ -728,14 +1005,29 @@ async def chat(request: Request):
 # ═══════════════════════════════════════════════════════
 
 @app.get("/api/schedules")
-async def get_schedules(status: str = "", date_from: str = "", date_to: str = ""):
-    return db.sch_list(status=status, date_from=date_from, date_to=date_to)
+async def get_schedules(status: str = "", date_from: str = "", date_to: str = "", overdue: str = ""):
+    items = db.sch_list(status=status, date_from=date_from, date_to=date_to)
+    if overdue:
+        from .schedule_reminder import _parse_time
+        now = now_tz()
+        filtered = []
+        for s in items:
+            st = s.get("start_time", "")
+            start = _parse_time(st) if st else None
+            if start is None:
+                continue
+            is_overdue = start < now and s.get("status") not in ("done", "cancelled")
+            if overdue == "true" and is_overdue:
+                filtered.append(s)
+            elif overdue == "false" and not is_overdue:
+                filtered.append(s)
+        return filtered
+    return items
 
 
 @app.post("/api/schedules")
-async def create_schedule(data: dict = None):
-    if not data:
-        data = {}
+async def create_schedule(request: Request):
+    data = await request.json() or {}
     if not data.get("title"):
         raise HTTPException(400, "title 为必填字段")
     data["source"] = data.get("source", "manual")
@@ -744,22 +1036,80 @@ async def create_schedule(data: dict = None):
 
 
 @app.put("/api/schedules/{sid}")
-async def update_schedule(sid: int, data: dict):
+async def update_schedule(sid: int, data: dict = Body(default=None)):
+    old = db.sch_get(sid)
+    if not old:
+        raise HTTPException(404, "日程不存在")
+
+    # 重复日程仅修改本次实例
+    if data.get("apply_to") == "instance" and old.get("recurrence"):
+        instance = dict(old)
+        instance.pop("id", None)
+        instance["parent_id"] = old["id"]
+        instance["recurrence"] = ""
+        for k in ["title", "description", "start_time", "end_time", "location", "status", "priority", "importance", "category", "impact", "country", "remind_before", "goal_id"]:
+            if k in data:
+                instance[k] = data[k]
+        new_id = db.sch_add(instance)
+        return {"success": True, "instance_id": new_id, "message": "已创建独立实例"}
+
     db.sch_update(sid, data)
+    # 目标关联：完成日程时推进目标进度
+    if data.get("status") == "done":
+        goal_id = data.get("goal_id") or old.get("goal_id")
+        if goal_id:
+            g = db.goal_get(goal_id)
+            if g:
+                strategy = g.get("strategy", "compound")
+                current = float(g.get("current_value", 0))
+                target = float(g.get("target_value", 1))
+                daily = float(g.get("daily_target", 5))
+                if strategy == "linear":
+                    new_value = current + 1
+                else:
+                    new_value = current * (1 + daily / 100)
+                new_value = min(new_value, target)
+                db.goal_update(goal_id, {"current_value": new_value})
+    # 自动记忆：标记 done → 后台提炼经验记忆
+    if data.get("status") == "done":
+        task = asyncio.create_task(_auto_extract_schedule_memory(sid, old))
+        _pending_schedule_tasks.add(task)
+        task.add_done_callback(_pending_schedule_tasks.discard)
     return {"success": True}
 
 
 @app.delete("/api/schedules/{sid}")
-async def delete_schedule(sid: int):
+async def delete_schedule(sid: int, cascade: str = ""):
+    """删除日程。若 cascade=true 且为重复母日程，同时删除所有实例"""
+    if cascade == "true":
+        with db() as c:
+            c.execute("DELETE FROM schedules WHERE parent_id = ?", (sid,))
     db.sch_del(sid)
     return {"success": True}
 
 
 @app.post("/api/schedules/ai-plan")
-async def ai_plan(data: dict):
+async def ai_plan(data: dict = Body(default=None)):
     schedules = data.get("schedules", db.sch_list(status="confirmed")[:20])
     advice = await plan_time(schedules)
     return {"advice": advice}
+
+
+@app.get("/api/reminders")
+async def get_reminders():
+    """获取当前到期提醒与已逾期日程"""
+    result = get_due_reminders()
+    return {
+        "due": result.get("due", []),
+        "overdue": result.get("overdue", []),
+        "upcoming": get_upcoming_schedules(limit=5),
+    }
+
+
+@app.get("/api/reminders/presets")
+async def get_reminder_presets():
+    """返回可用的 remind_before 预设选项"""
+    return REMINDER_PRESETS
 
 
 # ═══════════════════════════════════════════════════════
@@ -790,7 +1140,7 @@ async def get_calendar_templates():
 
 @app.get("/api/calendar/week")
 async def get_calendar_week(date: str = ""):
-    """返回指定日期所在周的所有日程"""
+    """返回指定日期所在周的所有日程（含重复展开）"""
     from datetime import datetime as _dt, timedelta as _td
     try:
         ref = _dt.strptime(date, "%Y-%m-%d") if date else _dt.now()
@@ -799,13 +1149,26 @@ async def get_calendar_week(date: str = ""):
     dow = ref.weekday()  # 周一=0
     monday = (ref - _td(days=dow)).strftime("%Y-%m-%d")
     sunday = (ref + _td(days=6 - dow)).strftime("%Y-%m-%d 23:59:59")
-    schedules = db.sch_list(date_from=monday, date_to=sunday)
-    return {"monday": monday, "sunday": sunday, "events": schedules}
+    # 普通日程按时间范围查询；重复日程母记录单独拉取
+    normal = db.sch_list(date_from=monday, date_to=sunday)
+    recurring = [s for s in db.sch_list() if s.get("recurrence")]
+    expanded = []
+    seen_ids = set()
+    for s in normal + recurring:
+        if s["id"] in seen_ids:
+            continue
+        seen_ids.add(s["id"])
+        if s.get("recurrence"):
+            instances = expand_recurring(s, monday, sunday)
+            expanded.extend(instances)
+        else:
+            expanded.append(s)
+    return {"monday": monday, "sunday": sunday, "events": expanded}
 
 
 @app.get("/api/calendar/month")
 async def get_calendar_month(month: str = ""):
-    """返回指定月份所有有事件的日期"""
+    """返回指定月份所有有事件的日期（含重复展开）"""
     from datetime import datetime as _dt
     try:
         ref = _dt.strptime(month, "%Y-%m") if month else _dt.now()
@@ -815,13 +1178,19 @@ async def get_calendar_month(month: str = ""):
     last_day = (ref.replace(day=28) + __import__('datetime').timedelta(days=4)).replace(day=1) - __import__('datetime').timedelta(days=1)
     last = last_day.strftime("%Y-%m-%d 23:59:59")
     schedules = db.sch_list(date_from=first, date_to=last)
-    # 返回每个日期的事件数
+    # 展开重复日程并返回每个日期的事件数
     from collections import Counter
     date_counts = Counter()
     for s in schedules:
-        st = s.get("start_time", "")
-        if st:
-            date_counts[st[:10]] += 1
+        if s.get("recurrence"):
+            for inst in expand_recurring(s, first, last):
+                st = inst.get("start_time", "")
+                if st:
+                    date_counts[st[:10]] += 1
+        else:
+            st = s.get("start_time", "")
+            if st:
+                date_counts[st[:10]] += 1
     return {"month": month or ref.strftime("%Y-%m"), "date_counts": {k: v for k, v in date_counts.items()}}
 
 
@@ -835,7 +1204,7 @@ async def get_goals(status: str = ""):
 
 
 @app.post("/api/goals")
-async def create_goal(data: dict = None):
+async def create_goal(data: dict = Body(default=None)):
     if not data:
         data = {}
     if not data.get("title"):
@@ -844,8 +1213,16 @@ async def create_goal(data: dict = None):
     return {"id": gid, **data}
 
 
+@app.get("/api/goals/{gid}")
+async def get_goal(gid: int):
+    g = db.goal_get(gid)
+    if not g:
+        raise HTTPException(404, "目标不存在")
+    return g
+
+
 @app.put("/api/goals/{gid}")
-async def update_goal(gid: int, data: dict):
+async def update_goal(gid: int, data: dict = Body(default=None)):
     db.goal_update(gid, data)
     return {"success": True}
 
@@ -864,6 +1241,19 @@ async def get_goal_stats(gid: int):
     return stats
 
 
+@app.get("/api/goals/{gid}/schedules")
+async def get_goal_schedules(gid: int, status: str = ""):
+    """获取与目标关联的日程列表"""
+    g = db.goal_get(gid)
+    if not g:
+        raise HTTPException(404, "目标不存在")
+    items = db.sch_list()
+    related = [s for s in items if s.get("goal_id") == gid]
+    if status:
+        related = [s for s in related if s.get("status") == status]
+    return related
+
+
 # ═══════════════════════════════════════════════════════
 # API: Notes
 # ═══════════════════════════════════════════════════════
@@ -874,7 +1264,7 @@ async def get_notes(search: str = ""):
 
 
 @app.post("/api/notes")
-async def create_note(data: dict = None):
+async def create_note(data: dict = Body(...)):
     if not data:
         data = {}
     if not data.get("title"):
@@ -884,7 +1274,7 @@ async def create_note(data: dict = None):
 
 
 @app.put("/api/notes/{nid}")
-async def update_note(nid: int, data: dict):
+async def update_note(nid: int, data: dict = Body(default=None)):
     db.note_update(nid, data)
     return {"success": True}
 
@@ -893,6 +1283,14 @@ async def update_note(nid: int, data: dict):
 async def delete_note(nid: int):
     db.note_del(nid)
     return {"success": True}
+
+
+@app.post("/api/notes/{nid}/distill")
+async def distill_note_endpoint(nid: int):
+    """手动蒸馏一条 raw note：根据记忆偏好/方法分流为笔记/日程/记忆"""
+    from .tools import _handle_distill_note
+    result = await _handle_distill_note({"note_id": nid})
+    return result
 
 
 # ═══════════════════════════════════════════════════════
@@ -905,7 +1303,7 @@ async def proposals():
 
 
 @app.post("/api/proposals/confirm")
-async def proposal_confirm(data: dict):
+async def proposal_confirm(data: dict = Body(default=None)):
     ptype = data.get("type") or data.get("confirm_type")
     pid = data.get("id") or data.get("confirm_id")
     if not ptype or not pid:
@@ -914,7 +1312,7 @@ async def proposal_confirm(data: dict):
 
 
 @app.post("/api/proposals/reject")
-async def proposal_reject(data: dict):
+async def proposal_reject(data: dict = Body(default=None)):
     ptype = data.get("type") or data.get("confirm_type")
     pid = data.get("id") or data.get("confirm_id")
     if not ptype or not pid:
@@ -923,7 +1321,7 @@ async def proposal_reject(data: dict):
 
 
 @app.post("/api/proposals/modify")
-async def proposal_modify(data: dict):
+async def proposal_modify(data: dict = Body(default=None)):
     ptype = data.get("type") or data.get("confirm_type")
     pid = data.get("id") or data.get("confirm_id")
     if not ptype or not pid:
@@ -936,7 +1334,7 @@ async def proposal_modify(data: dict):
 # ═══════════════════════════════════════════════════════
 
 @app.post("/api/tutorial/create")
-async def tutorial_create(data: dict):
+async def tutorial_create(data: dict = Body(default=None)):
     """创建分步教程会话
 
     Body: {"title": "安装MT5指标", "steps": [{"action": "...", "verify": "..."}, ...]}
@@ -968,7 +1366,7 @@ async def tutorial_confirm(session_id: str):
 
 
 @app.post("/api/tutorial/{session_id}/fail")
-async def tutorial_fail(session_id: str, data: dict = None):
+async def tutorial_fail(session_id: str, data: dict = Body(default=None)):
     """标记当前步骤失败"""
     flow = TutorialFlow.get(session_id)
     if not flow:
@@ -1065,7 +1463,7 @@ _TRANSFORM_PROMPTS = {
 
 
 @app.post("/api/transform")
-async def transform_item(data: dict):
+async def transform_item(data: dict = Body(default=None)):
     """记忆/笔记/行程 互转 — LLM 生成目标数据，创建 proposed 状态新条目"""
     source_type = data.get("source_type", "")  # memory | note | schedule
     source_id = data.get("source_id", 0)
@@ -1157,6 +1555,10 @@ async def transform_item(data: dict):
         all_mems = db.mem_list()
         created_item = next((m for m in all_mems if m["id"] == created_id), None)
 
+    # 4. 标记源条目为已转化
+    if source_type == "schedule":
+        db.sch_update(source_id, {"status": "converted"})
+
     return {
         "success": True,
         "source_type": source_type,
@@ -1177,7 +1579,7 @@ async def list_skills(search: str = "", confirmed: int = -1):
 
 
 @app.post("/api/skills")
-async def add_skill(data: dict):
+async def add_skill(data: dict = Body(default=None)):
     sid = db.skill_add(data)
     skill = db.skill_get(sid)
     return {"success": True, "id": sid, **skill}
@@ -1192,7 +1594,7 @@ async def get_skill(sid: int):
 
 
 @app.put("/api/skills/{sid}")
-async def update_skill(sid: int, data: dict):
+async def update_skill(sid: int, data: dict = Body(default=None)):
     db.skill_update(sid, data)
     skill = db.skill_get(sid)
     return {"success": True, **skill}
@@ -1227,12 +1629,119 @@ async def match_skills(scene: str):
     return skills
 
 
-# ═══════════════════════════════════════════════════════
+# ===== 技能反馈迭代机制 =====
+
+_SKILL_FEEDBACK_PROMPT = """分析以下技能及其反馈，生成改进建议。
+
+技能信息：
+名称: {name}
+触发场景: {trigger_scene}
+当前步骤:
+{steps}
+
+使用反馈（来自实际使用经验）:
+{feedback}
+
+诊断问题并提出改进建议。输出 JSON（只输出 JSON）：
+{{"analysis": "问题诊断（2-3句话）", "improved_steps": ["新步骤1", "新步骤2", ...], "reason": "改进理由"}}"""
+
+
+@app.post("/api/skills/{sid}/feedback")
+async def submit_skill_feedback(sid: int, data: dict = Body(default=None)):
+    """提交技能使用反馈 → 存储为 experience 记忆"""
+    skill = db.skill_get(sid)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+    content = data.get("content", "").strip()
+    if not content:
+        raise HTTPException(400, "反馈内容不能为空")
+    rating = int(data.get("rating", 3))
+    keywords = data.get("keywords", "") or f"技能反馈,{skill.get('name', '')}"
+    mem_id = db.mem_add(
+        type_="experience",
+        content=f"[技能反馈] {skill['name']}: {content}",
+        importance=min(rating, 5),
+        keywords=keywords,
+        source_conv_id=f"skill_feedback_{sid}",
+    )
+    db.skill_increment_usage(sid)
+    return {"success": True, "memory_id": mem_id}
+
+
+@app.get("/api/skills/{sid}/suggestions")
+async def get_skill_suggestions(sid: int):
+    """聚合技能反馈 → LLM 生成改进建议"""
+    skill = db.skill_get(sid)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    # 查询该技能的所有反馈记忆
+    all_mems = db.mem_list()
+    feedback_mems = [m for m in all_mems if m.get("source_conv_id") == f"skill_feedback_{sid}"]
+    if len(feedback_mems) < 2:
+        return {"ready": False, "feedback_count": len(feedback_mems), "min_required": 2}
+
+    # 格式化步骤和反馈
+    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(skill.get("steps", [])))
+    feedback_text = "\n".join(f"- {m['content']}" for m in feedback_mems[-10:])
+
+    prompt = _SKILL_FEEDBACK_PROMPT.format(
+        name=skill.get("name", ""),
+        trigger_scene=skill.get("trigger_scene", ""),
+        steps=steps_text,
+        feedback=feedback_text,
+    )
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        resp = await call_llm(messages, temperature=0.3, max_tokens=1200,
+                              response_format={"type": "json_object"})
+        raw = resp.get("content", "")
+        m = re.search(r'\{[\s\S]*\}', raw)
+        parsed = json.loads(m.group()) if m else json.loads(raw)
+    except Exception as e:
+        raise HTTPException(500, f"LLM 建议生成失败: {e}")
+
+    return {
+        "ready": True,
+        "feedback_count": len(feedback_mems),
+        "analysis": parsed.get("analysis", ""),
+        "current_steps": skill.get("steps", []),
+        "improved_steps": parsed.get("improved_steps", []),
+        "reason": parsed.get("reason", ""),
+    }
+
+
+@app.post("/api/skills/{sid}/improve")
+async def apply_skill_improvement(sid: int, data: dict = Body(default=None)):
+    """应用改进建议到技能"""
+    new_steps = data.get("steps", [])
+    if not new_steps:
+        raise HTTPException(400, "steps 不能为空")
+
+    skill = db.skill_get(sid)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    # 存储旧版本（作为反馈记忆保留历史）
+    old_steps = skill.get("steps", [])
+    db.mem_add(
+        type_="fact",
+        content=f"[技能版本记录] {skill['name']} v{skill.get('usage_count', 0)}: {' → '.join(old_steps)}",
+        importance=2,
+        keywords=f"技能版本,{skill.get('name', '')}",
+        source_conv_id=f"skill_version_{sid}",
+    )
+
+    db.skill_update(sid, {"steps": new_steps})
+    updated = db.skill_get(sid)
+    return {"success": True, **updated}
+
+
 # API: Code Execution
 # ═══════════════════════════════════════════════════════
 
 @app.post("/api/code/run")
-async def run_code(data: dict):
+async def run_code(data: dict = Body(default=None)):
     from .code_runner import run
     return await run(data.get("code", ""), timeout=data.get("timeout", 30))
 
@@ -1361,9 +1870,16 @@ async def calendar_data(year: int = 0, month: int = 0):
 
     result = {"year": y, "month": m, "days": {}}
 
-    # 日程 — 按 start_time 日期分组
+    # 日程 — 按 start_time 日期分组（含重复展开）
     schedules = db.sch_list(date_from=date_from, date_to=date_to)
+    expanded_schedules = []
     for s in schedules:
+        if s.get("recurrence"):
+            expanded_schedules.extend(expand_recurring(s, date_from, date_to))
+        else:
+            expanded_schedules.append(s)
+
+    for s in expanded_schedules:
         st = s.get("start_time", "")
         if st:
             day_key = st[:10]  # YYYY-MM-DD
@@ -1372,6 +1888,7 @@ async def calendar_data(year: int = 0, month: int = 0):
                 "id": s["id"], "title": s["title"], "start_time": st,
                 "end_time": s.get("end_time", ""), "status": s["status"],
                 "priority": s["priority"], "location": s.get("location", ""),
+                "is_recurring_instance": s.get("is_recurring_instance", False),
             })
 
     # 笔记 — 按 created_at 日期分组
@@ -1421,7 +1938,7 @@ async def calendar_data(year: int = 0, month: int = 0):
 
     # 月统计
     result["summary"] = {
-        "schedules": len(schedules),
+        "schedules": len(expanded_schedules),
         "notes": sum(len(d["notes"]) for d in result["days"].values()),
         "conversations": sum(len(d["conversations"]) for d in result["days"].values()),
         "memories": sum(len(d["memories"]) for d in result["days"].values()),

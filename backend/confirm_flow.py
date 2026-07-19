@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime
 from .database import sch_update, note_update, sch_list, note_list, db
+from .timezone import now_tz
 
 logger = logging.getLogger("zenith.confirm")
 
@@ -43,7 +44,7 @@ def get_pending_proposals() -> list[dict]:
 
 def confirm_proposal(proposal_type: str, proposal_id: int) -> dict:
     """确认一个提议"""
-    now = datetime.now().isoformat()
+    now = now_tz().isoformat()
     if proposal_type == "schedule":
         sch_update(proposal_id, {"status": "confirmed", "confirmed_at": now})
         return {"success": True, "message": f"日程 (ID:{proposal_id}) 已确认保存"}
@@ -66,9 +67,13 @@ def reject_proposal(proposal_type: str, proposal_id: int) -> dict:
 
 def modify_proposal(proposal_type: str, proposal_id: int, changes: dict) -> dict:
     """修改并确认一个提议"""
-    now = datetime.now().isoformat()
+    now = now_tz().isoformat()
     if proposal_type == "schedule":
-        allowed = {"title", "start_time", "end_time", "description", "location", "priority"}
+        allowed = {
+            "title", "start_time", "end_time", "description", "location",
+            "priority", "importance", "category", "impact", "country",
+            "remind_before", "goal_id",
+        }
         filtered = {k: v for k, v in changes.items() if k in allowed}
         filtered["status"] = "confirmed"
         filtered["confirmed_at"] = now
@@ -113,12 +118,12 @@ class TutorialFlow:
         self.current = 0
         self.status = "active"  # active / completed / failed
         self.history: list[dict] = []  # 记录每步执行情况
-        self.created_at = datetime.now().isoformat()
+        self.created_at = now_tz().isoformat()
 
     @classmethod
     def create(cls, title: str, steps: list[dict]) -> "TutorialFlow":
         """创建新的教程会话"""
-        session_id = f"tutorial_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        session_id = f"tutorial_{now_tz().strftime('%Y%m%d%H%M%S')}"
         flow = cls(session_id, title, steps)
         _tutorial_sessions[session_id] = flow
         logger.info("TutorialFlow created: %s (%d steps)", session_id, len(steps))
@@ -154,7 +159,7 @@ class TutorialFlow:
             "step_index": self.current + 1,
             "action": step.get("action", ""),
             "result": "confirmed",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_tz().isoformat(),
         })
         self.current += 1
 
@@ -186,7 +191,7 @@ class TutorialFlow:
             "action": step.get("action", ""),
             "result": "failed",
             "reason": reason,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_tz().isoformat(),
         })
         return {
             "success": True,
@@ -215,7 +220,7 @@ class TutorialFlow:
             "step_index": self.current + 1,
             "action": step.get("action", ""),
             "result": "skipped",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_tz().isoformat(),
         })
         self.current += 1
 

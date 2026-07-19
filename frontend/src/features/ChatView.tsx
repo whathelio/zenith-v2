@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
-import Sidebar from '../components/Sidebar'
+import { useParams, useNavigate, Link } from 'react-router-dom'
+import ChatConvPanel from '../components/ChatConvPanel'
 import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
 import ProposalsBar from '../components/ProposalsBar'
@@ -24,6 +24,7 @@ export default function ChatView() {
   const [error, setError] = useState('')
   const [summarizing, setSummarizing] = useState(false)
   const [summaryResult, setSummaryResult] = useState<ConversationSummary | null>(null)
+  const [convCollapsed, setConvCollapsed] = useState(false)
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -266,6 +267,20 @@ export default function ChatView() {
     }
   }
 
+  // proposals 变化时通知左侧面板
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('zenith:proposals', { detail: proposals }))
+  }, [proposals])
+
+  // activeConv 变化时通知左侧面板
+  useEffect(() => {
+    if (activeConv) {
+      window.dispatchEvent(new CustomEvent('zenith:conv-change', {
+        detail: { id: activeConv.id, title: activeConv.title }
+      }))
+    }
+  }, [activeConv])
+
   const handleSummarize = async () => {
     if (!activeConv?.id || summarizing) return
     if (messages.length < 2) {
@@ -286,45 +301,44 @@ export default function ChatView() {
   }
 
   return (
-    <div className="app-shell">
-      <Sidebar
+    <div className="chat-layout">
+      {/* 会话列表 — 瘦身可折叠 */}
+      <ChatConvPanel
         conversations={conversations}
         activeId={activeConv?.id || ''}
         onSelect={handleSelectConv}
         onDelete={handleDeleteConv}
         onNew={handleNewChat}
+        collapsed={convCollapsed}
+        onToggle={() => setConvCollapsed(!convCollapsed)}
       />
-        <div className="main-content">
-          <div className="topbar">
-            <span className="topbar-title">
-              {activeConv?.title || 'Zenith v2'}
-            </span>
-            <div className="topbar-actions">
-              {activeConv && messages.length >= 2 && (
-                <button
-                  className="btn btn-sm"
-                  style={{
-                    background: summarizing ? 'var(--color-bg-muted)' : 'var(--color-accent-primary)',
-                    color: '#fff',
-                    cursor: summarizing ? 'wait' : 'pointer',
-                  }}
+
+      {/* 主聊天区 */}
+      <div className="chat-main">
+        {/* 工具条: 标题 + 总结按钮 */}
+        <div className="chat-toolbar">
+          <span className="chat-title">{activeConv?.title || '新对话'}</span>
+          <div className="chat-toolbar-actions">
+            {activeConv && messages.length >= 2 && (
+              <button
+                className="btn btn-sm"
+                style={{
+                  background: summarizing ? 'var(--color-bg-muted)' : 'var(--color-accent-primary)',
+                  color: '#fff',
+                  cursor: summarizing ? 'wait' : 'pointer',
+                }}
                 onClick={handleSummarize}
                 disabled={summarizing}
               >
                 {summarizing ? '⏳ 总结中...' : '🧪 总结对话'}
               </button>
             )}
-            <a href="/" className="btn btn-sm">🏠 主页</a>
-            <a href="/schedules" className="btn btn-sm">📅 日程</a>
-            <a href="/notes" className="btn btn-sm">📝 笔记</a>
-            <a href="/memories" className="btn btn-sm">🧠 记忆</a>
-            <a href="/analysis" className="btn btn-sm">📋 文件分析</a>
-            <a href="/settings" className="btn btn-sm">⚙ 设置</a>
           </div>
         </div>
+
         {reminder && !reminderDismissed && (
           <div style={{
-            margin: '0 16px',
+            margin: '0 12px',
             padding: '10px 14px',
             background: 'var(--color-bg-panel)',
             border: '1px solid var(--color-border)',
@@ -354,11 +368,13 @@ export default function ChatView() {
             </button>
           </div>
         )}
+
         <div className="chat-area">
           <ChatMessages
             messages={messages}
             streamingText={streamingText}
             isLoading={isLoading}
+            onSend={handleSend}
           />
           {error && (
             <div style={{ padding: '8px 24px', color: 'var(--color-accent-danger)', fontSize: 'var(--font-size-sm)' }}>
@@ -367,6 +383,7 @@ export default function ChatView() {
           )}
           <div ref={chatEndRef} />
         </div>
+
         {proposals.length > 0 && (
           <ProposalsBar
             proposals={proposals}
@@ -417,13 +434,11 @@ export default function ChatView() {
               </button>
             </div>
 
-            {/* 基本信息 */}
             <div style={{ marginBottom: 12, fontSize: 12, color: 'var(--color-text-muted)' }}>
               对话: {summaryResult.title} | 消息数: {summaryResult.message_count}
               {summaryResult.experiences_saved > 0 && ` | 已保存 ${summaryResult.experiences_saved} 条经验`}
             </div>
 
-            {/* 摘要 */}
             {summaryResult.summary && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-accent-primary)', marginBottom: 6 }}>📝 概要</div>
@@ -431,7 +446,6 @@ export default function ChatView() {
               </div>
             )}
 
-            {/* 关键决定 */}
             {summaryResult.key_decisions.length > 0 && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#bd93f9', marginBottom: 6 }}>⚖️ 关键决定</div>
@@ -441,7 +455,6 @@ export default function ChatView() {
               </div>
             )}
 
-            {/* 蒸馏经验 */}
             {summaryResult.experiences.length > 0 && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#ff6e40', marginBottom: 6 }}>
@@ -465,7 +478,6 @@ export default function ChatView() {
               </div>
             )}
 
-            {/* 知识点 */}
             {summaryResult.knowledge.length > 0 && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#f1fa8c', marginBottom: 6 }}>💡 知识点</div>
@@ -475,7 +487,6 @@ export default function ChatView() {
               </div>
             )}
 
-            {/* 行动项 */}
             {summaryResult.action_items.length > 0 && (
               <div style={{ marginBottom: 16, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#50fa7b', marginBottom: 6 }}>✅ 行动项</div>
@@ -485,7 +496,6 @@ export default function ChatView() {
               </div>
             )}
 
-            {/* 标签 */}
             {summaryResult.tags.length > 0 && (
               <div style={{ marginBottom: 12, display: 'flex', gap: 6 }}>
                 {summaryResult.tags.map((t, i) => (
@@ -502,9 +512,9 @@ export default function ChatView() {
             )}
 
             <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
-              <a href="/memories" className="btn btn-sm" style={{ background: '#ff6e40', color: '#fff' }}>
-                🧠 查看记忆库
-              </a>
+              <Link to="/library?tab=memories" className="btn btn-sm" style={{ background: '#ff6e40', color: '#fff' }}>
+                🧠 查看知识库
+              </Link>
               <button className="btn btn-sm" onClick={() => setSummaryResult(null)}>
                 关闭
               </button>

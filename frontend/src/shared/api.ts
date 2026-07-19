@@ -32,6 +32,9 @@ interface Schedule {
   impact: string
   country: string
   remind_before: number
+  goal_id: number | null
+  recurrence: string
+  parent_id: number | null
   source: string
   confirmed_at: string | null
   created_at: string
@@ -44,6 +47,10 @@ interface Note {
   tags: string
   status: string
   source: string
+  stage: string
+  recorded_at: string
+  distilled_at: string
+  distilled_into: string
   created_at: string
   updated_at: string
 }
@@ -55,6 +62,8 @@ interface Memory {
   importance: number
   keywords: string
   source_conv_id: string
+  recorded_at: string
+  distilled_from: number | null
   created_at: string
 }
 
@@ -131,6 +140,7 @@ interface Goal {
   status: string
   start_date: string
   end_date: string
+  active_days?: string[]
   created_at: string
   updated_at: string
 }
@@ -142,6 +152,8 @@ interface GoalStats {
   daily_return: number
   remaining: number
   on_track: boolean
+  schedule_count: number
+  completed_schedule_count: number
 }
 
 interface CalendarTemplate {
@@ -265,6 +277,7 @@ interface MarketReport {
   analysis_text: string
   daily_advice: string
   weekly_advice: string
+  markdown_text?: string
   created_at: string
 }
 
@@ -300,6 +313,16 @@ interface Skill {
   confirmed_by_user: number
   source_conv_id: string
   created_at: string
+}
+
+interface SkillSuggestion {
+  ready: boolean
+  feedback_count: number
+  min_required: number
+  analysis?: string
+  current_steps?: string[]
+  improved_steps?: string[]
+  reason?: string
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -364,6 +387,8 @@ export const api = {
   // Goals
   listGoals: (status = '') =>
     request<Goal[]>(`/goals?status=${encodeURIComponent(status)}`),
+  getGoal: (id: number) =>
+    request<Goal>(`/goals/${id}`),
   createGoal: (data: Partial<Goal>) =>
     request<Goal>('/goals', { method: 'POST', body: JSON.stringify(data) }),
   updateGoal: (id: number, data: Partial<Goal>) =>
@@ -374,6 +399,8 @@ export const api = {
     request<{ success: boolean }>(`/goals/${id}`, { method: 'DELETE' }),
   getGoalStats: (id: number) =>
     request<GoalStats>(`/goals/${id}/stats`),
+  listGoalSchedules: (id: number, status = '') =>
+    request<Schedule[]>(`/goals/${id}/schedules?status=${encodeURIComponent(status)}`),
 
   // Notes
   listNotes: (search = '') =>
@@ -386,6 +413,8 @@ export const api = {
     }),
   deleteNote: (id: number) =>
     request<{ success: boolean }>(`/notes/${id}`, { method: 'DELETE' }),
+  distillNote: (id: number) =>
+    request<{ success: boolean; result: string; created_ids: Record<string, number> }>(`/notes/${id}/distill`, { method: 'POST' }),
 
   // Proposals
   getProposals: () => request<Proposal[]>('/proposals'),
@@ -557,11 +586,38 @@ export const api = {
   matchSkills: (scene: string) =>
     request<Skill[]>(`/skills/match?scene=${encodeURIComponent(scene)}`),
 
+  // ── Skill 反馈迭代 ──
+  feedbackSkill: (id: number, content: string, rating: number) =>
+    request<{ success: boolean; memory_id: number }>(`/skills/${id}/feedback`, { method: 'POST', body: JSON.stringify({ content, rating }) }),
+  getSkillSuggestions: (id: number) =>
+    request<SkillSuggestion>(`/skills/${id}/suggestions`),
+  improveSkill: (id: number, steps: string[]) =>
+    request<{ success: boolean } & Skill>(`/skills/${id}/improve`, { method: 'POST', body: JSON.stringify({ steps }) }),
+
   // ── Transform API ── 记忆/笔记/行程互转
   transform: (sourceType: string, sourceId: number, targetType: string) =>
     request<{ success: boolean; source_type: string; source_id: number; target_type: string; created_id: number; created_item: any; preview: any }>(
       '/transform', { method: 'POST', body: JSON.stringify({ source_type: sourceType, source_id: sourceId, target_type: targetType }) }
     ),
+
+  // ── Knowledge API ── 转发到外部 api_gateway
+  knowledgeHealth: () => request<{ status: string; service?: string; version?: string }>('/knowledge/health'),
+  knowledgeSearch: (question: string, top_k = 5) =>
+    request<{ answer?: string; error?: string }>('/knowledge/search', { method: 'POST', body: JSON.stringify({ question, top_k }) }),
+  knowledgeWiki: (question: string) =>
+    request<{ answer?: string; error?: string }>('/knowledge/wiki', { method: 'POST', body: JSON.stringify({ question }) }),
+  knowledgeCreateTask: (type: string, payload: Record<string, any>) =>
+    request<{ task_id: string; status: string }>('/knowledge/tasks', { method: 'POST', body: JSON.stringify({ type, payload }) }),
+  knowledgeGetTask: (id: string) =>
+    request<Record<string, any>>(`/knowledge/tasks/${id}`),
+  knowledgeListTasks: (status?: string, limit = 20) =>
+    request<{ tasks: any[] }>(`/knowledge/tasks${status ? `?status=${status}&limit=${limit}` : `?limit=${limit}`}`),
+  knowledgeIngest: async (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(BASE + '/knowledge/ingest', { method: 'POST', body: fd })
+    return res.json()
+  },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion }

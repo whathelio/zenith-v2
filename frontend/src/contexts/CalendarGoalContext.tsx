@@ -1,7 +1,13 @@
 import { createContext, useContext } from 'react'
-import type { CalendarData, CalendarDay, Goal, GoalStats, MarketReport } from '../shared/api'
+import type { CalendarData, CalendarDay, Goal, GoalStats } from '../shared/api'
 
 export type GoalDisplayField = 'target_value' | 'daily_target' | 'current_value'
+
+export interface GoalActiveInfo {
+  goalId: number
+  color: string
+  title: string
+}
 
 export interface GoalMarkInfo {
   goalId: number
@@ -37,8 +43,8 @@ export interface CalendarGoalContextType {
   goalStats: Record<number, GoalStats>
   goalDateMap: Map<string, GoalMarkInfo[]>
   goalAmountMap: Map<string, GoalAmountInfo[]>
+  goalActiveMap: Map<string, GoalActiveInfo[]>
   selectedDayData: CalendarDay | null
-  marketReport: MarketReport | null
   prevWeek: () => void
   nextWeek: () => void
   goToday: () => void

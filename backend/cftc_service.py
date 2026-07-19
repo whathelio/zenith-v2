@@ -1,6 +1,6 @@
-"""Zenith v2 CFTC 持仓分析服务 — 异步 + 缓存 + JSON 输出
-重构自 cftc_持仓分析.py (JPM Delta-One Table 12 复刻)
-"""
+"""Zenith v2 CFTC 持仓分析服务 — 已封存 (SEALED)
+
+CFTC Socrata API 当前返回 403，无法获取数据。本模块随市场分析功能一起封存。"""
 from __future__ import annotations
 
 import json

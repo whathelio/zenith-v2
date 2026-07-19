@@ -1,5 +1,19 @@
-"""Zenith v2 市场分析引擎 — 每日分析 + 预测追踪验证闭环
-组合 CFTC持仓 + 宏观指标 + 事件 → LLM → 报告 → 预测追踪
+"""Zenith v2 市场分析引擎 — 已封存 (SEALED)
+
+本模块自 2026-07-17 起封存，原因：
+1. CFTC 数据源 API 返回 403，无法获取持仓数据。
+2. 行情报告 LLM 输出存在质量问题，返回 "Error: " 空内容。
+3. 市场分析并非当前 Zenith 作为本地助手的核心功能。
+
+封存措施：
+- config.yaml / config.py 中 market_analysis_enabled 设为 false
+- tools.py 中已移除 query_market / cftc_positioning / analyze_gold / track_predictions 工具注册
+- app.py 中的 /api/market/* 路由保留但不再被 LLM 自动调用
+
+恢复条件（如未来需要）：
+1. 找到可用的 CFTC 替代数据源或移除 CFTC 依赖。
+2. 修复 LLM 输出解析与异常处理。
+3. 重新在 tools.py / config.py 中注册相关工具与提示。
 """
 from __future__ import annotations
 
@@ -95,6 +109,11 @@ class MarketAnalyzer:
         """执行每日分析全流程"""
         logger.info("Starting daily market analysis...")
 
+        # 0. 确定报告日期（本地时区）
+        from datetime import timezone, timedelta as _td
+        local_tz = timezone(_td(hours=8))  # CST
+        today = datetime.now(local_tz).strftime('%Y-%m-%d')
+
         # 1. 获取 CFTC 持仓数据
         try:
             await self._cftc.fetch_incremental()
@@ -129,13 +148,16 @@ class MarketAnalyzer:
         preds_str = self._format_predictions(pending_preds)
         workflow_str = self._format_workflow_experience(workflow_exp)
 
-        prompt = ANALYSIS_PROMPT_TEMPLATE.format(
-            macro_data=macro_str,
-            cftc_data=cftc_str,
-            events_data=events_str,
-            yesterday_predictions=preds_str,
-            workflow_experience=workflow_str,
-        )
+        # 使用字符串替换而非 str.format()，避免 JSON 花括号被误认为占位符
+        prompt = ANALYSIS_PROMPT_TEMPLATE
+        for k, v in {
+            "macro_data": macro_str,
+            "cftc_data": cftc_str,
+            "events_data": events_str,
+            "yesterday_predictions": preds_str,
+            "workflow_experience": workflow_str,
+        }.items():
+            prompt = prompt.replace("{" + k + "}", str(v))
 
         # 5. LLM 分析
         messages = [
@@ -153,13 +175,17 @@ class MarketAnalyzer:
         # 6. 解析 LLM 返回的 JSON
         analysis = self._parse_analysis(content)
 
-        # 7. 存入 market_reports
-        today = datetime.now().strftime('%Y-%m-%d')
+        # 7. 存入 market_reports（today 已在第101行用 CST 时区设定，此处不再重复赋值）
         gold_price = ""
         for ind in macro_indicators:
             if ind.get('indicator') == 'gold' and ind.get('value'):
                 gold_price = str(ind['value'])
                 break
+        if not gold_price:
+            gold_price = "N/A"
+
+        # 生成 Markdown 格式报告（纯文字符号风格，参考黄金分析报告模板）
+        markdown_text = self._to_markdown(analysis, gold_price, today)
 
         report_id = market_report_add({
             "report_date": today,
@@ -170,6 +196,7 @@ class MarketAnalyzer:
             "analysis_text": content,
             "daily_advice": analysis.get('daily_advice', ''),
             "weekly_advice": analysis.get('weekly_advice', ''),
+            "markdown_text": markdown_text,
         })
 
         # 8. 存入 market_predictions（今日新预测）
@@ -195,6 +222,9 @@ class MarketAnalyzer:
                     hit = v.get('hit', False)
                     prediction_verify(p['id'], actual_dir, "", "")
 
+        # 归档 Markdown 报告到外部目录
+        self._archive_market_report(markdown_text, today)
+
         logger.info(f"Daily analysis complete: report_id={report_id}, predictions={len(pred_ids)}")
 
         return {
@@ -202,6 +232,7 @@ class MarketAnalyzer:
             "report_date": today,
             "gold_price": gold_price,
             "analysis": analysis,
+            "markdown_text": markdown_text,
             "predictions_count": len(pred_ids),
         }
 
@@ -265,8 +296,16 @@ class MarketAnalyzer:
         for ind in indicators:
             val = ind.get('value', '')
             chg = ind.get('change_pct', '')
+            src = ind.get('source', '')
             if val:
-                line = f"- **{ind['indicator']}**: {val} (变化{chg}%)"
+                line = f"- **{ind['indicator']}**: {val} (变化{chg}%) [{src}]"
+                # 金十行情附加 K 线趋势
+                kline = ind.get('kline', [])
+                if kline and len(kline) >= 3:
+                    recent_closes = [float(k.get('close', 0)) for k in kline[-5:] if k.get('close')]
+                    if recent_closes:
+                        trend = "⬆上升" if recent_closes[-1] > recent_closes[0] else ("⬇下降" if recent_closes[-1] < recent_closes[0] else "—横盘")
+                        line += f" | 近5日趋势:{trend}"
                 lines.append(line)
         return '\n'.join(lines) if lines else '（宏观数据获取失败）'
 
@@ -307,12 +346,40 @@ class MarketAnalyzer:
         parts = []
         if overdue:
             parts.append("### 逾期（已发生/已到期，需确认消化）")
-            for e in overdue:
-                parts.append(f"- {e.get('name', 'N/A')} ({e.get('time', '')})")
+            # 金十数据有 star / previous / actual / affect_txt 等字段
+            has_jin10_fields = any(e.get('star') or e.get('affect_txt') for e in overdue)
+            if has_jin10_fields:
+                parts.append("| 事件 | 星级 | 前值 | 实际值 | 影响 | 方向 |")
+                parts.append("|------|------|------|--------|------|------|")
+                for e in overdue:
+                    name = e.get('name', '—')
+                    star = '★' * max(0, min(3, int(e.get('star', 0) or 0)))
+                    prev = e.get('previous', '—') or '—'
+                    actual = e.get('actual', '—') or '—'
+                    affect = e.get('affect_txt', '—') or '—'
+                    direction = self._dir_symbol(e.get('direction', ''))
+                    parts.append(f"| {name} | {star} | {prev} | {actual} | {affect} | {direction} |")
+            else:
+                for e in overdue:
+                    parts.append(f"- {e.get('name', 'N/A')} ({e.get('time', '')})")
         if upcoming:
             parts.append("### 未达（今日待发布/待发生）")
-            for e in upcoming:
-                parts.append(f"- {e.get('name', 'N/A')} ({e.get('time', '')})")
+            has_jin10_fields = any(e.get('star') or e.get('affect_txt') for e in upcoming)
+            if has_jin10_fields:
+                parts.append("| 事件 | 时间 | 星级 | 预期值 | 前值 | 影响 | 方向 |")
+                parts.append("|------|------|------|--------|------|------|------|")
+                for e in upcoming:
+                    name = e.get('name', '—')
+                    time = e.get('time', '—')
+                    star = '★' * max(0, min(3, int(e.get('star', 0) or 0)))
+                    consensus = e.get('consensus', '—') or '—'
+                    prev = e.get('previous', '—') or '—'
+                    affect = e.get('affect_txt', '—') or '—'
+                    direction = self._dir_symbol(e.get('direction', ''))
+                    parts.append(f"| {name} | {time} | {star} | {consensus} | {prev} | {affect} | {direction} |")
+            else:
+                for e in upcoming:
+                    parts.append(f"- {e.get('name', 'N/A')} ({e.get('time', '')})")
         return '\n'.join(parts) if parts else '（事件数据获取失败）'
 
     def _format_predictions(self, predictions: list[dict]) -> str:
@@ -449,6 +516,145 @@ class MarketAnalyzer:
             'yesterday_verification': [],
             'summary': '',
         }
+
+    # -- Markdown Report Builder -----------------------------------------
+
+    @staticmethod
+    def _dir_symbol(direction: str) -> str:
+        """方向代码 → 文字符号"""
+        mapping = {
+            'bullish': '⬆',
+            'bearish': '⬇',
+            'bidirectional': '⇄',
+            'neutral': '—',
+        }
+        return mapping.get(direction, '—')
+
+    @staticmethod
+    def _stars(strength) -> str:
+        """力度数值 → 星号字符串"""
+        try:
+            n = int(strength)
+        except (ValueError, TypeError):
+            n = 0
+        return '★' * max(0, min(5, n)) if n else '—'
+
+    def _to_markdown(self, analysis: dict, gold_price: str, today: str) -> str:
+        """将 LLM 返回的 JSON analysis 转换为纯文字符号风格的 Markdown 报告。
+        
+        参考「黄金分析报告_20260716.md」的视觉风格（表格/分隔线/★符号），
+        但去除 emoji 图标，仅使用文字符号。
+        """
+        from datetime import timezone, timedelta as _td
+        local_tz = timezone(_td(hours=8))
+        now_str = datetime.now(local_tz).strftime('%Y-%m-%d %H:%M')
+
+        parts = []
+
+        # 标题
+        parts.append(f"# 现货黄金综合分析报告")
+        parts.append(f"## {today} | 黄金现货 {gold_price}")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+        # 一、影响因素汇总
+        parts.append("## 一、影响因素汇总")
+        parts.append("")
+        factor_table = analysis.get('factor_table', '')
+        if factor_table:
+            parts.append(str(factor_table))
+        else:
+            parts.append("（暂无影响因素数据）")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+        # 二、逾期事件消化确认
+        parts.append("## 二、逾期事件消化确认")
+        parts.append("")
+        overdue = analysis.get('overdue_events', [])
+        if overdue and isinstance(overdue, list):
+            parts.append("| 事件 | 影响 | 力度 | 方向 | 确认要点 |")
+            parts.append("|------|------|------|------|---------|")
+            for e in overdue:
+                name = e.get('name', '—')
+                impact = e.get('impact', '—')
+                strength = self._stars(e.get('strength', 0))
+                direction = self._dir_symbol(e.get('direction', ''))
+                note = e.get('note', '—')
+                parts.append(f"| {name} | {impact} | {strength} | {direction} | {note} |")
+        else:
+            parts.append("（暂无逾期事件）")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+        # 三、今日待发布事件
+        parts.append("## 三、今日待发布事件")
+        parts.append("")
+        upcoming = analysis.get('upcoming_events', [])
+        if upcoming and isinstance(upcoming, list):
+            parts.append("| 事件 | 时间 | 预期值 | 前值 | 潜在影响 | 方向 |")
+            parts.append("|------|------|--------|------|---------|------|")
+            for e in upcoming:
+                name = e.get('name', '—')
+                time = e.get('time', '—')
+                expected = e.get('expected_value', '—')
+                prev = e.get('prev_value', '—')
+                potential = e.get('potential_impact', '—')
+                direction = self._dir_symbol(e.get('direction', ''))
+                parts.append(f"| {name} | {time} | {expected} | {prev} | {potential} | {direction} |")
+        else:
+            parts.append("（暂无待发布事件）")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+        # 四、操作建议
+        parts.append("## 四、操作建议")
+        parts.append("")
+        parts.append("### 日内建议")
+        daily = analysis.get('daily_advice', '')
+        parts.append(daily if daily else "（暂无日内建议）")
+        parts.append("")
+        parts.append("### 周内建议")
+        weekly = analysis.get('weekly_advice', '')
+        parts.append(weekly if weekly else "（暂无周内建议）")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+
+        # 五、核心结论
+        parts.append("## 五、核心结论")
+        parts.append("")
+        summary = analysis.get('summary', '')
+        parts.append(summary if summary else "（暂无核心结论）")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+        parts.append(f"*报告生成时间: {now_str} CST*")
+
+        return '\n'.join(parts)
+
+    def _archive_market_report(self, markdown_text: str, today: str) -> None:
+        """将 Markdown 报告归档到外部目录。
+        
+        路径: O:/计划书A1/为什么没有成果/Zenith/market/{today}/market_report_{timestamp}.md
+        写失败仅记录日志，不阻塞主流程。
+        """
+        if not markdown_text:
+            return
+        try:
+            from pathlib import Path
+            archive_base = Path("O:/计划书A1/为什么没有成果/Zenith/market") / today
+            archive_base.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = archive_base / f"market_report_{timestamp}.md"
+            filepath.write_text(markdown_text, encoding="utf-8")
+            logger.info(f"行情报告已归档: {filepath}")
+        except Exception as e:
+            logger.warning(f"行情报告归档失败（不影响主流程）: {e}")
 
 
 # ---------------------------------------------------------------------------

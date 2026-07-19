@@ -41,3 +41,15 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Session cache
+.zenith.browser
+
+# Daily plans (personal)
+data/daily_plans/
+
+# Knowledge base data (should not be in this repo)
+zenith_rag/
+zenith_wiki/
+chroma_db/
+tasks.db

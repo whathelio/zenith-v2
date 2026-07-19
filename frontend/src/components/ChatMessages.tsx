@@ -1,14 +1,16 @@
 import { useRef, useEffect } from 'react'
 import type { Message } from '../shared/api'
 import { api } from '../shared/api'
+import ConfirmCard, { extractConfirmCard, stripConfirmCard, type ConfirmOption } from './ConfirmCard'
 
 interface ChatMessagesProps {
   messages: Message[]
   streamingText: string
   isLoading: boolean
+  onSend?: (text: string) => void
 }
 
-export default function ChatMessages({ messages, streamingText, isLoading }: ChatMessagesProps) {
+export default function ChatMessages({ messages, streamingText, isLoading, onSend }: ChatMessagesProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -43,24 +45,34 @@ export default function ChatMessages({ messages, streamingText, isLoading }: Cha
 
   return (
     <div className="chat-messages" onClick={handleLinkClick}>
-      {messages.filter(m => m.role !== 'system').map(msg => (
-        <div key={msg.id} className={`message message-${msg.role === 'user' ? 'user' : 'ai'}`}>
-          <div className="message-avatar">
-            {msg.role === 'user' ? 'I' : 'Z'}
-          </div>
-          <div>
-            <div
-              className="message-bubble"
-              dangerouslySetInnerHTML={{ __html: formatContent(msg.content) }}
-            />
-            <div className="message-time">
-              {msg.created_at ? new Date(msg.created_at).toLocaleTimeString('zh-CN', {
-                hour: '2-digit', minute: '2-digit'
-              }) : ''}
+      {messages.filter(m => m.role !== 'system').map(msg => {
+        const card = msg.role !== 'user' ? extractConfirmCard(msg.content) : null
+        const textContent = card ? stripConfirmCard(msg.content) : msg.content
+        return (
+          <div key={msg.id} className={`message message-${msg.role === 'user' ? 'user' : 'ai'}`}>
+            <div className="message-avatar">
+              {msg.role === 'user' ? 'I' : 'Z'}
+            </div>
+            <div>
+              <div
+                className="message-bubble"
+                dangerouslySetInnerHTML={{ __html: formatContent(textContent) }}
+              />
+              {card && onSend && (
+                <ConfirmCard
+                  data={card}
+                  onSelect={(opt: ConfirmOption) => onSend(opt.confirmText)}
+                />
+              )}
+              <div className="message-time">
+                {msg.created_at ? new Date(msg.created_at).toLocaleTimeString('zh-CN', {
+                  hour: '2-digit', minute: '2-digit'
+                }) : ''}
+              </div>
             </div>
           </div>
-        </div>
-      ))}
+        )
+      })}
       {streamingText && (
         <div className="message message-ai">
           <div className="message-avatar">Z</div>

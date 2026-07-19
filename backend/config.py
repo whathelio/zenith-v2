@@ -29,7 +29,6 @@ SYSTEM_PROMPT = (
     "6. 上下文压缩 — 长对话自动生成摘要\n"
     "7. 网页访问 — 读取网页内容或主动联网搜索最新信息\n"
     "8. 内容总结 — 分析任意链接（文章/B站/GitHub/视频），生成结构化摘要\n"
-    "9. 市场分析 — 查询现货黄金市场状态、CFTC持仓分析、宏观数据、每日分析报告\n"
     "\n"
     "## 行为准则\n"
     "1. 发现日程安排 → 调用 add_schedule 记录\n"
@@ -40,9 +39,16 @@ SYSTEM_PROMPT = (
     "6. 用户发来链接 / 让你看某个网页 / 总结这篇文章或视频 → 优先调用 analyze_content（自动识别B站/GitHub/文章/视频并生成摘要）\n"
     "7. 需要读取网页原始内容（如提取特定文字）→ 调用 web_fetch\n"
     "8. 需要联网查最新信息 → 调用 web_search 搜索\n"
-    "9. 用户问黄金/市场/持仓/CFTC → 调用 query_market 或 cftc_positioning\n"
-    "10. 用户要求做市场分析 → 调用 analyze_gold 生成综合分析报告\n"
-    "11. 用户问预测命中情况 → 调用 track_predictions\n"
+    "9. 需要查本地文献/论文/书籍内容 → 调用 retrieve_docs（RAG 检索）\n"
+    "10. 需要查已编译的专题/Wiki → 调用 query_wiki\n"
+    "11. 用户问知识库状态 → 调用 kb_stats\n"
+    "12. 需要记录日程/笔记/记忆/技能 → 调用 smart_classify（不要用 retrieve_docs 记录信息）\n"
+    "\n"
+    "## 确认卡片（Confirm Card）\n"
+    "当需要用户确认不可逆操作（删除、合并、归档等）或提供多个互斥决策时，"
+    "在回复末尾输出确认卡片标记：\n"
+    "<!-- zenith-confirm-card:{\\\"id\\\":\\\"唯一标识\\\",\\\"title\\\":\\\"标题\\\",\\\"description\\\":\\\"说明\\\",\\\"options\\\":[{\\\"label\\\":\\\"按钮文字\\\",\\\"value\\\":\\\"动作标识\\\",\\\"confirmText\\\":\\\"用户点击后自动发送的确认消息\\\",\\\"variant\\\":\\\"primary|danger|default\\\"}]} -->\n"
+    "要求：id 唯一、options 至少一个、confirmText 必须是一句用户可直接发送的完整确认指令。"
 )
 
 DEFAULT_CONFIG = {
@@ -57,8 +63,8 @@ DEFAULT_CONFIG = {
     "context_compress_threshold": 20,
     "memory_extract_interval": 5,
     "auto_distill_enabled": True,
-    # 市场分析配置
-    "market_analysis_enabled": True,
+    # 市场分析配置（已封存）
+    "market_analysis_enabled": False,
     "market_analysis_time": "07:00",
     "gold_focus_contract": "GOLD - COMMODITY",
     "cftc_zscore_window": 156,
@@ -109,3 +115,15 @@ def get_api_key() -> str:
 
 def get_model() -> str:
     return load_config().get("model", DEFAULT_CONFIG["model"])
+
+
+def get_temperature() -> float:
+    return float(load_config().get("temperature", DEFAULT_CONFIG["temperature"]))
+
+
+def get_max_tokens() -> int:
+    return int(load_config().get("max_tokens", DEFAULT_CONFIG["max_tokens"]))
+
+
+def get_system_prompt() -> str:
+    return load_config().get("system_prompt", DEFAULT_CONFIG["system_prompt"])

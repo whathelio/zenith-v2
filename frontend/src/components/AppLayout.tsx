@@ -1,27 +1,17 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Outlet } from 'react-router-dom'
-import { api, type CalendarData, type Goal, type GoalStats, type MarketReport } from '../shared/api'
+import { Outlet, Link, useNavigate } from 'react-router-dom'
+import { api, type CalendarData, type Goal, type GoalStats } from '../shared/api'
 import {
   CalendarGoalContext,
   type GoalDisplayField,
   type GoalMarkInfo,
   type GoalAmountInfo,
+  type GoalActiveInfo,
   type WeekDayInfo,
 } from '../contexts/CalendarGoalContext'
 
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
 const GOAL_COLORS = ['#50fa7b', '#8be9fd', '#ff79c6', '#f1fa8c', '#bd93f9']
-
-const STATUS_COLORS: Record<string, string> = {
-  confirmed: '#50fa7b', proposed: '#f1fa8c', done: '#8be9fd', cancelled: '#ff5555',
-}
-const PRIORITY_COLORS: Record<string, string> = {
-  high: '#ff5555', normal: '#bd93f9', low: '#717e95',
-}
-const MEMORY_TYPE_COLORS: Record<string, string> = {
-  personal_info: '#ff79c6', preference: '#8be9fd', event: '#50fa7b',
-  decision: '#f1fa8c', fact: '#bd93f9', experience: '#ff6e40',
-}
 
 function formatDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -84,6 +74,7 @@ function calcDailyGoalAmounts(g: Goal): Map<string, number> {
    右侧面板：Outlet（各页面内容）
    ══════════════════════════════════════════ */
 export default function AppLayout() {
+  const navigate = useNavigate()
   const [currentDate, setCurrentDate] = useState(new Date())
   const [selectedDate, setSelectedDate] = useState(new Date())
   const todayStr = formatDate(new Date())
@@ -99,13 +90,13 @@ export default function AppLayout() {
   const [goals, setGoals] = useState<Goal[]>([])
   const [goalStats, setGoalStats] = useState<Record<number, GoalStats>>({})
 
-  // 行情
-  const [marketReport, setMarketReport] = useState<MarketReport | null>(null)
-
   // 目标 CRUD
   const [showGoalModal, setShowGoalModal] = useState(false)
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null)
   const [showGoalDelete, setShowGoalDelete] = useState<Goal | null>(null)
+
+  // 提议同步（来自 ChatView 的 CustomEvent）
+  const [proposals, setProposals] = useState<any[]>([])
 
   // 周计算：以 selectedDate 为基准，显示其所在周（周一到周日）
   const refDate = selectedDate
@@ -127,6 +118,16 @@ export default function AppLayout() {
   }, [currentDate.getFullYear(), currentDate.getMonth() + 1])
   useEffect(() => { loadCalendar() }, [loadCalendar])
 
+  // 监听 ChatView 的提议更新事件
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      setProposals(Array.isArray(detail) ? detail : [])
+    }
+    window.addEventListener('zenith:proposals', handler)
+    return () => window.removeEventListener('zenith:proposals', handler)
+  }, [])
+
   // 加载目标
   const loadGoals = useCallback(async () => {
     try {
@@ -140,15 +141,6 @@ export default function AppLayout() {
     } catch {}
   }, [])
   useEffect(() => { loadGoals() }, [loadGoals])
-
-  // 加载行情
-  const loadMarket = useCallback(async () => {
-    try {
-      const r = await api.getLatestReport()
-      setMarketReport(r)
-    } catch {}
-  }, [])
-  useEffect(() => { loadMarket() }, [loadMarket])
 
   const prevWeek = () => {
     const d = new Date(selectedDate)
@@ -172,6 +164,21 @@ export default function AppLayout() {
   const updateGoalBalance = async (goalId: number, newValue: number) => {
     await api.updateGoal(goalId, { current_value: newValue })
     loadGoals()
+  }
+
+  // 提议确认/拒绝（左侧面板紧凑列表）
+  const handleProposalConfirm = async (type: string, id: number) => {
+    try {
+      await api.confirmProposal(type, id)
+      setProposals(prev => prev.filter(p => !(p.type === type && p.id === id)))
+      loadCalendar()
+    } catch (e) { console.error('确认提议失败', e) }
+  }
+  const handleProposalReject = async (type: string, id: number) => {
+    try {
+      await api.rejectProposal(type, id)
+      setProposals(prev => prev.filter(p => !(p.type === type && p.id === id)))
+    } catch (e) { console.error('拒绝提议失败', e) }
   }
 
   // 选定目标日期
@@ -210,6 +217,21 @@ export default function AppLayout() {
         const list = map.get(dateKey) || []
         list.push({ goalId: g.id, color, amount })
         map.set(dateKey, list)
+      })
+    })
+    return map
+  }, [goals])
+
+  // 目标激活日期映射（基于 active_days）
+  const goalActiveMap = useMemo(() => {
+    const map = new Map<string, GoalActiveInfo[]>()
+    goals.forEach((g, idx) => {
+      const color = GOAL_COLORS[idx % GOAL_COLORS.length]
+      const activeDays = g.active_days || []
+      activeDays.forEach(date => {
+        const list = map.get(date) || []
+        list.push({ goalId: g.id, color, title: g.title })
+        map.set(date, list)
       })
     })
     return map
@@ -257,14 +279,14 @@ export default function AppLayout() {
   const contextValue = useMemo(() => ({
     currentDate, setCurrentDate, selectedDate, setSelectedDate, todayStr,
     selectedDayKey, weekDays, data, loading, goals, goalStats,
-    goalDateMap, goalAmountMap, selectedDayData, marketReport,
+    goalDateMap, goalAmountMap, goalActiveMap, selectedDayData,
     prevWeek, nextWeek, goToday, loadCalendar, loadGoals,
     updateGoalBalance, updateGoalEndDate,
     goalDisplayField, setGoalDisplayField,
     showGoalModal, setShowGoalModal, editingGoal, setEditingGoal,
     showGoalDelete, setShowGoalDelete, handleGoalSubmit, handleGoalDelete,
   }), [currentDate, selectedDate, todayStr, selectedDayKey, weekDays, data, loading,
-    goals, goalStats, goalDateMap, goalAmountMap, selectedDayData, marketReport,
+    goals, goalStats, goalDateMap, goalAmountMap, goalActiveMap, selectedDayData,
     goalDisplayField, showGoalModal, editingGoal, showGoalDelete])
 
   return (
@@ -274,18 +296,50 @@ export default function AppLayout() {
         <div className="topbar">
           <div className="topbar-brand">Zenith v2</div>
           <div className="topbar-actions">
-            <a href="/" className="btn btn-sm">🏠 主页</a>
-            <a href="/chat" className="btn btn-sm">💬 对话</a>
-            <a href="/schedules" className="btn btn-sm">📋 日程</a>
-            <a href="/notes" className="btn btn-sm">📝 笔记</a>
-            <a href="/memories" className="btn btn-sm">🧠 记忆</a>
-            <a href="/settings" className="btn btn-sm">⚙ 设置</a>
+            <Link to="/" className="btn btn-sm">🏠 主页</Link>
+            <Link to="/chat" className="btn btn-sm">💬 对话</Link>
+            <Link to="/calendar" className="btn btn-sm">📋 日程</Link>
+            <Link to="/library" className="btn btn-sm">📚 笔记库</Link>
+            <Link to="/knowledge" className="btn btn-sm">🧠 知识库</Link>
+            <Link to="/goals" className="btn btn-sm">🎯 目标</Link>
+            <Link to="/settings" className="btn btn-sm">⚙ 设置</Link>
           </div>
         </div>
 
         <div className="app-layout-body">
           {/* ====== 左侧面板：日历 + 目标追踪 ====== */}
           <div className="app-layout-left">
+            {/* 待确认提议（来自对话） */}
+            {proposals.length > 0 && (
+              <div className="proposal-compact" style={{ marginBottom: 10 }}>
+                <div className="proposal-compact-header">
+                  <span>📋</span>待确认提议 ({proposals.length})
+                </div>
+                {proposals.slice(0, 5).map((p, i) => (
+                  <div key={`${p.type}-${p.id}-${i}`} className="proposal-compact-item">
+                    <span className="proposal-compact-item-title">
+                      {p.type === 'schedule' ? '📅' : '📝'} {p.data?.title || p.data?.content || '提议'}
+                    </span>
+                    <button
+                      className="proposal-compact-btn confirm"
+                      onClick={() => handleProposalConfirm(p.type, p.id)}
+                      title="确认"
+                    >✓</button>
+                    <button
+                      className="proposal-compact-btn reject"
+                      onClick={() => handleProposalReject(p.type, p.id)}
+                      title="拒绝"
+                    >✗</button>
+                  </div>
+                ))}
+                {proposals.length > 5 && (
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', textAlign: 'center', padding: '4px 0' }}>
+                    +{proposals.length - 5} 条，去对话页查看
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* 周导航 */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
               <button className="btn btn-sm" onClick={prevWeek}>‹</button>
@@ -302,18 +356,18 @@ export default function AppLayout() {
                 const schedCount = dayData?.schedules?.length ?? 0
                 const goalMarks = goalDateMap.get(wd.key) || []
                 const goalAmts = goalAmountMap.get(wd.key) || []
-                // 根据显示字段决定日历上显示什么数值
+                // 多目标显示：显示所有目标的颜色点 + 聚合数值
                 let displayValue: { text: string; color: string } | null = null
                 if (wd.key >= todayStr) {
                   if (goalDisplayField === 'current_value' && goals.length > 0) {
-                    const g = goals[0]
-                    displayValue = { text: formatMoneyShort(g.current_value), color: GOAL_COLORS[0] }
+                    const total = goals.reduce((sum, g) => sum + g.current_value, 0)
+                    displayValue = { text: formatMoneyShort(total), color: '#50fa7b' }
                   } else if (goalDisplayField === 'daily_target' && goalAmts.length > 0) {
-                    const primaryAmt = goalAmts[0]
-                    displayValue = { text: formatMoneyShort(primaryAmt.amount), color: primaryAmt.color }
+                    const total = goalAmts.reduce((sum, a) => sum + a.amount, 0)
+                    displayValue = { text: formatMoneyShort(total), color: '#8be9fd' }
                   } else if (goalDisplayField === 'target_value' && goals.length > 0) {
-                    const g = goals[0]
-                    displayValue = { text: formatMoneyShort(g.target_value), color: GOAL_COLORS[0] }
+                    const total = goals.reduce((sum, g) => sum + g.target_value, 0)
+                    displayValue = { text: formatMoneyShort(total), color: '#f1fa8c' }
                   }
                 }
                 return (
@@ -340,18 +394,18 @@ export default function AppLayout() {
                     )}
                     {displayValue && (
                       <div style={{
-                        fontSize: 13, marginTop: 4,
+                        fontSize: 12, marginTop: 2,
                         color: isSelected ? '#fff9' : displayValue.color,
                         fontWeight: 600,
                       }}>
                         {displayValue.text}
                       </div>
                     )}
-                    {goalMarks.length > 0 && !displayValue && (
-                      <div style={{ display: 'flex', justifyContent: 'center', gap: 3, marginTop: 2 }}>
-                        {goalMarks.slice(0, 3).map((m, i) => (
+                    {goalMarks.length > 0 && (
+                      <div style={{ display: 'flex', justifyContent: 'center', gap: 2, marginTop: 2, flexWrap: 'wrap' }}>
+                        {goalMarks.slice(0, 5).map((m, i) => (
                           <div key={i} style={{
-                            width: 8, height: 8, borderRadius: '50%', background: isSelected ? '#fff8' : m.color,
+                            width: 7, height: 7, borderRadius: '50%', background: isSelected ? '#fff8' : m.color,
                           }} title={`${m.title} ${m.label}`} />
                         ))}
                       </div>
@@ -381,6 +435,7 @@ export default function AppLayout() {
                 onSelectDate={(d) => { setSelectedDate(d); setCurrentDate(d) }}
                 goalDateMap={goalDateMap}
                 goalAmountMap={goalAmountMap}
+                goalActiveMap={goalActiveMap}
                 goalDisplayField={goalDisplayField}
                 goals={goals}
               />
@@ -397,8 +452,8 @@ export default function AppLayout() {
             {/* ====== 目标追踪板块 ====== */}
             {goals.length > 0 ? (
               <Section title="目标追踪" icon="🎯" color="#50fa7b">
-                {/* 显示字段切换 */}
-                <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+                {/* 显示字段切换 + 主目标说明 */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 8, flexWrap: 'wrap' }}>
                   {([
                     { key: 'current_value', label: '现金额' },
                     { key: 'daily_target', label: '日化目标' },
@@ -419,99 +474,57 @@ export default function AppLayout() {
                       {opt.label}
                     </button>
                   ))}
+                  <span style={{ fontSize: 10, color: 'var(--color-text-muted)', marginLeft: 'auto' }}>
+                    {goals.length} 个目标
+                  </span>
                 </div>
 
                 {goals.map((g, idx) => {
                   const s = goalStats[g.id]
                   const progress = s?.progress ?? ((g.current_value - g.start_value) / (g.target_value - g.start_value) * 100)
                   const color = GOAL_COLORS[idx % GOAL_COLORS.length]
+                  const activeDays = g.active_days || []
+                  const rate = g.daily_target || 5
+                  const factor = 1 + rate / 100
+                  const requiredDays = (g.current_value > 0 && g.target_value > g.current_value && factor > 1)
+                    ? Math.ceil(Math.log(g.target_value / g.current_value) / Math.log(factor))
+                    : 0
                   return (
-                    <div key={g.id} style={{ padding: 10, background: 'var(--color-bg-input)', borderRadius: 6, marginBottom: 6, borderLeft: `3px solid ${color}` }}>
+                    <div
+                      key={g.id}
+                      onClick={() => navigate('/calendar')}
+                      style={{
+                        padding: '8px 10px',
+                        background: 'var(--color-bg-input)',
+                        borderRadius: 8,
+                        marginBottom: 6,
+                        borderLeft: `3px solid ${color}`,
+                        cursor: 'pointer',
+                        transition: 'all 0.15s',
+                      }}
+                      title="点击进入日历查看详情"
+                    >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>{g.title}</span>
-                        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                          <span style={{ fontSize: 11, color: s?.on_track ? '#50fa7b' : '#ff5555' }}>
-                            {s?.on_track ? '✓在轨' : '⚠偏离'}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {g.title}
                           </span>
-                          <button
-                            className="btn btn-sm"
-                            onClick={() => { setEditingGoal(g); setShowGoalModal(true) }}
-                            style={{
-                              fontSize: 11, padding: '3px 10px',
-                              background: 'var(--color-accent-primary)', color: '#fff',
-                              border: 'none', borderRadius: 4, fontWeight: 600,
-                            }}
-                          >
-                            编辑
-                          </button>
                         </div>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: progress >= 100 ? '#50fa7b' : 'var(--color-text-secondary)', flexShrink: 0, marginLeft: 8 }}>
+                          {progress.toFixed(0)}%
+                        </span>
                       </div>
-                      {/* 进度条 */}
-                      <div style={{ background: 'var(--color-bg-muted)', borderRadius: 4, height: 6, marginTop: 6 }}>
+
+                      <div style={{ background: 'var(--color-bg-muted)', borderRadius: 4, height: 6, marginTop: 6, overflow: 'hidden' }}>
                         <div style={{ width: `${Math.min(progress, 100)}%`, height: 6, borderRadius: 4, background: color, transition: 'width 0.3s' }} />
                       </div>
-                      <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 5 }}>
-                        {progress.toFixed(1)}% · {formatMoney(g.current_value)} → {formatMoney(g.target_value)}
-                      </div>
-                      {/* 四维统计 */}
-                      {s && (
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 4, marginTop: 6, fontSize: 11 }}>
-                          <div style={{ textAlign: 'center', color: s.daily_return >= g.daily_target ? '#50fa7b' : '#ff5555' }}>
-                            日化 {s.daily_return.toFixed(1)}%
-                          </div>
-                          <div style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
-                            {s.days_passed}/{s.days_total}天
-                          </div>
-                          <div style={{ textAlign: 'center', color: 'var(--color-text-muted)' }}>
-                            剩余 {formatMoney(s.remaining)}
-                          </div>
-                          <div style={{ textAlign: 'center', color: color, fontWeight: 600 }}>
-                            需 {g.daily_target}%/日
-                          </div>
-                        </div>
-                      )}
-                      {/* 选定目标日期 + 快速更新余额 */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-                        <input
-                          type="date"
-                          value={g.end_date || ''}
-                          onChange={e => {
-                            const v = e.target.value
-                            if (v) updateGoalEndDate(g.id, v)
-                          }}
-                          style={{
-                            padding: '4px 6px', borderRadius: 4, background: 'var(--color-bg-muted)',
-                            border: `1px solid ${color}`, color: 'var(--color-text-primary)', fontSize: 11,
-                            width: 120,
-                          }}
-                        />
-                        <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>目标日</span>
-                        <input
-                          id={`left-balance-${g.id}`}
-                          type="number"
-                          placeholder="输入新余额"
-                          style={{
-                            flex: 1, minWidth: 80, padding: '4px 8px', borderRadius: 4, background: 'var(--color-bg-muted)',
-                            border: '1px solid var(--color-border)', color: 'var(--color-text-primary)', fontSize: 12,
-                          }}
-                          onKeyDown={e => {
-                            if (e.key === 'Enter') {
-                              const v = parseFloat((e.target as HTMLInputElement).value)
-                              if (v > 0) { updateGoalBalance(g.id, v); (e.target as HTMLInputElement).value = '' }
-                            }
-                          }}
-                        />
-                        <button
-                          className="btn btn-sm"
-                          onClick={() => {
-                            const input = document.getElementById(`left-balance-${g.id}`) as HTMLInputElement
-                            const v = parseFloat(input.value)
-                            if (v > 0) { updateGoalBalance(g.id, v); input.value = '' }
-                          }}
-                          style={{ fontSize: 10, background: color, color: '#fff', padding: '4px 10px', border: 'none', borderRadius: 4 }}
-                        >
-                          更新
-                        </button>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 11, color: 'var(--color-text-muted)' }}>
+                        <span>{formatMoney(g.current_value)} / {formatMoney(g.target_value)}</span>
+                        <span style={{ color: activeDays.length >= requiredDays && requiredDays > 0 ? '#50fa7b' : '#f1fa8c' }}>
+                          已激活 {activeDays.length} 天{requiredDays > 0 ? ` / 需 ${requiredDays} 天` : ''}
+                        </span>
                       </div>
                     </div>
                   )
@@ -649,12 +662,13 @@ function GoalModalForm({ editingGoal, onSubmit, onCancel, onDelete }: {
 }
 
 /* 小月历组件 */
-function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, goalDateMap, goalAmountMap, goalDisplayField, goals }: {
+function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, goalDateMap, goalAmountMap, goalActiveMap, goalDisplayField, goals }: {
   year: number; month: number; data: CalendarData | null; todayStr: string;
   selectedDate: Date;
   onSelectDate: (d: Date) => void;
   goalDateMap: Map<string, GoalMarkInfo[]>;
   goalAmountMap: Map<string, GoalAmountInfo[]>;
+  goalActiveMap: Map<string, GoalActiveInfo[]>;
   goalDisplayField: GoalDisplayField;
   goals: Goal[];
 }) {
@@ -671,22 +685,22 @@ function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, go
   }
   while (cells.length % 7 !== 0) cells.push(null)
 
-  // 根据显示字段决定月历上显示什么
+  // 根据显示字段决定月历上显示什么：多目标聚合
   const getDisplayForCell = (cellKey: string): { text: string; color: string } | null => {
     if (cellKey < todayStr || goals.length === 0) return null
     if (goalDisplayField === 'daily_target') {
       const goalAmts = goalAmountMap.get(cellKey)
       if (goalAmts && goalAmts.length > 0) {
-        const primaryAmt = goalAmts[0]
-        return { text: primaryAmt.amount >= 10000 ? `${(primaryAmt.amount / 10000).toFixed(1)}万` : primaryAmt.amount.toFixed(0), color: primaryAmt.color }
+        const total = goalAmts.reduce((sum, a) => sum + a.amount, 0)
+        return { text: total >= 10000 ? `${(total / 10000).toFixed(1)}万` : total.toFixed(0), color: '#8be9fd' }
       }
       return null
     } else if (goalDisplayField === 'current_value') {
-      const g = goals[0]
-      return { text: g.current_value >= 10000 ? `${(g.current_value / 10000).toFixed(1)}万` : g.current_value.toFixed(0), color: GOAL_COLORS[0] }
+      const total = goals.reduce((sum, g) => sum + g.current_value, 0)
+      return { text: total >= 10000 ? `${(total / 10000).toFixed(1)}万` : total.toFixed(0), color: '#50fa7b' }
     } else if (goalDisplayField === 'target_value') {
-      const g = goals[0]
-      return { text: g.target_value >= 10000 ? `${(g.target_value / 10000).toFixed(1)}万` : g.target_value.toFixed(0), color: GOAL_COLORS[0] }
+      const total = goals.reduce((sum, g) => sum + g.target_value, 0)
+      return { text: total >= 10000 ? `${(total / 10000).toFixed(1)}万` : total.toFixed(0), color: '#f1fa8c' }
     }
     return null
   }
@@ -705,6 +719,7 @@ function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, go
           const isToday = cell.key === todayStr
           const isSelected = cell.key === selectedKey
           const goalMarks = goalDateMap.get(cell.key) || []
+          const goalActives = goalActiveMap.get(cell.key) || []
           const displayVal = getDisplayForCell(cell.key)
           const showAmount = displayVal !== null
           return (
@@ -712,11 +727,12 @@ function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, go
               key={i}
               onClick={() => onSelectDate(parseLocalDate(cell.key))}
               style={{
-                textAlign: 'center', fontSize: 14, padding: showAmount ? '6px 0 3px' : '5px 0', borderRadius: 5,
+                textAlign: 'center', fontSize: 14, padding: '6px 0 3px', borderRadius: 5,
                 cursor: 'pointer',
                 color: isSelected ? '#fff' : isToday ? 'var(--color-accent-primary)' : hasEvents ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
                 fontWeight: isSelected || isToday ? 700 : hasEvents ? 500 : 400,
                 background: isSelected ? 'var(--color-accent-primary)' : isToday ? 'rgba(189,147,249,0.12)' : hasEvents ? 'var(--color-bg-input)' : 'transparent',
+                position: 'relative',
               }}
             >
               <div>{cell.day}</div>
@@ -725,10 +741,20 @@ function MiniMonth({ year, month, data, todayStr, selectedDate, onSelectDate, go
                   {displayVal!.text}
                 </div>
               )}
-              {goalMarks.length > 0 && !showAmount && (
-                <div style={{ display: 'flex', justifyContent: 'center', gap: 3, marginTop: 2 }}>
-                  {goalMarks.slice(0, 3).map((m, j) => (
-                    <div key={j} style={{ width: 8, height: 8, borderRadius: '50%', background: isSelected ? '#fff8' : m.color }} title={`${m.title} ${m.label}`} />
+              {/* 目标激活日期指示条 */}
+              {goalActives.length > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 2, marginTop: 3, flexWrap: 'wrap' }}>
+                  {goalActives.slice(0, 5).map((m, j) => (
+                    <div key={j} style={{
+                      width: 8, height: 4, borderRadius: 2, background: isSelected ? '#fff8' : m.color,
+                    }} title={`${m.title} 已激活`} />
+                  ))}
+                </div>
+              )}
+              {goalMarks.length > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'center', gap: 2, marginTop: 2, flexWrap: 'wrap' }}>
+                  {goalMarks.slice(0, 5).map((m, j) => (
+                    <div key={j} style={{ width: 7, height: 7, borderRadius: '50%', background: isSelected ? '#fff8' : m.color }} title={`${m.title} ${m.label}`} />
                   ))}
                 </div>
               )}
