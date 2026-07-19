@@ -10,9 +10,12 @@ import webbrowser
 import threading
 import socket
 import ctypes
+import platform
+import atexit
 from pathlib import Path
 
-# 配置日志 — 同时输出到文件（pythonw 无控制台时仍可排查）
+# 新增：Unix系统文件锁句柄全局保存
+_lock_fd = None
 PROJECT_DIR = Path(__file__).parent
 _LOG_FILE = PROJECT_DIR / "zenith.log"
 
@@ -32,24 +35,62 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 # 单实例锁 + 浏览器打开时间戳
 _INSTANCE_MUTEX_NAME = "ZenithV2SingleInstanceMutex"
+# Linux锁文件路径
+_UNIX_LOCK_PATH = Path("/tmp/ZenithV2SingleInstanceMutex.lock")
 _BROWSER_TS_FILE = PROJECT_DIR / ".zenith.browser"
 _BROWSER_COOLDOWN_SECONDS = 5
 
 
+def _release_unix_lock():
+    """进程退出时释放Linux文件锁"""
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            _lock_fd.close()
+        except Exception:
+            pass
+        _lock_fd = None
+
+
 def _acquire_instance_mutex():
-    """创建 Windows 命名互斥量。返回 (mutex_handle, is_first_instance)。"""
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.GetLastError.restype = ctypes.c_uint32
+    """创建 Windows 命名互斥量 / Linux 文件锁。返回 (lock_handle, is_first_instance)。
+    Windows原有逻辑完全保留，新增Linux分支
+    """
+    sys_platform = platform.system()
+    if sys_platform == "Windows":
+        # ========== Windows 原有代码 完全未改动 ==========
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_uint32
 
-    mutex = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
-    last_error = kernel32.GetLastError()
+        mutex = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+        last_error = kernel32.GetLastError()
 
-    # ERROR_ALREADY_EXISTS = 183
-    if mutex and last_error == 183:
-        return mutex, False
-    return mutex, True
+        # ERROR_ALREADY_EXISTS = 183
+        if mutex and last_error == 183:
+            return mutex, False
+        return mutex, True
+    else:
+        # ========== Linux / macOS 新增兼容逻辑 ==========
+        global _lock_fd
+        import fcntl
+        try:
+            # 创建/打开锁文件
+            _lock_fd = open(str(_UNIX_LOCK_PATH), "w", encoding="utf-8")
+            # 非阻塞独占锁，已被占用则抛异常
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # 注册退出释放锁
+            atexit.register(_release_unix_lock)
+            return _lock_fd, True
+        except BlockingIOError:
+            # 锁已被其他进程持有，非首个实例
+            return None, False
+        except Exception as e:
+            logger.warning(f"Unix lock create failed: {str(e)}")
+            return None, False
 
 
 def _browser_recently_opened() -> bool:
@@ -80,7 +121,7 @@ if __name__ == "__main__":
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(("127.0.0.1", p)) == 0
 
-    # 原子获取 Windows 命名互斥量
+    # 原子获取跨平台单实例锁
     mutex_handle, is_first_instance = _acquire_instance_mutex()
 
     if not is_first_instance:
