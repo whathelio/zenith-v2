@@ -11,6 +11,7 @@ from .database import (
     conv_get, msg_list, sch_list, mem_list, mem_search, mem_add, mem_for_inject,
     conv_update_summary, conv_update_title,
     conv_list_by_date, mem_list_by_date, note_list_by_date,
+    analysis_list_by_date, market_report_get_by_date, goal_list,
 )
 from .llm_client import call_llm, _parse_json_response
 from .memory_engine import _is_duplicate
@@ -123,8 +124,9 @@ def _gather_memories(type_: str = "", search: str = "") -> dict:
 
 def _gather_daily(date: str) -> dict:
     """聚合指定日期的全部内容（对话+日程+笔记+记忆）"""
-    date_start = f"{date} 00:00"
-    date_end = f"{date} 23:59"
+    # 日期格式必须与数据库 created_at/updated_at 一致 (ISO 8601 T 分隔)
+    date_start = f"{date}T00:00:00"
+    date_end = f"{date}T23:59:59"
 
     # 对话：当天更新的
     convs = conv_list_by_date(date_from=date_start, date_to=date_end)
@@ -165,12 +167,48 @@ def _gather_daily(date: str) -> dict:
         mem_lines.append(f"- [{m.get('type', '?')}] {m['content'][:200]} ({m.get('importance', 3)}/5)")
     memory_text = "\n".join(mem_lines) if mem_lines else "（当日无新增记忆）"
 
+    # 内容分析（analyze_content 工具产物）
+    analyses = analysis_list_by_date(date_from=date, date_to=date)
+    analysis_lines = []
+    for a in analyses[:10]:  # 限前 10 条避免 prompt 过长
+        text_preview = (a.get("analysis_text") or "")[:300]
+        if text_preview:
+            analysis_lines.append(f"- [{a.get('filename', '?')[:50]}] {text_preview}")
+    analysis_text = "\n".join(analysis_lines) if analysis_lines else "（当日无内容分析）"
+
+    # 市场报告
+    market_report = market_report_get_by_date(date)
+    market_lines = []
+    if market_report:
+        headline = market_report.get("headline", "")
+        daily_advice = (market_report.get("daily_advice") or "")[:300]
+        if headline:
+            market_lines.append(f"- 标题: {headline}")
+        if daily_advice:
+            market_lines.append(f"- 当日建议: {daily_advice}")
+    market_text = "\n".join(market_lines) if market_lines else "（当日无市场报告）"
+
+    # 目标进度（所有 active 目标 + 今日是否触及）
+    active_goals = goal_list(status="active")
+    goal_lines = []
+    for g in active_goals[:8]:  # 限前 8 个目标
+        title = g.get("title", "?")
+        current = g.get("current_value", 0)
+        target = g.get("target_value", 0)
+        daily_target = g.get("daily_target", 0)
+        progress_pct = (current / target * 100) if target else 0
+        goal_lines.append(f"- {title}: {current}/{target} ({progress_pct:.0f}%), 日化 {daily_target}")
+    goal_text = "\n".join(goal_lines) if goal_lines else "（无 active 目标）"
+
     return {
         "date": date,
         "chat_text": chat_text,
         "schedule_text": schedule_text,
         "note_text": note_text,
         "memory_text": memory_text,
+        "analysis_text": analysis_text,
+        "market_text": market_text,
+        "goal_text": goal_text,
         "conv_count": len(convs),
         "sch_count": len(schedules),
         "note_count": len(notes),
@@ -186,8 +224,8 @@ def _gather_weekly(week_start: str) -> dict:
     end = start + timedelta(days=6)
     week_end = end.strftime("%Y-%m-%d")
 
-    date_start = f"{week_start} 00:00"
-    date_end = f"{week_end} 23:59"
+    date_start = f"{week_start}T00:00:00"
+    date_end = f"{week_end}T23:59:59"
 
     # 对话
     convs = conv_list_by_date(date_from=date_start, date_to=date_end)
@@ -342,6 +380,7 @@ _PROMPT_ALL = """请对以下对话、日程和记忆数据进行全维度综合
 
 _PROMPT_DAILY = """请对以下「当日全部内容」进行综合蒸馏总结。这是 {date} 这一天的全部活动记录。
 生成一份结构化的每日总结报告，包括：当日全貌、重要事项、完成与遗漏、经验教训、明日建议。
+如果提供了「附加输入」（内容分析/市场报告/目标进度），请融入总结中。
 
 返回 JSON 格式：
 {
@@ -368,6 +407,15 @@ _PROMPT_DAILY = """请对以下「当日全部内容」进行综合蒸馏总结�
 
 当日新增记忆：
 {memory_text}
+
+当日内容分析：
+{analysis_text}
+
+当日市场报告：
+{market_text}
+
+活跃目标进度：
+{goal_text}
 
 只返回 JSON，不要其他内容。"""
 
@@ -1016,15 +1064,16 @@ def get_txt_content(result: dict) -> str:
 # 每日/每周蒸馏主入口
 # ---------------------------------------------------------------------------
 
-async def distill_daily(date: str = "", save_txt: bool = True) -> dict:
+async def distill_daily(date: str = "", save_txt: bool = True, save_md: bool = True) -> dict:
     """每日内容综合蒸馏
-    
+
     Args:
         date: 目标日期，格式 YYYY-MM-DD，空则取今天
         save_txt: 是否保存为 txt 文件
-    
+        save_md: 是否保存为 md 文件
+
     Returns:
-        dict: 蒸馏结果 (含 txt_content 字段)
+        dict: 蒸馏结果 (含 txt_content, md_content 字段)
     """
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
@@ -1061,6 +1110,9 @@ async def distill_daily(date: str = "", save_txt: bool = True) -> dict:
         schedule_text=daily_data["schedule_text"],
         note_text=daily_data["note_text"],
         memory_text=daily_data["memory_text"],
+        analysis_text=daily_data["analysis_text"],
+        market_text=daily_data["market_text"],
+        goal_text=daily_data["goal_text"],
     )
 
     # 3. 自动存入记忆库（核心洞察作为 experience）
@@ -1078,24 +1130,30 @@ async def distill_daily(date: str = "", save_txt: bool = True) -> dict:
 
     # 4. txt 格式化
     txt_content = _to_txt_daily(result, daily_data)
+    md_content = _to_md_daily(result, daily_data)
     result["txt_content"] = txt_content
+    result["md_content"] = md_content
     result["saved_count"] = saved_count
 
-    # 5. 保存 txt 文件到每日计划目录
+    # 5. 保存文件
     if save_txt:
         result["txt_path"] = _save_txt_plan(txt_content, f"daily_{date}.txt")
-        # 同步归档到外部目录
         _archive_external(txt_content, kind="daily", date_str=date, filename=f"daily_{date}.txt")
+    if save_md:
+        result["md_path"] = _save_txt_plan(md_content, f"daily_{date}.md")
+        _archive_external(md_content, kind="daily", date_str=date, filename=f"daily_{date}.md")
 
     logger.info(f"每日蒸馏完成: {date}, 已保存{saved_count}条记忆")
     return result
 
 
-async def distill_weekly(week_start: str = "", save_txt: bool = True) -> dict:
+async def distill_weekly(week_start: str = "", save_txt: bool = True, save_md: bool = True) -> dict:
     """每周内容综合蒸馏
-    
+
     Args:
         week_start: 周起始日期(周一)，格式 YYYY-MM-DD，空则取本周
+        save_txt: 是否保存为 txt 文件
+        save_md: 是否保存为 md 文件
         save_txt: 是否保存为 txt 文件
     
     Returns:
@@ -1166,16 +1224,20 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True) -> dict:
                 )
                 saved_count += 1
 
-    # 4. txt 格式化
+    # 4. txt + md 格式化
     txt_content = _to_txt_weekly(result, weekly_data)
+    md_content = _to_md_weekly(result, weekly_data)
     result["txt_content"] = txt_content
+    result["md_content"] = md_content
     result["saved_count"] = saved_count
 
-    # 5. 保存 txt 文件到每日计划目录
+    # 5. 保存文件
     if save_txt:
         result["txt_path"] = _save_txt_plan(txt_content, f"weekly_{week_start}.txt")
-        # 同步归档到外部目录
         _archive_external(txt_content, kind="weekly", date_str=week_start, filename=f"weekly_{week_start}.txt")
+    if save_md:
+        result["md_path"] = _save_txt_plan(md_content, f"weekly_{week_start}.md")
+        _archive_external(md_content, kind="weekly", date_str=week_start, filename=f"weekly_{week_start}.md")
 
     logger.info(f"每周蒸馏完成: {week_start}, 已保存{saved_count}条记忆")
     return result
@@ -1188,12 +1250,18 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True) -> dict:
 def _to_txt_daily(result: dict, daily_data: dict) -> str:
     """每日蒸馏 → txt 格式"""
     date = daily_data.get("date", "")
+    # 追加市场+目标计数到头部
+    extra = ""
+    if "market_text" in daily_data and "（当日无市场报告）" not in daily_data["market_text"]:
+        extra += " | 市场✓"
+    if "goal_text" in daily_data and "（无 active 目标）" not in daily_data["goal_text"]:
+        extra += " | 目标✓"
     lines = [
         "=" * 60,
         f"每日总结蒸馏报告 — {date}",
         "=" * 60,
         f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"当日数据: 对话{daily_data['conv_count']}条 | 日程{daily_data['sch_count']}条 | 笔记{daily_data['note_count']}条 | 记忆{daily_data['mem_count']}条",
+        f"当日数据: 对话{daily_data['conv_count']}条 | 日程{daily_data['sch_count']}条 | 笔记{daily_data['note_count']}条 | 记忆{daily_data['mem_count']}条{extra}",
         "",
         "--- 一句话概要 ---",
         result.get("headline", ""),
@@ -1251,6 +1319,120 @@ def _to_txt_daily(result: dict, daily_data: dict) -> str:
 
     lines.append("=" * 60)
     return "\n".join(lines)
+
+
+def _to_md_daily(result: dict, daily_data: dict) -> str:
+    """每日蒸馏 → md 格式（兼容 Obsidian / 笔记工具）"""
+    date = daily_data.get("date", "")
+    extra = ""
+    if "market_text" in daily_data and "（当日无市场报告）" not in daily_data["market_text"]:
+        extra += " · 市场✓"
+    if "goal_text" in daily_data and "（无 active 目标）" not in daily_data["goal_text"]:
+        extra += " · 目标✓"
+    lines = [
+        f"# 每日总结 — {date}",
+        "",
+        f"> {result.get('headline', '')}",
+        "",
+        f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        f"*数据: 对话 {daily_data['conv_count']} 条 · 日程 {daily_data['sch_count']} 条 · 笔记 {daily_data['note_count']} 条 · 记忆 {daily_data['mem_count']} 条{extra}*",
+        "",
+        "## 当日全貌",
+        result.get("daily_summary", ""),
+        "",
+    ]
+
+    key_events = result.get("key_events", [])
+    if key_events:
+        lines.append("## 重要事项")
+        for e in key_events:
+            lines.append(f"- {e}")
+        lines.append("")
+
+    completed = result.get("completed", [])
+    if completed:
+        lines.append("## 已完成")
+        for c in completed:
+            lines.append(f"- {c}")
+        lines.append("")
+
+    missed = result.get("missed", [])
+    if missed:
+        lines.append("## 遗漏/未完成")
+        for m in missed:
+            lines.append(f"- {m}")
+        lines.append("")
+
+    insights = result.get("insights", [])
+    if insights:
+        lines.append("## 核心洞察")
+        for ins in insights:
+            lines.append(f"- {ins}")
+        lines.append("")
+
+    emotions = result.get("emotions", "")
+    if emotions:
+        lines.append("## 当日状态")
+        lines.append(f"_{emotions}_")
+        lines.append("")
+
+    suggestions = result.get("next_day_suggestions", [])
+    if suggestions:
+        lines.append("## 明日建议")
+        for s in suggestions:
+            lines.append(f"- {s}")
+        lines.append("")
+
+    tags = result.get("tags", [])
+    if tags:
+        lines.append("## 标签")
+        lines.append(" ".join(f"`#{t}`" for t in tags))
+
+    return "\n".join(lines) + "\n"
+
+
+def _to_md_weekly(result: dict, weekly_data: dict) -> str:
+    """每周蒸馏 → md 格式"""
+    ws = weekly_data.get("week_start", "")
+    we = weekly_data.get("week_end", "")
+    lines = [
+        f"# 周总结 — {ws} ~ {we}",
+        "",
+        f"> {result.get('headline', '')}",
+        "",
+        f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        "",
+        "## 本周全貌",
+        result.get("weekly_summary", ""),
+        "",
+    ]
+    for key, title in [("major_events", "## 重要事项"),
+                        ("achievements", "## 本周成就"),
+                        ("lessons", "## 经验教训"),
+                        ("next_week_plan", "## 下周规划")]:
+        items = result.get(key, [])
+        if items:
+            lines.append(title)
+            for it in items:
+                lines.append(f"- {it}")
+            lines.append("")
+
+    for key, title in [("patterns", "## 规律模式"),
+                        ("trends", "## 趋势变化"),
+                        ("goal_progress", "## 目标进展")]:
+        items = result.get(key, [])
+        if items:
+            lines.append(title)
+            for it in items:
+                lines.append(f"- {it}")
+            lines.append("")
+
+    tags = result.get("tags", [])
+    if tags:
+        lines.append("## 标签")
+        lines.append(" ".join(f"`#{t}`" for t in tags))
+
+    return "\n".join(lines) + "\n"
 
 
 def _to_txt_weekly(result: dict, weekly_data: dict) -> str:

@@ -455,10 +455,10 @@ def conv_list_by_date(date_from: str = "", date_to: str = "") -> list:
     """
     ps = []
     if date_from:
-        q += " AND c.updated_at >= ?"
+        q += " AND date(c.updated_at) >= date(?)"
         ps.append(date_from)
     if date_to:
-        q += " AND c.updated_at <= ?"
+        q += " AND date(c.updated_at) <= date(?)"
         ps.append(date_to)
     q += " GROUP BY c.id ORDER BY c.updated_at DESC"
     with db() as c:
@@ -538,10 +538,10 @@ def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
     q = "SELECT * FROM memories WHERE 1=1"
     ps = []
     if date_from:
-        q += " AND created_at >= ?"
+        q += " AND date(created_at) >= date(?)"
         ps.append(date_from)
     if date_to:
-        q += " AND created_at <= ?"
+        q += " AND date(created_at) <= date(?)"
         ps.append(date_to)
     q += " ORDER BY importance DESC, created_at DESC"
     with db() as c:
@@ -732,10 +732,10 @@ def note_list_by_date(date_from: str = "", date_to: str = "") -> list:
     q = "SELECT * FROM notes WHERE status != 'cancelled'"
     ps = []
     if date_from:
-        q += " AND created_at >= ?"
+        q += " AND date(created_at) >= date(?)"
         ps.append(date_from)
     if date_to:
-        q += " AND created_at <= ?"
+        q += " AND date(created_at) <= date(?)"
         ps.append(date_to)
     q += " ORDER BY updated_at DESC"
     with db() as c:
@@ -983,6 +983,22 @@ def analysis_list() -> list:
             "length(analysis_text) as analysis_len, "
             "schedule_ids FROM analysis_documents ORDER BY created_at DESC"
         ).fetchall()
+    return [dict(r) for r in rs]
+
+
+def analysis_list_by_date(date_from: str = "", date_to: str = "") -> list:
+    """按日期范围筛选内容分析文档"""
+    with db() as c:
+        q = "SELECT id, filename, analysis_text, created_at FROM analysis_documents WHERE 1=1"
+        ps = []
+        if date_from:
+            q += " AND date(created_at) >= date(?)"
+            ps.append(date_from)
+        if date_to:
+            q += " AND date(created_at) <= date(?)"
+            ps.append(date_to)
+        q += " ORDER BY created_at DESC"
+        rs = c.execute(q, ps).fetchall()
     return [dict(r) for r in rs]
 
 

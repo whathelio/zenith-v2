@@ -137,6 +137,11 @@ def is_code_execution_enabled() -> bool:
     return bool(load_config().get("code_execution_enabled", False))
 
 
+def is_auto_distill_enabled() -> bool:
+    """自动蒸馏是否启用。控制 daily/weekly 定时蒸馏循环（每对话自动蒸馏独立受 _auto_distill_conv 控制）。"""
+    return bool(load_config().get("auto_distill_enabled", True))
+
+
 _DOCKER_AVAILABLE_CACHE = None
 
 

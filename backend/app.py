@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
 from .database import conv_update_summary
-from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled
+from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
 from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
 from .llm_client import chat_stream, plan_time, call_llm
 from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate
@@ -59,10 +59,12 @@ async def lifespan(app: FastAPI):
     # 启动记忆整理定时任务（每6小时执行一次）
     asyncio.create_task(_memory_maintenance_loop())
 
-    # 启动每日蒸馏定时任务（每天23:00）
-    asyncio.create_task(_daily_distill_loop())
-    # 启动每周蒸馏定时任务（每周日23:00）
-    asyncio.create_task(_weekly_distill_loop())
+    # 启动每日/每周蒸馏定时任务（受 auto_distill_enabled 控制）
+    if is_auto_distill_enabled():
+        asyncio.create_task(_daily_distill_loop())
+        asyncio.create_task(_weekly_distill_loop())
+    else:
+        logger.info("auto_distill_enabled=false, 跳过每日/每周蒸馏定时任务")
     # 启动日程提醒后台扫描任务（每5分钟检查 remind_before 到期）
     asyncio.create_task(_reminder_loop())
 
@@ -607,9 +609,9 @@ async def api_distill_all(
 
 
 @app.post("/api/distill/daily/{date}")
-async def api_distill_daily(date: str, save_txt: bool = True):
+async def api_distill_daily(date: str, save_txt: bool = True, save_md: bool = True):
     """每日蒸馏 — 聚合指定日期的对话/日程/笔记/记忆 → 生成每日总结"""
-    result = await distill_daily(date=date, save_txt=save_txt)
+    result = await distill_daily(date=date, save_txt=save_txt, save_md=save_md)
     if not result.get("success", True) and "error" in result:
         raise HTTPException(400, result["error"])
     return result
