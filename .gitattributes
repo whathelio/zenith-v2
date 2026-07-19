@@ -1,0 +1,13 @@
+# Ensure shell scripts keep LF line endings (critical for Linux/macOS)
+*.sh text eol=lf
+*.bat text eol=crlf
+
+# Python files use native line endings
+*.py text
+
+# Binary files
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
