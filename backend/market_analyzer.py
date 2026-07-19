@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -647,7 +648,12 @@ class MarketAnalyzer:
             return
         try:
             from pathlib import Path
-            archive_base = Path("O:/计划书A1/为什么没有成果/Zenith/market") / today
+            # 外部归档路径（可通过环境变量覆盖，默认使用项目 data 目录）
+            archive_root = os.environ.get(
+                "ZENITH_MARKET_ARCHIVE",
+                str(Path(__file__).parent.parent / "data" / "market_reports"),
+            )
+            archive_base = Path(archive_root) / today
             archive_base.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = archive_base / f"market_report_{timestamp}.md"

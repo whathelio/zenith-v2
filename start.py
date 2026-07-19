@@ -9,7 +9,7 @@ import logging
 import webbrowser
 import threading
 import socket
-import ctypes
+import tempfile
 from pathlib import Path
 
 # 配置日志 — 同时输出到文件（pythonw 无控制台时仍可排查）
@@ -31,25 +31,48 @@ logger = logging.getLogger("zenith.start")
 sys.path.insert(0, str(PROJECT_DIR))
 
 # 单实例锁 + 浏览器打开时间戳
-_INSTANCE_MUTEX_NAME = "ZenithV2SingleInstanceMutex"
+_INSTANCE_LOCK_FILE = Path(tempfile.gettempdir()) / "zenith_v2.lock"
 _BROWSER_TS_FILE = PROJECT_DIR / ".zenith.browser"
 _BROWSER_COOLDOWN_SECONDS = 5
 
 
 def _acquire_instance_mutex():
-    """创建 Windows 命名互斥量。返回 (mutex_handle, is_first_instance)。"""
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.GetLastError.restype = ctypes.c_uint32
+    """跨平台单实例锁。返回 (lock_handle, is_first_instance)。
 
-    mutex = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
-    last_error = kernel32.GetLastError()
+    - Windows: 使用命名互斥量 (kernel32.CreateMutexW)
+    - Unix (Linux/macOS): 使用 fcntl.flock 文件锁
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.GetLastError.restype = ctypes.c_uint32
 
-    # ERROR_ALREADY_EXISTS = 183
-    if mutex and last_error == 183:
-        return mutex, False
-    return mutex, True
+            mutex = kernel32.CreateMutexW(None, False, "ZenithV2SingleInstanceMutex")
+            last_error = kernel32.GetLastError()
+            # ERROR_ALREADY_EXISTS = 183
+            if mutex and last_error == 183:
+                return mutex, False
+            return mutex, True
+        except (AttributeError, OSError):
+            # 非 Windows 或 ctypes 不可用，降级到文件锁
+            pass
+
+    # Unix 文件锁
+    try:
+        import fcntl
+        fd = os.open(str(_INSTANCE_LOCK_FILE), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd, True  # 获取锁成功 → 是首实例
+        except (IOError, OSError):
+            os.close(fd)
+            return None, False  # 锁已被占用 → 已有实例在运行
+    except (ImportError, OSError):
+        # fcntl 不可用或文件系统不支持，跳过单实例检查
+        return None, True
 
 
 def _browser_recently_opened() -> bool:
