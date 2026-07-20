@@ -98,6 +98,25 @@ export default function AppLayout() {
   // 提议同步（来自 ChatView 的 CustomEvent）
   const [proposals, setProposals] = useState<any[]>([])
 
+  // 全局提醒轮询（每 60s 检查到期日程）
+  const [reminders, setReminders] = useState<{ due: any[]; overdue: any[] }>({ due: [], overdue: [] })
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval>
+    const fetchReminders = async () => {
+      try {
+        const r = await fetch('/api/reminders')
+        if (r.ok) {
+          const j = await r.json()
+          setReminders({ due: j.due || [], overdue: j.overdue || [] })
+        }
+      } catch { /* silent */ }
+    }
+    fetchReminders()
+    timer = setInterval(fetchReminders, 60_000)
+    return () => clearInterval(timer)
+  }, [])
+
   // 周计算：以 selectedDate 为基准，显示其所在周（周一到周日）
   const refDate = selectedDate
   const monday = new Date(refDate.getTime() - ((refDate.getDay() || 7) - 1) * 86400000)
@@ -557,6 +576,24 @@ export default function AppLayout() {
 
           {/* ====== 右侧面板：Outlet ====== */}
           <div className="app-layout-right">
+            {(reminders.due.length > 0 || reminders.overdue.length > 0) && (
+              <div style={{
+                padding: '8px 12px', marginBottom: 4,
+                background: 'rgba(255, 85, 85, 0.08)', borderRadius: 6,
+                border: '1px solid rgba(255, 85, 85, 0.2)', fontSize: 13,
+              }}>
+                {reminders.overdue.map((s, i) => (
+                  <div key={`od-${i}`} style={{ color: '#ff5555' }}>
+                    🔴 已逾期: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
+                  </div>
+                ))}
+                {reminders.due.map((s, i) => (
+                  <div key={`due-${i}`} style={{ color: '#f1fa8c' }}>
+                    ⏰ 即将开始: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
+                  </div>
+                ))}
+              </div>
+            )}
             <Outlet />
           </div>
         </div>

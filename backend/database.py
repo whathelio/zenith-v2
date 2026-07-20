@@ -643,10 +643,10 @@ def sch_list(status: str = "", date_from: str = "", date_to: str = "") -> list:
         q += " AND status = ?"
         ps.append(status)
     if date_from:
-        q += " AND start_time >= ?"
+        q += " AND date(start_time) >= date(?)"
         ps.append(date_from)
     if date_to:
-        q += " AND start_time <= ?"
+        q += " AND date(start_time) <= date(?)"
         ps.append(date_to)
     q += " ORDER BY start_time ASC"
     with db() as c:
@@ -664,19 +664,23 @@ _SCHEDULE_COLUMNS = {"title", "description", "start_time", "end_time", "location
 
 
 def sch_update(sid: int, data: dict):
+    """更新日程。值为 None 的字段会被显式清空（设为 NULL）。"""
     fs = []
     ps = []
     for k, v in data.items():
         if k not in _SCHEDULE_COLUMNS:
             continue
-        if v is not None:
-            fs.append(f"{k} = ?")
-            ps.append(v)
+        # None 也写入（用于清空 goal_id 等字段），不再跳过
+        fs.append(f"{k} = ?")
+        ps.append(v)
     if not fs:
         return
     ps.append(sid)
     with db() as c:
         c.execute(f"UPDATE schedules SET {', '.join(fs)} WHERE id = ?", ps)
+        # P1-2: status 变为 confirmed 时自动更新 confirmed_at
+        if data.get("status") == "confirmed":
+            c.execute("UPDATE schedules SET confirmed_at = ? WHERE id = ?", (_now(), sid))
 
 
 def sch_del(sid: int):

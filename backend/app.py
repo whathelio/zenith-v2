@@ -72,18 +72,14 @@ async def lifespan(app: FastAPI):
 
 
 async def _reminder_loop():
-    """后台每5分钟扫描 remind_before 到期提醒，并记录已提醒状态"""
+    """后台每5分钟扫描 remind_before 到期提醒，记录到 schedule_reminders 表"""
     logger = logging.getLogger("zenith.schedule")
     while True:
         try:
-            result = get_due_reminders()
-            due = result.get("due", [])
-            overdue = result.get("overdue", [])
-            if due or overdue:
-                logger.info(
-                    "日程提醒扫描: %d 个即将到期, %d 个已逾期",
-                    len(due), len(overdue)
-                )
+            # check_reminders 会调 get_due_reminders + _record_reminder 写表
+            text = check_reminders()
+            if text:
+                logger.info("日程提醒扫描发现到期项:\n%s", text)
         except Exception as e:
             logger.warning("日程提醒扫描失败: %s", e)
         await asyncio.sleep(5 * 60)
@@ -1042,6 +1038,23 @@ async def create_schedule(request: Request):
     if not data.get("title"):
         raise HTTPException(400, "title 为必填字段")
     data["source"] = data.get("source", "manual")
+
+    # P1-5: 冲突检测（与已确认日程重叠时返回 409 + 建议时间）
+    start_time = data.get("start_time", "")
+    if start_time:
+        from .tools import _find_time_conflict, _suggest_alternative_time
+        conflict = _find_time_conflict(start_time, data.get("end_time"))
+        if conflict:
+            suggestions = _suggest_alternative_time(start_time, data.get("end_time"))
+            raise HTTPException(
+                409,
+                detail={
+                    "error": "时间冲突",
+                    "conflict_with": {"id": conflict.get("id"), "title": conflict.get("title"), "start_time": conflict.get("start_time")},
+                    "suggestions": suggestions[:3],
+                },
+            )
+
     sid = db.sch_add(data)
     return {"id": sid, **data}
 
@@ -1566,9 +1579,14 @@ async def transform_item(data: dict = Body(default=None)):
         all_mems = db.mem_list()
         created_item = next((m for m in all_mems if m["id"] == created_id), None)
 
-    # 4. 标记源条目为已转化
+    # 4. 标记源条目为已转化（用 cancelled 软删除，避免 CHECK 约束冲突）
     if source_type == "schedule":
-        db.sch_update(source_id, {"status": "converted"})
+        orig = db.sch_get(source_id)
+        orig_desc = (orig or {}).get("description", "") if orig else ""
+        db.sch_update(source_id, {
+            "status": "cancelled",
+            "description": f"[已转化→{target_type}] {orig_desc}".strip(),
+        })
 
     return {
         "success": True,

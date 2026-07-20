@@ -5,7 +5,6 @@ export const STATUS_NAMES: Record<string, string> = {
   confirmed: '已确认',
   done: '已完成',
   cancelled: '已取消',
-  converted: '已转化',
 }
 
 export const STATUS_ICONS: Record<string, string> = {
@@ -13,7 +12,6 @@ export const STATUS_ICONS: Record<string, string> = {
   confirmed: '✓',
   done: '✅',
   cancelled: '✗',
-  converted: '⇄',
 }
 
 export const STATUS_COLORS: Record<string, string> = {
@@ -21,7 +19,6 @@ export const STATUS_COLORS: Record<string, string> = {
   confirmed: '#50fa7b',
   done: '#8be9fd',
   cancelled: '#717e95',
-  converted: '#bd93f9',
 }
 
 export const STATUS_BG_COLORS: Record<string, string> = {
@@ -29,7 +26,6 @@ export const STATUS_BG_COLORS: Record<string, string> = {
   confirmed: 'rgba(80,250,123,0.06)',
   done: 'rgba(139,233,253,0.05)',
   cancelled: 'rgba(113,126,149,0.04)',
-  converted: 'rgba(189,147,247,0.05)',
 }
 
 export const PRIORITY_NAMES: Record<string, string> = {
@@ -66,7 +62,7 @@ export const IMPACT_COLORS: Record<string, string> = {
 
 /** 判断日程是否逾期（未完成且开始时间已过） */
 export function isScheduleOverdue(s: { start_time?: string; status?: string }): boolean {
-  if (!s.start_time || s.status === 'done' || s.status === 'cancelled' || s.status === 'converted') {
+  if (!s.start_time || s.status === 'done' || s.status === 'cancelled') {
     return false
   }
   const start = new Date(s.start_time)
@@ -88,10 +84,10 @@ export function sortSchedules<T extends { priority?: string; start_time?: string
   })
 }
 
-/** 过滤掉已完成/已取消/已转化/已逾期的日程（用于左侧今日速览） */
+/** 过滤掉已完成/已取消/已逾期的日程（用于左侧今日速览） */
 export function filterActiveSchedules<T extends { start_time?: string; status?: string }>(list: T[]): T[] {
   return list.filter(s => {
-    if (s.status === 'done' || s.status === 'cancelled' || s.status === 'converted') return false
+    if (s.status === 'done' || s.status === 'cancelled') return false
     if (isScheduleOverdue(s)) return false
     return true
   })

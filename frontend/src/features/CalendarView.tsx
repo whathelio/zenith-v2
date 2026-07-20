@@ -159,7 +159,7 @@ export default function CalendarView() {
       const list = await api.listSchedules(listFilter)
       const now = new Date().toISOString()
       const filtered = listFilter ? list : list.filter((s: Schedule) => {
-        if (s.status === 'done' || s.status === 'converted' || s.status === 'cancelled') return false
+        if (s.status === 'done' || s.status === 'cancelled') return false
         if (s.end_time && s.end_time < now && (s.status === 'proposed' || s.status === 'confirmed')) return false
         return true
       })
@@ -273,7 +273,7 @@ export default function CalendarView() {
   const handleListStatusChange = async (id: number, status: string) => {
     try {
       await api.updateSchedule(id, { status })
-      if (status === 'done' || status === 'cancelled' || status === 'converted') {
+      if (status === 'done' || status === 'cancelled') {
         setAllSchedules(prev => prev.filter(s => s.id !== id))
       } else {
         setAllSchedules(prev => prev.map(s => s.id === id ? { ...s, status } : s))
@@ -346,7 +346,7 @@ export default function CalendarView() {
     const ids = Array.from(selectedIds)
     try {
       await Promise.all(ids.map(id => api.updateSchedule(id, { status })))
-      if (status === 'done' || status === 'cancelled' || status === 'converted') {
+      if (status === 'done' || status === 'cancelled') {
         setAllSchedules(prev => prev.filter(s => !selectedIds.has(s.id)))
       } else {
         setAllSchedules(prev => prev.map(s => selectedIds.has(s.id) ? { ...s, status } : s))

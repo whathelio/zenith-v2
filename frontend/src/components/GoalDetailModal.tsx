@@ -45,10 +45,13 @@ export default function GoalDetailModal({
   const [localActiveDays, setLocalActiveDays] = useState<string[]>(goal.active_days || [])
   const [currentValueInput, setCurrentValueInput] = useState(String(goal.current_value))
   const [saving, setSaving] = useState(false)
+  const [linkedSchedules, setLinkedSchedules] = useState<any[]>([])
 
   useEffect(() => {
     setLocalActiveDays(goal.active_days || [])
     setCurrentValueInput(String(goal.current_value))
+    // P2-2: 加载关联日程
+    api.listGoalSchedules(goal.id).then(r => setLinkedSchedules(r)).catch(() => setLinkedSchedules([]))
   }, [goal.id])
 
   const progress = useMemo(() => {
@@ -424,6 +427,37 @@ export default function GoalDetailModal({
             <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>已激活日期（点击切换）</span>
           </div>
         </div>
+
+        {/* P2-2: 关联日程列表 */}
+        {linkedSchedules.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--color-text-secondary)' }}>
+              📅 关联日程 ({linkedSchedules.length})
+            </div>
+            <div style={{ maxHeight: 120, overflowY: 'auto', fontSize: 12 }}>
+              {linkedSchedules.slice(0, 10).map((s: any) => (
+                <div key={s.id} style={{
+                  display: 'flex', justifyContent: 'space-between',
+                  padding: '4px 8px', borderRadius: 4,
+                  background: s.status === 'done' ? 'rgba(139,233,253,0.05)' : 'rgba(255,255,255,0.02)',
+                  marginBottom: 2,
+                }}>
+                  <span style={{ textDecoration: s.status === 'done' ? 'line-through' : 'none', color: 'var(--color-text-primary)' }}>
+                    {s.status === 'done' ? '✅' : s.status === 'confirmed' ? '✓' : '⏳'} {s.title}
+                  </span>
+                  <span style={{ color: 'var(--color-text-muted)', fontFamily: 'var(--font-mono)' }}>
+                    {s.start_time?.slice(5, 16) || ''}
+                  </span>
+                </div>
+              ))}
+              {linkedSchedules.length > 10 && (
+                <div style={{ textAlign: 'center', fontSize: 11, color: 'var(--color-text-muted)', padding: 4 }}>
+                  ...还有 {linkedSchedules.length - 10} 条
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* 操作栏 */}
         <div className="modal-actions">

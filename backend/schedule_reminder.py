@@ -69,8 +69,12 @@ def _record_reminder(sid: int):
         )
 
 
-def get_due_reminders() -> list[dict]:
-    """获取所有到期的提醒（包括 remind_before 到期和已逾期）"""
+def get_due_reminders() -> dict:
+    """获取所有到期的提醒（包括 remind_before 到期和已逾期）
+
+    Returns:
+        {"due": [...], "overdue": [...]}
+    """
     items = sch_list(status="confirmed")
     now = now_tz()
     due = []

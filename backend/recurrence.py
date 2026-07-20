@@ -130,13 +130,6 @@ def _days_in_month(year: int, month: int) -> int:
     return 30
 
 
-def build_recurrence_rule(rtype: str, count: Optional[int] = None, until: Optional[str] = None) -> str:
-    """根据参数构建规则字符串"""
-    if rtype not in SUPPORTED_RULES:
-        return ""
-    parts = [rtype]
-    if count:
-        parts.append(f"count={count}")
-    if until:
-        parts.append(f"until={until}")
-    return ",".join(parts)
+# build_recurrence_rule 已移除：前端直接发送原始规则字符串（如 "daily,count=5"），
+# 不需要此辅助函数。如需重新启用，从 git 历史恢复。
+
