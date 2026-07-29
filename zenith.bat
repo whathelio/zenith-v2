@@ -37,6 +37,9 @@ set ZENITH_API_KEY=zenith-internal-v2
 set KNOWLEDGE_API_KEY=zenith-internal-v2
 set ZENITH_RAG_EMBED_MODEL=%ZENITH_ROOT%\bge-small-model
 
+REM ── 杀掉占用 8766 端口的旧进程（无需手动打开任务管理器） ──
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr "LISTENING" ^| findstr ":8766"') do taskkill /PID %%a /F 2>nul
+
 REM ── 清除可能残留的锁文件 ──
 if exist "%TEMP%\zenith_v2.lock" del /q "%TEMP%\zenith_v2.lock" 2>nul
 
