@@ -2,15 +2,17 @@ import { useRef, useEffect } from 'react'
 import type { Message } from '../shared/api'
 import { api } from '../shared/api'
 import ConfirmCard, { extractConfirmCard, stripConfirmCard, type ConfirmOption } from './ConfirmCard'
+import ToolCallBubble, { type ToolCallEntry } from './ToolCallBubble'
 
 interface ChatMessagesProps {
   messages: Message[]
   streamingText: string
   isLoading: boolean
   onSend?: (text: string) => void
+  toolCallBubbles?: ToolCallEntry[]
 }
 
-export default function ChatMessages({ messages, streamingText, isLoading, onSend }: ChatMessagesProps) {
+export default function ChatMessages({ messages, streamingText, isLoading, onSend, toolCallBubbles }: ChatMessagesProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -81,6 +83,16 @@ export default function ChatMessages({ messages, streamingText, isLoading, onSen
               className="message-bubble"
               dangerouslySetInnerHTML={{ __html: formatContent(streamingText) }}
             />
+          </div>
+        </div>
+      )}
+      {toolCallBubbles && toolCallBubbles.length > 0 && (
+        <div className="message message-ai">
+          <div className="message-avatar" style={{ visibility: 'hidden' }}>Z</div>
+          <div>
+            {toolCallBubbles.map(entry => (
+              <ToolCallBubble key={entry.id} entry={entry} />
+            ))}
           </div>
         </div>
       )}

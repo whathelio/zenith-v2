@@ -4,6 +4,7 @@ import ChatConvPanel from '../components/ChatConvPanel'
 import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
 import ProposalsBar from '../components/ProposalsBar'
+import ToolCallBubble, { type ToolCallEntry } from '../components/ToolCallBubble'
 import { api, type Message, type Proposal, type ConversationSummary } from '../shared/api'
 import { takePendingMessage } from '../shared/pendingMessage'
 
@@ -25,6 +26,7 @@ export default function ChatView() {
   const [summarizing, setSummarizing] = useState(false)
   const [summaryResult, setSummaryResult] = useState<ConversationSummary | null>(null)
   const [convCollapsed, setConvCollapsed] = useState(false)
+  const [toolCallBubbles, setToolCallBubbles] = useState<ToolCallEntry[]>([])
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -127,6 +129,7 @@ export default function ChatView() {
     setError('')
     setReminder('')
     setProposals([])
+    setToolCallBubbles([])
     setStreamingText('')
 
     const userMsg: Message = {
@@ -201,6 +204,24 @@ export default function ChatView() {
             } else if (data.type === 'tool_results') {
               // 工具结果 — 刷新提议列表
               loadProposals()
+            } else if (data.type === 'tool_call_start') {
+              setToolCallBubbles(prev => [...prev, {
+                id: data.id,
+                name: data.name,
+                args: data.args || {},
+                status: 'pending',
+                round: data.round,
+              }])
+            } else if (data.type === 'tool_call_end') {
+              setToolCallBubbles(prev => prev.map(b =>
+                b.id === data.id ? {
+                  ...b,
+                  status: 'done',
+                  resultSummary: data.result_summary,
+                  durationMs: data.duration_ms,
+                  success: data.success,
+                } : b
+              ))
             } else if (data.type === 'done') {
               // done
             }
@@ -382,6 +403,7 @@ export default function ChatView() {
             streamingText={streamingText}
             isLoading={isLoading}
             onSend={handleSend}
+            toolCallBubbles={toolCallBubbles}
           />
           {error && (
             <div style={{ padding: '8px 24px', color: 'var(--color-accent-danger)', fontSize: 'var(--font-size-sm)' }}>

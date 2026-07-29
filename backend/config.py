@@ -92,12 +92,37 @@ DEFAULT_CONFIG = {
     "context_compress_threshold": 20,
     "memory_extract_interval": 5,
     "auto_distill_enabled": True,
+
+    # Phase 2.1: 防幻觉 — 审计员 Skill
+    "auditor_skill": {
+        "enabled": True,
+    },
+
+    # Phase 2.2-2.4: 验证器配置
+    "validators": {
+        "input": {"enabled": True, "block_high_risk": True},
+        "output": {"enabled": True, "confidence_check": True, "memory_contradiction_check": True},
+    },
+
     # 市场分析配置（已封存）
     "market_analysis_enabled": False,
     "market_analysis_time": "07:00",
     "gold_focus_contract": "GOLD - COMMODITY",
     "cftc_zscore_window": 156,
     "cftc_cache_days": 1200,
+
+    # Phase 1: 执行追踪
+    "trace": {
+        "enabled": True,
+        "show_tool_bubbles": True,
+    },
+
+    # Phase 3.5: 审计日志
+    "audit": {
+        "enabled": True,
+        "log_path": "data/audit/",
+        "retention_days": 90,
+    },
 }
 
 

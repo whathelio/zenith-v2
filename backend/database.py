@@ -452,6 +452,18 @@ CREATE TABLE IF NOT EXISTS market_predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_pred_date ON market_predictions(report_date);
 CREATE INDEX IF NOT EXISTS idx_pred_verified ON market_predictions(verified);
+
+-- 执行追踪表（Phase 1: 记录 LLM 调用 & 工具调用）
+CREATE TABLE IF NOT EXISTS conversation_traces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conv_id TEXT NOT NULL,
+    message_id INTEGER,
+    trace_type TEXT NOT NULL,   -- 'llm_call' | 'tool_call' | 'error' | 'validation'
+    round_num INTEGER DEFAULT 0,
+    data TEXT NOT NULL,         -- JSON blob: {name, args, result_summary, duration_ms, tokens, ...}
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_traces_conv ON conversation_traces(conv_id, created_at);
 """)
 
 
@@ -561,6 +573,58 @@ def msg_count(cid: str) -> int:
             "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ? AND role != 'system'", (cid,)
         ).fetchone()
     return r["cnt"] if r else 0
+
+
+# ---------------------------------------------------------------------------
+# Conversation Traces (执行追踪)
+# ---------------------------------------------------------------------------
+
+def trace_add(conv_id: str, trace_type: str, data: dict,
+              message_id: int = None, round_num: int = 0) -> int:
+    with db() as c:
+        c.execute(
+            "INSERT INTO conversation_traces (conv_id, message_id, trace_type, round_num, data, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (conv_id, message_id, trace_type, round_num, json.dumps(data, ensure_ascii=False), _now()),
+        )
+        return c.lastrowid
+
+
+def trace_list(conv_id: str = "", trace_type: str = "", limit: int = 100) -> list:
+    q = "SELECT * FROM conversation_traces WHERE 1=1"
+    ps = []
+    if conv_id:
+        q += " AND conv_id = ?"
+        ps.append(conv_id)
+    if trace_type:
+        q += " AND trace_type = ?"
+        ps.append(trace_type)
+    q += " ORDER BY id DESC LIMIT ?"
+    ps.append(limit)
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    return [dict(r) for r in rs]
+
+
+def trace_stats(conv_id: str = "") -> dict:
+    """统计概览：总调用次数、类型分布、平均耗时、错误数"""
+    q = "SELECT trace_type, COUNT(*) as cnt FROM conversation_traces"
+    ps = []
+    if conv_id:
+        q += " WHERE conv_id = ?"
+        ps.append(conv_id)
+    q += " GROUP BY trace_type"
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    type_counts = {r["trace_type"]: r["cnt"] for r in rs}
+    total = sum(type_counts.values())
+    errors = type_counts.get("error", 0)
+    return {
+        "total": total,
+        "by_type": type_counts,
+        "error_count": errors,
+        "error_rate": round(errors / total, 3) if total > 0 else 0,
+    }
 
 
 # ---------------------------------------------------------------------------

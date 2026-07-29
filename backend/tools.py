@@ -577,6 +577,7 @@ async def execute_tool(name: str, args: dict) -> dict:
     """
     执行工具并返回统一格式 {success, result, ...}。
     通过注册表字典分发，替代长 if/elif 链。
+    执行后自动附加 _verification 字段用于前端警告显示。
     """
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
@@ -586,11 +587,52 @@ async def execute_tool(name: str, args: dict) -> dict:
         if asyncio.iscoroutine(result):
             result = await result
         # 统一格式
-        if isinstance(result, dict) and "success" in result:
-            return result
-        return {"success": True, "result": result}
+        if not (isinstance(result, dict) and "success" in result):
+            result = {"success": True, "result": result}
+        # 附加执行验证
+        verification = _verify_tool_result(name, args, result)
+        if verification:
+            result["_verification"] = verification
+        return result
     except Exception as e:
         return {"success": False, "result": str(e)}
+
+
+def _verify_tool_result(name: str, args: dict, result: dict) -> dict | None:
+    """执行验证 — 检测工具返回结果的合理性，返回 warning 信息或 None"""
+    try:
+        if name == "execute_code":
+            output = result.get("result", "")
+            if isinstance(output, dict):
+                output = output.get("output", "")
+            if not output or not str(output).strip():
+                return {"level": "warning", "message": "代码执行未产生输出"}
+
+        elif name == "web_search":
+            data = result.get("result", {})
+            if isinstance(data, dict) and not data.get("results"):
+                return {"level": "warning", "message": "搜索未返回结果，信息可能不完整"}
+
+        elif name in ("add_schedule", "add_note"):
+            start_time = args.get("start_time", "")
+            if start_time:
+                from datetime import datetime, timezone, timedelta
+                now = datetime.now(timezone(timedelta(hours=8)))
+                try:
+                    dt = datetime.fromisoformat(start_time)
+                    if dt < now:
+                        return {"level": "warning", "message": f"日程时间已过: {start_time}"}
+                except ValueError:
+                    pass
+
+        elif name in ("mem_add", "add_memory"):
+            content = args.get("content", "")
+            from .memory_engine import _is_duplicate
+            if content and _is_duplicate(content, threshold=0.8):
+                return {"level": "info", "message": "相似记忆已存在，跳过重复添加"}
+    except Exception:
+        pass
+    return None
 
 
 async def _handle_add_schedule(args: dict) -> dict:
@@ -1216,6 +1258,20 @@ def _extract_json(text: str) -> dict:
     if m:
         try:
             return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+
+    # L5: 截断 JSON 自动补全（LLM 输出被截断时常见）
+    cleaned = text.strip()
+    open_braces = cleaned.count('{')
+    close_braces = cleaned.count('}')
+    if open_braces > close_braces:
+        # 补全缺失的右括号
+        cleaned += '}' * (open_braces - close_braces)
+        # 移除因截断产生的尾随不完整字段
+        cleaned = _re.sub(r',\s*"[^"]*"\s*:\s*[^{\[]*$', '', cleaned)
+        try:
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 

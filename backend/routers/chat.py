@@ -1,6 +1,7 @@
-"""Chat API — SSE 流式对话 + 6 轮工具循环"""
+"""Chat API — SSE 流式对话 + 6 轮工具循环 + 执行追踪"""
 import json
 import asyncio
+import time
 import logging
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -16,6 +17,7 @@ from ..memory_engine import (
 from ..context_compressor import maybe_compress
 from ..schedule_reminder import check_reminders
 from ..confirm_flow import get_pending_proposals
+from ..validators.auditor_skill import AUDITOR_SKILL_PROMPT
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -105,9 +107,65 @@ async def _process_conv(
             messages.append(assistant_msg)
 
             for i, tc in enumerate(round_tool_calls):
-                result = await execute_tool(tc["name"], tc["args"])
-                tool_results.append(result)
                 tool_id = tc.get("id") or f"call_{round_num}_{i}"
+                tool_name = tc["name"]
+                tool_args = tc.get("args", {})
+
+                # Phase 1: 工具调用开始事件
+                trace_cfg = cfg.get("trace", {})
+                trace_enabled = trace_cfg.get("enabled", True) if isinstance(trace_cfg, dict) else True
+                show_bubbles = trace_cfg.get("show_tool_bubbles", True) if isinstance(trace_cfg, dict) else True
+
+                if show_bubbles:
+                    event_queue.put_nowait(json.dumps({
+                        'type': 'tool_call_start',
+                        'id': tool_id,
+                        'name': tool_name,
+                        'args': tool_args,
+                        'round': round_num,
+                    }, ensure_ascii=False))
+
+                t_start = time.time()
+                try:
+                    result = await execute_tool(tool_name, tool_args)
+                    success = not result.get("error")
+                except Exception as exc:
+                    result = {"error": str(exc), "result": f"工具执行异常: {exc}"}
+                    success = False
+
+                duration_ms = int((time.time() - t_start) * 1000)
+                tool_results.append(result)
+
+                # Phase 1: 工具调用结束事件
+                result_text = str(result.get("result", ""))
+                if show_bubbles:
+                    event_queue.put_nowait(json.dumps({
+                        'type': 'tool_call_end',
+                        'id': tool_id,
+                        'name': tool_name,
+                        'args': tool_args,
+                        'result_summary': result_text[:500],
+                        'round': round_num,
+                        'duration_ms': duration_ms,
+                        'success': success,
+                    }, ensure_ascii=False))
+
+                # Phase 1: 写入执行追踪
+                if trace_enabled:
+                    try:
+                        db.trace_add(
+                            conv_id, "tool_call",
+                            data={
+                                "name": tool_name,
+                                "args": tool_args,
+                                "result_summary": result_text[:500],
+                                "success": success,
+                                "duration_ms": duration_ms,
+                            },
+                            round_num=round_num,
+                        )
+                    except Exception:
+                        pass
 
                 if result.get("confirm"):
                     proposal_data = dict(result)
@@ -117,9 +175,11 @@ async def _process_conv(
                         proposal_data["id"] = proposal_data["confirm_id"]
                     event_queue.put_nowait(json.dumps({'type': 'proposal', 'data': proposal_data}, ensure_ascii=False))
                 else:
-                    tool_info = f"\n\n[{tc['name']}]: {result.get('result', '')}"
-                    assistant_text += tool_info
-                    event_queue.put_nowait(json.dumps({'type': 'text', 'content': tool_info}, ensure_ascii=False))
+                    # 兼容模式：保留文本拼接（若前端不支持 tool_call_start/end 气泡）
+                    if not show_bubbles:
+                        tool_info = f"\n\n[{tool_name}]: {result_text}"
+                        assistant_text += tool_info
+                        event_queue.put_nowait(json.dumps({'type': 'text', 'content': tool_info}, ensure_ascii=False))
 
                 messages.append({
                     "role": "tool",
@@ -149,6 +209,14 @@ async def _process_conv(
 
     except Exception as e:
         logger.error("后台对话处理异常: %s", e, exc_info=True)
+        # Phase 1: 异常追踪
+        try:
+            db.trace_add(conv_id, "error", {
+                "error": str(e),
+                "stage": "process_conv",
+            })
+        except Exception:
+            pass
         event_queue.put_nowait(json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False))
     finally:
         event_queue.put_nowait(None)
@@ -185,6 +253,11 @@ async def chat(request: Request):
 
     cfg = load_config()
     system_parts = [cfg["system_prompt"]]
+
+    # 审计员 Skill — 从源头减少幻觉（可配置关闭）
+    if cfg.get("auditor_skill", {}).get("enabled", True):
+        system_parts.append(AUDITOR_SKILL_PROMPT)
+
     memory_injection = build_memory_injection(current_query=user_message)
     if memory_injection:
         system_parts.append(memory_injection)
