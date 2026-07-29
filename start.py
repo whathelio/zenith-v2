@@ -28,8 +28,9 @@ logger = logging.getLogger("zenith.start")
 
 sys.path.insert(0, str(PROJECT_DIR))
 
-# Single-instance file lock + browser timestamp
+# Single-instance file lock + PID tracking
 _INSTANCE_LOCK_FILE = Path(tempfile.gettempdir()) / "zenith_v2.lock"
+_PID_FILE = Path(tempfile.gettempdir()) / "zenith_v2.pid"
 _BROWSER_TS_FILE = PROJECT_DIR / ".zenith.browser"
 _BROWSER_COOLDOWN_SECONDS = 5
 
@@ -127,6 +128,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     _write_browser_ts()
+
+    # 写入 PID 文件，供 zenith.bat 一键停止使用
+    _PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
 
     if _is_port_in_use(port):
         logger.info(f"Port {port} already in use, opening browser: {url}")
