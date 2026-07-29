@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
 from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
@@ -294,120 +295,7 @@ async def health():
     return {"status": "ok", "version": "2.0.0"}
 
 
-# ── 知识库薄代理（转发到外部 api_gateway） ──────────────────────
-@app.get("/api/knowledge/health")
-async def knowledge_health():
-    try:
-        return await knowledge_service.health()
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": str(e), "code": "GATEWAY_DOWN"})
-
-
-@app.get("/api/knowledge/status")
-async def knowledge_status():
-    """轻量健康检查 — 给前端条件渲染用，3秒超时"""
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get("http://127.0.0.1:8788/health")
-            return {"available": resp.status_code == 200}
-    except Exception:
-        return {"available": False}
-
-
-@app.post("/api/knowledge/search")
-async def knowledge_search(data: dict = Body(default=None)):
-    q = (data or {}).get("question", "").strip()
-    if not q:
-        raise HTTPException(400, "question is required")
-    top_k = int((data or {}).get("top_k", 5))
-    return await knowledge_service.search(q, top_k)
-
-
-@app.post("/api/knowledge/wiki")
-async def knowledge_wiki(data: dict = Body(default=None)):
-    q = (data or {}).get("question", "").strip()
-    if not q:
-        raise HTTPException(400, "question is required")
-    return await knowledge_service.wiki_query(q)
-
-
-@app.post("/api/knowledge/tasks")
-async def knowledge_create_task(data: dict = Body(default=None)):
-    t = (data or {}).get("type")
-    payload = (data or {}).get("payload", {})
-    if t not in ("search", "wiki", "agent"):
-        raise HTTPException(400, "type must be search|wiki|agent")
-    return await knowledge_service.create_task(t, payload)
-
-
-@app.get("/api/knowledge/tasks/{task_id}")
-async def knowledge_get_task(task_id: str):
-    return await knowledge_service.get_task(task_id)
-
-
-@app.get("/api/knowledge/tasks")
-async def knowledge_list_tasks(status: str | None = None, limit: int = 20):
-    return await knowledge_service.list_tasks(status, limit)
-
-
-@app.post("/api/knowledge/ingest")
-async def knowledge_ingest(file: UploadFile = File(...)):
-    """上传 PDF → 审查 → 入库（转发到 api_gateway）"""
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "仅支持 PDF")
-    try:
-        content = await file.read()
-        result = await knowledge_service.ingest_pdf(file.filename, content)
-    except Exception as e:
-        logger.exception("knowledge ingest failed")
-        return JSONResponse(status_code=502, content={"error": str(e), "code": "INGEST_FAILED"})
-    if result.get("code") in ("GATEWAY_DOWN", "GATEWAY_TIMEOUT"):
-        return JSONResponse(status_code=502, content=result)
-    if result.get("error"):
-        return JSONResponse(status_code=502, content=result)
-    return result
-
-
-@app.post("/api/open-url")
-async def open_url(request: Request):
-    """通过系统默认浏览器打开 URL"""
-    body = await request.json()
-    url = body.get("url", "").strip()
-    if not url:
-        raise HTTPException(400, "URL is required")
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(400, "Only http/https URLs are allowed")
-    try:
-        webbrowser.open(url)
-        return {"success": True}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.get("/api/settings")
-async def get_settings():
-    """返回配置，API Key 做掩码处理（安全）"""
-    cfg = load_config()
-    key = cfg.get("api_key", "")
-    if key:
-        cfg["api_key"] = key[:6] + "•" * (len(key) - 10) + key[-4:] if len(key) > 10 else "•" * len(key)
-    # 首次运行标识：api_key 为空则未配置
-    cfg["is_first_run"] = not bool(cfg.get("api_key", "").strip())
-    return cfg
-
-
-@app.put("/api/settings")
-async def update_settings(data: dict = Body(default=None)):
-    """更新配置 — 合并到现有配置，不覆盖未提供的字段"""
-    existing = load_config()
-    # 如果前端传回的是掩码 key，保留原有 key
-    if "api_key" in data and "•" in data.get("api_key", ""):
-        data["api_key"] = existing.get("api_key", "")
-    merged = {**existing, **data}
-    save_config(merged)
-    return {"success": True}
+# Knowledge - migrated to routers/knowledge.py
 
 
 # ═══════════════════════════════════════════════════════
@@ -794,327 +682,9 @@ async def _handle_consolidate_chat(
     event_queue.put_nowait(None)
 
 
-async def _process_conv(
-    conv_id: str, user_message: str, messages: list, cfg: dict,
-    event_queue: asyncio.Queue,
-):
-    """后台任务：LLM 调用 + 工具执行 + 消息保存，不受客户端断连影响"""
-    logger = logging.getLogger("zenith.chat")
-    try:
-        reminder = check_reminders()
-        if reminder:
-            event_queue.put_nowait(json.dumps({'type': 'reminder', 'content': reminder}, ensure_ascii=False))
+# Chat API - migrated to routers/chat.py
 
-        assistant_text = ""
-        tool_results = []
-        MAX_TOOL_ROUNDS = 6
-
-        for round_num in range(MAX_TOOL_ROUNDS):
-            round_text = ""
-            round_tool_calls = []
-
-            async for chunk in chat_stream(messages, tools=TOOLS_SCHEMA):
-                if chunk["type"] == "text":
-                    round_text += chunk["content"]
-                    assistant_text += chunk["content"]
-                    event_queue.put_nowait(json.dumps({'type': 'text', 'content': chunk["content"]}, ensure_ascii=False))
-                elif chunk["type"] == "tool_call":
-                    round_tool_calls.append(chunk)
-
-            if not round_tool_calls:
-                break
-
-            assistant_msg = {
-                "role": "assistant",
-                "content": round_text if round_text else None,
-                "tool_calls": [
-                    {
-                        "id": tc.get("id") or f"call_{round_num}_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["args"], ensure_ascii=False),
-                        },
-                    }
-                    for i, tc in enumerate(round_tool_calls)
-                ],
-            }
-            messages.append(assistant_msg)
-
-            for i, tc in enumerate(round_tool_calls):
-                result = await execute_tool(tc["name"], tc["args"])
-                tool_results.append(result)
-                tool_id = tc.get("id") or f"call_{round_num}_{i}"
-
-                if result.get("confirm"):
-                    proposal_data = dict(result)
-                    if "confirm_type" in proposal_data and "type" not in proposal_data:
-                        proposal_data["type"] = proposal_data["confirm_type"]
-                    if "confirm_id" in proposal_data and "id" not in proposal_data:
-                        proposal_data["id"] = proposal_data["confirm_id"]
-                    event_queue.put_nowait(json.dumps({'type': 'proposal', 'data': proposal_data}, ensure_ascii=False))
-                else:
-                    tool_info = f"\n\n[{tc['name']}]: {result.get('result', '')}"
-                    assistant_text += tool_info
-                    event_queue.put_nowait(json.dumps({'type': 'text', 'content': tool_info}, ensure_ascii=False))
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": str(result.get("result", "")),
-                })
-
-        if assistant_text:
-            db.msg_add(conv_id, "assistant", assistant_text)
-
-        event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': assistant_text, 'conversation_id': conv_id}, ensure_ascii=False))
-
-        if tool_results:
-            event_queue.put_nowait(json.dumps({'type': 'tool_results', 'results': tool_results}, ensure_ascii=False))
-
-        proposals = get_pending_proposals()
-        if proposals:
-            event_queue.put_nowait(json.dumps({'type': 'proposals', 'proposals': proposals}, ensure_ascii=False))
-
-        combined = user_message + "\n" + assistant_text
-        await maybe_extract_memories(combined, conv_id, interval=cfg.get("memory_extract_interval", 3))
-
-        # 自动蒸馏：后台触发对话蒸馏
-        if cfg.get("auto_distill_enabled", True):
-            asyncio.create_task(_auto_distill_conv(conv_id))
-
-        event_queue.put_nowait(json.dumps({'type': 'done'}))
-
-    except Exception as e:
-        logger.error("后台对话处理异常: %s", e, exc_info=True)
-        event_queue.put_nowait(json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False))
-    finally:
-        # 信号：处理完成，generate() 读到 None 后退出循环
-        event_queue.put_nowait(None)
-        _active_streams.pop(conv_id, None)
-
-
-def _build_skill_injection(current_query: str) -> str:
-    """从记忆库检索 type='skill' 匹配当前查询，注入 system prompt"""
-    if not current_query or len(current_query.strip()) < 2:
-        return ""
-    try:
-        results = db.mem_search(current_query.strip()[:30], limit=5)
-        skill_mems = [m for m in results if m.get("type") == "skill"]
-        if not skill_mems:
-            return ""
-        parts = ["【已记录技能参考】"]
-        for m in skill_mems[:3]:
-            c = m.get("content", "")
-            parts.append(f"- {c[:300]}")
-        return "\n".join(parts).strip()
-    except Exception:
-        return ""
-
-@app.post("/api/chat")
-async def chat(request: Request):
-    """SSE 流式对话 — 后台任务处理，客户端断连不影响对话完成"""
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse({"error": "无效的 JSON 请求"}, status_code=400)
-
-    user_message = data.get("message", "")
-    conv_id = data.get("conversation_id", "")
-
-    if not conv_id:
-        conv = db.conv_create()
-        conv_id = conv["id"]
-
-    if not user_message.strip():
-        return JSONResponse({"error": "消息不能为空"}, status_code=400)
-
-    # 如有同对话的旧后台任务仍在运行，取消它
-    old_task = _active_streams.get(conv_id)
-    if old_task and not old_task.done():
-        old_task.cancel()
-        _active_streams.pop(conv_id, None)
-
-    db.msg_add(conv_id, "user", user_message)
-    await maybe_compress(conv_id)
-
-    # 检测/处理记忆整理意图。若命中，直接返回计划或结果，不走普通 LLM 流程。
-    event_queue = asyncio.Queue()
-    await _handle_consolidate_chat(conv_id, user_message, event_queue)
-    if event_queue.qsize() > 1:
-        # _handle_consolidate_chat 已放入内容，说明命中了 consolidate 流程
-        async def generate_consolidate():
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                yield f"data: {event}\n\n"
-        return StreamingResponse(
-            generate_consolidate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    cfg = load_config()
-    system_parts = [cfg["system_prompt"]]
-    memory_injection = build_memory_injection(current_query=user_message)
-    if memory_injection:
-        system_parts.append(memory_injection)
-    skill_injection = _build_skill_injection(current_query=user_message)
-    if skill_injection:
-        system_parts.append(skill_injection)
-
-    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
-    for m in db.msg_list(conv_id):
-        if m["role"] != "system":
-            messages.append({"role": m["role"], "content": m["content"]})
-
-    # 创建事件队列 + 启动后台处理任务
-    event_queue = asyncio.Queue()
-    process_task = asyncio.create_task(
-        _process_conv(conv_id, user_message, messages, cfg, event_queue)
-    )
-    _active_streams[conv_id] = process_task
-
-    async def generate():
-        """SSE 生成器：只从队列读事件并 yield，客户端断连不影响后台任务"""
-        try:
-            while True:
-                event = await event_queue.get()
-                if event is None:  # 后台任务完成信号
-                    break
-                yield f"data: {event}\n\n"
-        finally:
-            # 无论客户端断连还是正常完成，后台任务继续处理
-            _chat_logger = logging.getLogger("zenith.chat")
-            _chat_logger.info("SSE 流结束 (对话%s)", conv_id)
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-# ═══════════════════════════════════════════════════════
-# API: Schedules
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/schedules")
-async def get_schedules(status: str = "", date_from: str = "", date_to: str = "", overdue: str = ""):
-    items = db.sch_list(status=status, date_from=date_from, date_to=date_to)
-    if overdue:
-        from .schedule_reminder import _parse_time
-        now = now_tz()
-        filtered = []
-        for s in items:
-            st = s.get("start_time", "")
-            start = _parse_time(st) if st else None
-            if start is None:
-                continue
-            is_overdue = start < now and s.get("status") not in ("done", "cancelled")
-            if overdue == "true" and is_overdue:
-                filtered.append(s)
-            elif overdue == "false" and not is_overdue:
-                filtered.append(s)
-        return filtered
-    return items
-
-
-@app.post("/api/schedules")
-async def create_schedule(request: Request):
-    data = await request.json() or {}
-    if not data.get("title"):
-        raise HTTPException(400, "title 为必填字段")
-    data["source"] = data.get("source", "manual")
-
-    # P1-5: 冲突检测（与已确认日程重叠时返回 409 + 建议时间）
-    start_time = data.get("start_time", "")
-    if start_time:
-        from .tools import _find_time_conflict, _suggest_alternative_time
-        conflict = _find_time_conflict(start_time, data.get("end_time"))
-        if conflict:
-            suggestions = _suggest_alternative_time(start_time, data.get("end_time"))
-            raise HTTPException(
-                409,
-                detail={
-                    "error": "时间冲突",
-                    "conflict_with": {"id": conflict.get("id"), "title": conflict.get("title"), "start_time": conflict.get("start_time")},
-                    "suggestions": suggestions[:3],
-                },
-            )
-
-    sid = db.sch_add(data)
-    return {"id": sid, **data}
-
-
-@app.put("/api/schedules/{sid}")
-async def update_schedule(sid: int, data: dict = Body(default=None)):
-    old = db.sch_get(sid)
-    if not old:
-        raise HTTPException(404, "日程不存在")
-
-    # 重复日程仅修改本次实例
-    if data.get("apply_to") == "instance" and old.get("recurrence"):
-        instance = dict(old)
-        instance.pop("id", None)
-        instance["parent_id"] = old["id"]
-        instance["recurrence"] = ""
-        for k in ["title", "description", "start_time", "end_time", "location", "status", "priority", "importance", "category", "impact", "country", "remind_before", "goal_id"]:
-            if k in data:
-                instance[k] = data[k]
-        new_id = db.sch_add(instance)
-        return {"success": True, "instance_id": new_id, "message": "已创建独立实例"}
-
-    db.sch_update(sid, data)
-    # 目标关联：完成日程时推进目标进度
-    if data.get("status") == "done":
-        goal_id = data.get("goal_id") or old.get("goal_id")
-        if goal_id:
-            g = db.goal_get(goal_id)
-            if g:
-                strategy = g.get("strategy", "compound")
-                current = float(g.get("current_value", 0))
-                target = float(g.get("target_value", 1))
-                daily = float(g.get("daily_target", 5))
-                if strategy == "linear":
-                    new_value = current + 1
-                else:
-                    new_value = current * (1 + daily / 100)
-                new_value = min(new_value, target)
-                db.goal_update(goal_id, {"current_value": new_value})
-    # 自动记忆：标记 done → 后台提炼经验记忆
-    if data.get("status") == "done":
-        task = asyncio.create_task(_auto_extract_schedule_memory(sid, old))
-        _pending_schedule_tasks.add(task)
-        task.add_done_callback(_pending_schedule_tasks.discard)
-    return {"success": True}
-
-
-@app.delete("/api/schedules/{sid}")
-async def delete_schedule(sid: int, cascade: str = ""):
-    """删除日程。若 cascade=true 且为重复母日程，同时删除所有实例"""
-    if cascade == "true":
-        with db() as c:
-            c.execute("DELETE FROM schedules WHERE parent_id = ?", (sid,))
-    db.sch_del(sid)
-    return {"success": True}
-
-
-@app.post("/api/schedules/ai-plan")
-async def ai_plan(data: dict = Body(default=None)):
-    schedules = data.get("schedules", db.sch_list(status="confirmed")[:20])
-    advice = await plan_time(schedules)
-    return {"advice": advice}
-
+# Schedules/Calendar/Reminders - migrated to routers/schedules.py
 
 @app.get("/api/reminders")
 async def get_reminders():
@@ -1216,105 +786,8 @@ async def get_calendar_month(month: str = ""):
 
 
 # ═══════════════════════════════════════════════════════
-# API: Goals（目标追踪）
-# ═══════════════════════════════════════════════════════
+# API: Goals - migrated to routers/goals.py
 
-@app.get("/api/goals")
-async def get_goals(status: str = ""):
-    return db.goal_list(status=status)
-
-
-@app.post("/api/goals")
-async def create_goal(data: dict = Body(default=None)):
-    if not data:
-        data = {}
-    if not data.get("title"):
-        raise HTTPException(400, "title 为必填字段")
-    gid = db.goal_add(data)
-    return {"id": gid, **data}
-
-
-@app.get("/api/goals/{gid}")
-async def get_goal(gid: int):
-    g = db.goal_get(gid)
-    if not g:
-        raise HTTPException(404, "目标不存在")
-    return g
-
-
-@app.put("/api/goals/{gid}")
-async def update_goal(gid: int, data: dict = Body(default=None)):
-    db.goal_update(gid, data)
-    return {"success": True}
-
-
-@app.delete("/api/goals/{gid}")
-async def delete_goal(gid: int):
-    db.goal_del(gid)
-    return {"success": True}
-
-
-@app.get("/api/goals/{gid}/stats")
-async def get_goal_stats(gid: int):
-    stats = db.goal_get_stats(gid)
-    if not stats:
-        raise HTTPException(404, "目标不存在")
-    return stats
-
-
-@app.get("/api/goals/{gid}/schedules")
-async def get_goal_schedules(gid: int, status: str = ""):
-    """获取与目标关联的日程列表"""
-    g = db.goal_get(gid)
-    if not g:
-        raise HTTPException(404, "目标不存在")
-    items = db.sch_list()
-    related = [s for s in items if s.get("goal_id") == gid]
-    if status:
-        related = [s for s in related if s.get("status") == status]
-    return related
-
-
-# ═══════════════════════════════════════════════════════
-# API: Notes
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/notes")
-async def get_notes(search: str = ""):
-    return db.note_list(search=search)
-
-
-@app.post("/api/notes")
-async def create_note(data: dict = Body(...)):
-    if not data:
-        data = {}
-    if not data.get("title"):
-        raise HTTPException(400, "title 为必填字段")
-    nid = db.note_add(data)
-    return {"id": nid, **data}
-
-
-@app.put("/api/notes/{nid}")
-async def update_note(nid: int, data: dict = Body(default=None)):
-    db.note_update(nid, data)
-    return {"success": True}
-
-
-@app.delete("/api/notes/{nid}")
-async def delete_note(nid: int):
-    db.note_del(nid)
-    return {"success": True}
-
-
-@app.post("/api/notes/{nid}/distill")
-async def distill_note_endpoint(nid: int):
-    """手动蒸馏一条 raw note：根据记忆偏好/方法分流为笔记/日程/记忆"""
-    from .tools import _handle_distill_note
-    result = await _handle_distill_note({"note_id": nid})
-    return result
-
-
-# ═══════════════════════════════════════════════════════
 # API: Proposals (Confirm Flow)
 # ═══════════════════════════════════════════════════════
 
@@ -1421,20 +894,8 @@ async def tutorials_active():
 
 
 # ═══════════════════════════════════════════════════════
-# API: Memories
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/memories")
-async def get_memories(type_: str = "", search: str = ""):
-    if search:
-        return db.mem_search(search)
-    return db.mem_list(type_=type_)
-
-
-@app.delete("/api/memories/{mid}")
-async def delete_memory(mid: int):
-    db.mem_del(mid)
-    return {"success": True}
+# API: Memories — migrated to routers/memories.py
+# Router registration at bottom of file
 
 
 # ═══════════════════════════════════════════════════════
@@ -1912,6 +1373,17 @@ async def mt5_tick_stats(symbol: str = "XAUUSD", seconds: int = 60):
     from .mt5_service import get_tick_stats
     seconds = min(max(seconds, 1), 3600)
     return get_tick_stats(symbol, seconds)
+
+
+# Router registration (must be before catch-all)
+app.include_router(memories.router)
+app.include_router(notes.router)
+app.include_router(goals.router)
+app.include_router(schedules.router)
+app.include_router(distill.router)
+app.include_router(knowledge.router)
+app.include_router(settings.router)
+app.include_router(chat.router)
 
 
 @app.get("/{full_path:path}")
