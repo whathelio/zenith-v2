@@ -509,7 +509,6 @@ export default function AppLayout() {
                   return (
                     <div
                       key={g.id}
-                      onClick={() => navigate('/calendar')}
                       style={{
                         padding: '8px 10px',
                         background: 'var(--color-bg-input)',
@@ -519,18 +518,32 @@ export default function AppLayout() {
                         cursor: 'pointer',
                         transition: 'all 0.15s',
                       }}
-                      title="点击进入日历查看详情"
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1 }}>
+                        <div
+                          onClick={() => navigate('/calendar')}
+                          title="点击进入日历查看详情"
+                          style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flex: 1, cursor: 'pointer' }}
+                        >
                           <div style={{ width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0 }} />
                           <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                             {g.title}
                           </span>
                         </div>
-                        <span style={{ fontSize: 12, fontWeight: 700, color: progress >= 100 ? '#50fa7b' : 'var(--color-text-secondary)', flexShrink: 0, marginLeft: 8 }}>
-                          {progress.toFixed(0)}%
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0, marginLeft: 8 }}>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: progress >= 100 ? '#50fa7b' : 'var(--color-text-secondary)' }}>
+                            {progress.toFixed(0)}%
+                          </span>
+                          <button
+                            onClick={e => { e.stopPropagation(); setShowGoalDelete(g) }}
+                            title="删除目标"
+                            style={{
+                              width: 20, height: 20, fontSize: 11, lineHeight: '18px',
+                              background: 'transparent', color: 'var(--color-text-muted)',
+                              border: 'none', borderRadius: 4, cursor: 'pointer',
+                            }}
+                          >×</button>
+                        </div>
                       </div>
 
                       <div style={{ background: 'var(--color-bg-muted)', borderRadius: 4, height: 6, marginTop: 6, overflow: 'hidden' }}>
