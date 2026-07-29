@@ -36,6 +36,7 @@ from .recurrence import expand_recurring
 from .file_analyzer import analyze_file_stream
 from .unified_distill import distill_conversation, distill_schedules, distill_memories, distill_all, distill_daily, distill_weekly
 from . import knowledge_service
+from . import scheduler
 
 PROJECT_DIR = Path(__file__).parent.parent
 FRONTEND_DIST = PROJECT_DIR / "frontend" / "dist"
@@ -50,24 +51,10 @@ async def lifespan(app: FastAPI):
     if not (PROJECT_DIR / "config" / "config.yaml").exists():
         save_config(DEFAULT_CONFIG)
 
-    # 启动市场分析定时任务
-    cfg = load_config()
-    if cfg.get('market_analysis_enabled', True):
-        from .market_analyzer import start_market_scheduler
-        scheduler_task = asyncio.create_task(start_market_scheduler())
-        # yield 时保持任务运行
+    # 启动所有后台定时任务（scheduler.py 统一管理）
+    scheduler.start_all_background_tasks()
 
-    # 启动记忆整理定时任务（每6小时执行一次）
-    asyncio.create_task(_memory_maintenance_loop())
-
-    # 启动每日/每周蒸馏定时任务（受 auto_distill_enabled 控制）
-    if is_auto_distill_enabled():
-        asyncio.create_task(_daily_distill_loop())
-        asyncio.create_task(_weekly_distill_loop())
-    else:
-        logger.info("auto_distill_enabled=false, 跳过每日/每周蒸馏定时任务")
-    # 启动日程提醒后台扫描任务（每5分钟检查 remind_before 到期）
-    asyncio.create_task(_reminder_loop())
+    yield
 
     yield
 
