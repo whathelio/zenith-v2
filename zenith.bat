@@ -40,12 +40,8 @@ set ZENITH_RAG_EMBED_MODEL=%ZENITH_ROOT%\bge-small-model
 REM ── 清除可能残留的锁文件 ──
 if exist "%TEMP%\zenith_v2.lock" del /q "%TEMP%\zenith_v2.lock" 2>nul
 
-REM ── 启动 Zenith v2 主服务（端口 8766） ──
+REM ── 启动 Zenith v2 主服务（端口 8766，start.py 内置浏览器自动打开） ──
 start "" /D "%~dp0" "%PYTHON_EXE%" "%~dp0start.py" 8766
-
-REM ── 等待服务就绪后打开浏览器（如果 start.py 的 webbrowser 失败则兜底） ──
-timeout /t 4 /nobreak >nul
-start http://localhost:8766
 
 REM ── 启动知识库 API 中台（端口 8788）─ 用 zenith-v2 的 venv ──
 timeout /t 2 /nobreak >nul
