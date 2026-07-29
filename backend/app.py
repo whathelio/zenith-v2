@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
-from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
 from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
@@ -1371,6 +1371,7 @@ app.include_router(distill.router)
 app.include_router(knowledge.router)
 app.include_router(settings.router)
 app.include_router(chat.router)
+app.include_router(audit.router)
 
 
 @app.get("/{full_path:path}")

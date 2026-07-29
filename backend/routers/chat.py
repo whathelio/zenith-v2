@@ -18,6 +18,9 @@ from ..context_compressor import maybe_compress
 from ..schedule_reminder import check_reminders
 from ..confirm_flow import get_pending_proposals
 from ..validators.auditor_skill import AUDITOR_SKILL_PROMPT
+from ..validators.output_validator import validate_output
+from ..validators.input_validator import validate_input
+from ..audit.audit_log import log_event
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -132,6 +135,11 @@ async def _process_conv(
                 except Exception as exc:
                     result = {"error": str(exc), "result": f"工具执行异常: {exc}"}
                     success = False
+                    log_event("tool_error", {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "error": str(exc),
+                    }, conv_id)
 
                 duration_ms = int((time.time() - t_start) * 1000)
                 tool_results.append(result)
@@ -189,6 +197,14 @@ async def _process_conv(
 
         if assistant_text:
             db.msg_add(conv_id, "assistant", assistant_text)
+            audit_cfg = cfg.get("audit", {})
+            if audit_cfg.get("enabled", True):
+                log_event("conversation_complete", {
+                    "conv_id": conv_id,
+                    "message_len": len(assistant_text),
+                    "tool_count": len(tool_results),
+                    "rounds": round_num + 1,
+                }, conv_id)
 
         event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': assistant_text, 'conversation_id': conv_id}, ensure_ascii=False))
 
@@ -204,6 +220,12 @@ async def _process_conv(
 
         if cfg.get("auto_distill_enabled", True):
             asyncio.create_task(_auto_distill_conv(conv_id))
+
+        # L3: 输出验证 — 绝对化表述/高风险领域/记忆矛盾检测
+        if cfg.get("validators", {}).get("output", {}).get("enabled", True):
+            warnings = validate_output(assistant_text, conv_id)
+            for w in warnings:
+                event_queue.put_nowait(json.dumps({'type': 'warning', **w}, ensure_ascii=False))
 
         event_queue.put_nowait(json.dumps({'type': 'done'}))
 
@@ -241,6 +263,19 @@ async def chat(request: Request):
     if not user_message.strip():
         return JSONResponse({"error": "消息不能为空"}, status_code=400)
 
+    # L1: 输入验证 — 高危指令拦截 / 模糊请求追问
+    cfg = load_config()
+    if cfg.get("validators", {}).get("input", {}).get("enabled", True):
+        input_check = validate_input(user_message)
+        if not input_check["passed"]:
+            return JSONResponse(
+                {"error": input_check["warning"],
+                 "validation": {"blocked": True}},
+                status_code=400,
+            )
+        if input_check["warning"] and not input_check["block"]:
+            pass  # soft warning — 继续但前端可显示提示
+
     old_task = _active_streams.get(conv_id)
     if old_task and not old_task.done():
         old_task.cancel()
@@ -251,7 +286,6 @@ async def chat(request: Request):
 
     event_queue = asyncio.Queue()
 
-    cfg = load_config()
     system_parts = [cfg["system_prompt"]]
 
     # 审计员 Skill — 从源头减少幻觉（可配置关闭）
