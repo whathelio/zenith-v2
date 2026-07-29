@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import numpy as np
+from collections import defaultdict
 from datetime import datetime, timedelta
 from .database import mem_add, mem_for_inject, mem_search, mem_list, mem_del, db, _now
 
@@ -134,7 +136,7 @@ async def maybe_extract_memories(
 
 
 async def _do_extract(text: str, conv_id: str):
-    """后台执行记忆提取 + 去重"""
+    """后台执行记忆提取 + 去重。同时被 periodic 和 final 两种触发时机共用。"""
     try:
         from .llm_client import extract_memories
         items = await extract_memories(text)
@@ -147,7 +149,6 @@ async def _do_extract(text: str, conv_id: str):
             if not content:
                 continue
 
-            # 去重检查：搜索已有记忆中是否有相似的
             if _is_duplicate(content):
                 skip_count += 1
                 continue
@@ -163,48 +164,141 @@ async def _do_extract(text: str, conv_id: str):
 
         if skip_count:
             logger.info("记忆去重: 跳过 %d 条相似记忆", skip_count)
+        return {"new": new_count, "skipped": skip_count}
 
     except Exception as e:
         logger.warning("记忆提取失败: %s", e, exc_info=True)
+        return {"new": 0, "skipped": 0}
 
 
-def _is_duplicate(content: str, threshold: float = 0.8) -> bool:
+# 公开别名 — 供 app.py _auto_distill_conv 调用
+extract_memories_from_text = _do_extract
+
+
+def _is_duplicate(content: str, threshold: float = 0.75) -> bool:
     """
     检查是否已有相似记忆。
-    策略：取内容前 20 字做 LIKE 查询，找到候选后计算相似度。
+    策略：提取关键词后用 LIKE 搜索候选（FTS5 CJK tokenizer 对中文分词受限），计算语义相似度。
     """
     if not content or len(content) < 4:
         return False
 
-    # 用前几个字做模糊查询
-    prefix = content[:20]
-    candidates = mem_search(prefix[:8])
+    # 用前 15 个字符做 LIKE 候选搜索（更可靠）
+    candidates = mem_search(content[:15], limit=10)
+    if not candidates:
+        # 补充：关键词搜索
+        keywords = _extract_keywords(content)
+        if keywords:
+            candidates = mem_search(keywords[0], limit=10)
 
     if not candidates:
         return False
 
     for c in candidates:
         existing = c.get("content", "")
-        if _similarity(content, existing) >= threshold:
+        sim = _similarity(content, existing)
+        if sim >= threshold:
             return True
 
     return False
 
 
-def _similarity(a: str, b: str) -> float:
-    """简易文本相似度 — 基于 Jaccard 系数（字符级）"""
+def _ngrams(text: str, n: int) -> set:
+    """提取 n-gram 字符片段"""
+    return set(text[i:i+n] for i in range(len(text) - n + 1))
+
+
+def _text_vector(text: str, idf_weights: dict = None) -> np.ndarray:
+    """将文本转为稀疏加权向量（2-4 gram + IDF 加权）"""
+    grams = set()
+    # 2-4 字符级 n-gram（对中文特别有效）
+    for n in [2, 3, 4]:
+        grams |= _ngrams(text, n)
+    # 单词级（英文/数字）
+    words = set(re.findall(r'[a-zA-Z0-9]+', text.lower()))
+    all_features = list(grams | words)
+    if not all_features:
+        return np.zeros(0)
+    vec = np.zeros(len(all_features))
+    for i, f in enumerate(all_features):
+        tf = text.count(f) / max(len(text), 1)
+        idf = idf_weights.get(f, 1.0) if idf_weights else 1.0
+        vec[i] = tf * idf
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+
+# 全局 IDF 权重缓存
+_idf_cache: dict = {}
+_idf_doc_count: int = 0
+
+
+def _update_idf_weights():
+    """从所有记忆中更新 IDF 权重"""
+    global _idf_cache, _idf_doc_count
+    try:
+        all_mems = mem_list()
+        _idf_doc_count = len(all_mems)
+        if _idf_doc_count < 5:
+            return
+        df = defaultdict(int)
+        for m in all_mems:
+            seen = set()
+            for n in [2, 3, 4]:
+                for gram in _ngrams(m.get("content", ""), n):
+                    if gram not in seen:
+                        df[gram] += 1
+                        seen.add(gram)
+        _idf_cache = {
+            gram: np.log((_idf_doc_count + 1) / (count + 1)) + 1
+            for gram, count in df.items()
+        }
+    except Exception as e:
+        logger.warning("更新 IDF 权重失败: %s", e)
+
+
+def _semantic_similarity(a: str, b: str) -> float:
+    """
+    增强版文本相似度 — n-gram TF-IDF + 余弦相似度。
+    对中文文本区分度远超 Jaccard bigram。
+    """
     if not a or not b:
         return 0.0
+    if a == b:
+        return 1.0
 
-    set_a = set(a[i:i+2] for i in range(len(a) - 1))
-    set_b = set(b[i:i+2] for i in range(len(b) - 1))
+    # 短文本额外检查精确包含
+    if len(a) < 10 and len(b) < 10:
+        if a in b or b in a:
+            return 0.9
 
-    if not set_a or not set_b:
+    va = _text_vector(a, _idf_cache if _idf_cache else None)
+    vb = _text_vector(b, _idf_cache if _idf_cache else None)
+    if len(va) == 0 or len(vb) == 0:
         return 0.0
 
-    intersection = set_a & set_b
-    union = set_a | set_b
-    return len(intersection) / len(union) if union else 0.0
+    # 确保向量维度一致（取交集）
+    if len(va) != len(vb):
+        return _legacy_jaccard(a, b)
+
+    return float(np.dot(va, vb))
+
+
+def _legacy_jaccard(a: str, b: str) -> float:
+    """降级：字符级 Jaccard bigram 相似度"""
+    set_a = set(a[i:i+2] for i in range(len(a) - 1))
+    set_b = set(b[i:i+2] for i in range(len(b) - 1))
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+def _similarity(a: str, b: str) -> float:
+    """统一相似度入口 — 优先使用语义相似度，降级到 Jaccard"""
+    try:
+        return _semantic_similarity(a, b)
+    except Exception:
+        return _legacy_jaccard(a, b)
 
 
 def mem_touch(memory_id: int):
@@ -218,39 +312,46 @@ def mem_touch(memory_id: int):
 
 def mem_consolidate():
     """
-    记忆合并 — 定期调用。
-    1. 合并高度相似的记忆（保留重要度最高的）
-    2. 降低长期未引用记忆的重要度
+    记忆增量合并 — 定期调用。
+    1. 从最近更新的记忆中查找相似对（非 O(n²) 全量比对）
+    2. 合并高度相似的记忆（保留重要度最高的）
+    3. 降低长期未引用记忆的重要度
     """
     all_mems = mem_list()
     if len(all_mems) < 10:
         return {"merged": 0, "decayed": 0}
 
+    # 按 created_at 排序，找最近 N 条
+    recent = sorted(all_mems, key=lambda m: m.get("created_at") or "", reverse=True)[:50]
+
     merged = 0
-    decayed = 0
     seen_ids = set()
 
-    for i, m in enumerate(all_mems):
+    for i, m in enumerate(recent):
         if m["id"] in seen_ids:
             continue
 
-        for j in range(i + 1, len(all_mems)):
-            other = all_mems[j]
-            if other["id"] in seen_ids:
+        # 用关键词搜索候选（非全量比对）
+        keywords = m.get("keywords", "")
+        if keywords:
+            candidates = mem_search(keywords.split(",")[0], limit=10)
+        else:
+            candidates = mem_search(m["content"][:20], limit=10)
+
+        for other in candidates:
+            if other["id"] == m["id"] or other["id"] in seen_ids:
                 continue
-            if other["type"] != m["type"]:
+            if other.get("type") != m.get("type"):
                 continue
 
             sim = _similarity(m["content"], other["content"])
             if sim >= 0.7:
-                # 合并：保留重要度更高的，删除较低的
                 keeper = m if m["importance"] >= other["importance"] else other
                 to_del = other if m["importance"] >= other["importance"] else m
 
-                # 合并关键词
                 merged_kw = set()
-                for kw in (keeper.get("keywords", "") + "," + to_del.get("keywords", "")).split(","):
-                    kw = kw.strip()
+                for kw_str in (keeper.get("keywords", "") + "," + to_del.get("keywords", "")).split(","):
+                    kw = kw_str.strip()
                     if kw:
                         merged_kw.add(kw)
 
@@ -273,12 +374,17 @@ def mem_consolidate():
             "WHERE created_at < ? AND importance > 1",
             (cutoff,)
         ).fetchall()
+        decayed = 0
         for r in rows:
             c.execute(
                 "UPDATE memories SET importance = importance - 1 WHERE id = ?",
                 (r["id"],)
             )
             decayed += 1
+
+    # 定期更新 IDF 权重（低频操作）
+    if merged > 0:
+        _update_idf_weights()
 
     if merged or decayed:
         logger.info("记忆合并完成: 合并 %d 条, 衰减 %d 条", merged, decayed)

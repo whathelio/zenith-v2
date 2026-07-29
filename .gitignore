@@ -28,6 +28,9 @@ data/code_temp/
 # Config (may contain API keys)
 config/config.yaml
 
+# Environment secrets
+.env
+
 # IDE
 .vscode/
 .idea/

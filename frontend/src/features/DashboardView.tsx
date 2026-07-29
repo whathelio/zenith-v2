@@ -1,243 +1,173 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useCalendarGoal } from '../contexts/CalendarGoalContext'
 import { useNavigate } from 'react-router-dom'
-import { api } from '../shared/api'
-import {
-  STATUS_COLORS, STATUS_BG_COLORS, STATUS_NAMES, STATUS_ICONS, isScheduleOverdue,
-} from '../shared/scheduleHelpers'
+import { api, type CalendarData } from '../shared/api'
+import { Icon } from '../components/Icon'
+import { setPendingMessage } from '../shared/pendingMessage'
+
+const WK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 
 export default function DashboardView() {
-  const { selectedDayKey, selectedDayData, loading, todayStr, loadCalendar } = useCalendarGoal()
+  const { todayStr, data, loading } = useCalendarGoal()
   const navigate = useNavigate()
-  const [chatInput, setChatInput] = useState('')
-  const [sending, setSending] = useState(false)
+  const [stats, setStats] = useState({ conv: 0, notes: 0, memories: 0, skills: 0, kb: '检测中' })
+  const [localCal, setLocalCal] = useState<CalendarData | null>(null)
 
-  const isToday = selectedDayKey === todayStr
-  const schedules = selectedDayData?.schedules || []
-  const notes = selectedDayData?.notes || []
-  const conversations = selectedDayData?.conversations || []
-  const memories = selectedDayData?.memories || []
-
-  // 发送对话：创建新对话 + 发送消息 → 跳转 /chat/:id
-  const handleSendChat = async () => {
-    const text = chatInput.trim()
-    if (!text || sending) return
-    setSending(true)
-    try {
-      const conv = await api.createConversation()
-      // 用 SSE 发送第一条消息（后台处理），然后直接跳转
-      // 不等 SSE 结束，跳转后 ChatView 会接管
-      api.chat(text, conv.id).catch(() => {/* ChatView 会处理 */})
-      setChatInput('')
-      navigate(`/chat/${conv.id}`)
-    } catch (e) {
-      console.error('创建对话失败', e)
-    } finally {
-      setSending(false)
+  // 当天日程：优先用 AppLayout 已加载的 context 数据
+  const ctxSchedules = data?.days?.[todayStr]?.schedules ?? []
+  useEffect(() => {
+    if (!loading && data && !data.days?.[todayStr]) {
+      const d = new Date()
+      api.getCalendar(d.getFullYear(), d.getMonth() + 1).then(setLocalCal).catch(() => {})
     }
-  }
+  }, [loading, data, todayStr])
+  const rawSchedules = (localCal ?? data)?.days?.[todayStr]?.schedules ?? ctxSchedules
+  const todaySchedules = [...rawSchedules].sort((a, b) =>
+    (a.start_time || '99').localeCompare(b.start_time || '99'))
 
-  const handleConfirmSchedule = async (s: any) => {
-    await api.updateSchedule(s.id, { status: 'confirmed' })
-    loadCalendar()
-  }
-  const handleRejectSchedule = async (s: any) => {
-    await api.updateSchedule(s.id, { status: 'cancelled' })
-    loadCalendar()
-  }
-  const handleCompleteSchedule = async (s: any) => {
-    await api.updateSchedule(s.id, { status: 'done' })
-    loadCalendar()
-  }
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const [conv, notes, memories, skills] = await Promise.all([
+          api.listConversations(),
+          api.listNotes(),
+          api.listMemories(),
+          api.listSkills(),
+        ])
+        if (!alive) return
+        let kb = '离线'
+        try { const h = await api.knowledgeHealth(); kb = h.status === 'ok' ? '就绪' : '异常' } catch { kb = '离线' }
+        if (!alive) return
+        setStats({ conv: conv.length, notes: notes.length, memories: memories.length, skills: skills.length, kb })
+      } catch {
+        setStats(s => ({ ...s, kb: '离线' }))
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  const hour = new Date().getHours()
+  const greet = hour < 6 ? '凌晨好' : hour < 12 ? '早上好' : hour < 14 ? '中午好' : hour < 18 ? '下午好' : '晚上好'
+
+  const [y, m, d] = todayStr.split('-').map(Number)
+  const dateLabel = `${y}年${m}月${d}日 ${WK[new Date(y, m - 1, d).getDay()]}`
+
+  const SECTIONS = [
+    { key: 'chat', name: '对话', path: '/chat', color: '#8be9fd', icon: 'chat', badge: String(stats.conv), desc: 'AI 智能对话，自动识别日程 / 笔记 / 记忆' },
+    { key: 'calendar', name: '日历日程', path: '/calendar', color: '#50fa7b', icon: 'calendar', badge: `${todaySchedules.length} 今日`, desc: '周视图日历 + 财经事件联动 + 目标追踪' },
+    { key: 'notes', name: '笔记', path: '/notes', color: '#bd93f9', icon: 'note', badge: String(stats.notes), desc: 'AI 智能分类、内容互转与 Markdown 渲染' },
+    { key: 'memories', name: '记忆库', path: '/memories', color: '#ffb86c', icon: 'memory', badge: String(stats.memories), desc: '自动蒸馏提取、多维分类与记忆整理' },
+    { key: 'skills', name: '技能卡片', path: '/skills', color: '#ff79c6', icon: 'skill', badge: String(stats.skills), desc: '可复用操作流程，AI 自动匹配场景' },
+    { key: 'knowledge', name: '知识库', path: '/knowledge', color: '#f1fa8c', icon: 'knowledge', badge: stats.kb, desc: 'PDF 入库 + 向量检索 + 上下文增强' },
+  ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '12px 16px' }}>
-      {/* 标题 */}
-      <div style={{ fontSize: 18, fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: 12 }}>
-        {isToday ? '今天' : selectedDayKey}
-        {schedules.length > 0 && (
-          <span style={{ fontSize: 12, color: 'var(--color-text-muted)', marginLeft: 8, fontWeight: 400 }}>
-            {schedules.length} 项日程
-          </span>
-        )}
-      </div>
-
-      {/* 内容区 — 滚动 */}
-      <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-        {loading ? (
-          <div style={{ color: 'var(--color-text-muted)', fontSize: 14, padding: 24, textAlign: 'center' }}>加载中...</div>
-        ) : schedules.length === 0 && notes.length === 0 && conversations.length === 0 && memories.length === 0 ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', padding: 32, color: 'var(--color-text-muted)' }}>
-            <div style={{ fontSize: 40, opacity: 0.4 }}>📭</div>
-            <div style={{ fontSize: 14 }}>当天暂无内容</div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>在下方输入框开始对话，或去左侧添加日程</div>
+    <div className="dash-view">
+      <div className="dash-scroll">
+        {/* 问候 + 日期 */}
+        <div className="dash-greet">
+          <div>
+            <h2>{greet}，whathelio 👋</h2>
+            <div className="dash-date">{dateLabel}</div>
           </div>
-        ) : (
-          <>
-            {/* 日程 */}
-            {schedules.length > 0 && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#bd93f9', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>📅</span>日程 ({schedules.length})
-                </div>
-                {schedules.map(s => {
-                  const isProposed = s.status === 'proposed'
-                  const isConfirmed = s.status === 'confirmed'
-                  const overdue = isScheduleOverdue(s)
-                  const displayStatus = overdue ? 'overdue' : s.status
-                  const borderColor = STATUS_COLORS[displayStatus] || (overdue ? '#ff5555' : '#717e95')
-                  const bgColor = STATUS_BG_COLORS[s.status] || 'var(--color-bg-input)'
-                  return (
-                    <div
-                      key={s.id}
-                      style={{
-                        padding: '8px 12px', marginBottom: 5, borderRadius: 5,
-                        background: bgColor, fontSize: 14,
-                        borderLeft: `4px solid ${borderColor}`,
-                      }}
-                    >
-                      <div style={{ color: 'var(--color-text-primary)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.title}</span>
-                        <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexShrink: 0 }}>
-                          <span style={{ fontSize: 11, color: borderColor, fontWeight: 600 }}>
-                            {overdue ? '⚠' : STATUS_ICONS[s.status]}
-                          </span>
-                          {isProposed && (
-                            <>
-                              <button
-                                style={{ padding: '2px 8px', borderRadius: 4, background: STATUS_COLORS.confirmed, color: '#000', fontWeight: 700, fontSize: 10, border: 'none', cursor: 'pointer' }}
-                                onClick={() => handleConfirmSchedule(s)}
-                                title="确认"
-                              >✓</button>
-                              <button
-                                style={{ padding: '2px 6px', borderRadius: 4, background: 'rgba(255,85,85,0.15)', color: '#ff5555', fontWeight: 600, fontSize: 10, border: '1px solid rgba(255,85,85,0.3)', cursor: 'pointer' }}
-                                onClick={() => handleRejectSchedule(s)}
-                                title="取消"
-                              >✗</button>
-                            </>
-                          )}
-                          {isConfirmed && (
-                            <button
-                              style={{ padding: '2px 6px', borderRadius: 4, background: 'rgba(139,233,253,0.12)', color: '#8be9fd', fontWeight: 600, fontSize: 10, border: '1px solid rgba(139,233,253,0.3)', cursor: 'pointer' }}
-                              onClick={() => handleCompleteSchedule(s)}
-                              title="完成"
-                            >✅</button>
-                          )}
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 3 }}>
-                        {s.start_time?.slice(11, 16)}{s.end_time ? ` - ${s.end_time.slice(11, 16)}` : ''}
-                        {s.location ? ` | ${s.location}` : ''}
-                        <span style={{ marginLeft: 6, color: borderColor }}>{overdue ? '已逾期' : STATUS_NAMES[s.status]}</span>
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
+          <div className="dash-quick">
+            <button className="btn btn-primary" onClick={() => navigate('/chat')}>💬 新对话</button>
+            <button className="btn btn-ghost" onClick={() => navigate('/notes')}>📝 记笔记</button>
+          </div>
+        </div>
 
-            {/* 笔记 */}
-            {notes.length > 0 && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#8be9fd', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>📝</span>笔记 ({notes.length})
-                </div>
-                {notes.map(n => (
-                  <div
-                    key={n.id}
-                    onClick={() => navigate('/library?tab=notes')}
-                    style={{
-                      display: 'block', padding: '8px 12px', marginBottom: 5, borderRadius: 5,
-                      background: 'var(--color-bg-input)', fontSize: 14, color: 'var(--color-text-primary)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {n.title}{n.tags && <span style={{ fontSize: 11, color: 'var(--color-accent-secondary)', marginLeft: 6 }}>#{n.tags}</span>}
+        {/* 今日日程 */}
+        <div>
+          <div className="dash-today-head">
+            <span className="t">今日日程</span>
+            <span className="c">{todaySchedules.length} 项</span>
+          </div>
+          {todaySchedules.length === 0 ? (
+            <div className="dash-today-empty">今天还没有安排，去 /calendar 添加吧</div>
+          ) : (
+            <div className="dash-today-list">
+              {todaySchedules.map(s => {
+                const time = (s.start_time || '').slice(11, 16) || '—'
+                const done = /done|completed|finished/i.test(s.status || '')
+                const high = /high|important/i.test(s.priority || '')
+                const cls = done ? 'today-tag--done' : high ? 'today-tag--high' : 'today-tag--default'
+                const label = done ? '已完成' : high ? '重要' : '待办'
+                return (
+                  <div key={s.id} className={`today-row ${done ? 'is-done' : ''}`}>
+                    <span className="today-time">{time}</span>
+                    <span className="today-title">{s.title}</span>
+                    <span className={`today-tag ${cls}`}>{label}</span>
                   </div>
-                ))}
-              </div>
-            )}
+                )
+              })}
+            </div>
+          )}
+        </div>
 
-            {/* 对话 */}
-            {conversations.length > 0 && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#717e95', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>💬</span>对话 ({conversations.length})
+        {/* 板块总览 */}
+        <div className="dash-section-title">
+          <span>功能板块总览</span>
+        </div>
+        <div className="dash-grid">
+          {SECTIONS.map(s => (
+            <div key={s.key} className="ov-card" style={{ ['--ov-color' as any]: s.color }} onClick={() => navigate(s.path)}>
+              <div className="ov-head">
+                <div className="ov-title">
+                  <span className="ov-icon" style={{ background: s.color + '22', color: s.color }}>
+                    <Icon name={s.icon} />
+                  </span>
+                  {s.name}
                 </div>
-                {conversations.map(c => (
-                  <div
-                    key={c.id}
-                    onClick={() => navigate(`/chat/${c.id}`)}
-                    style={{
-                      display: 'block', padding: '8px 12px', marginBottom: 5, borderRadius: 5,
-                      background: 'var(--color-bg-input)', fontSize: 14, color: 'var(--color-text-primary)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {c.title} <span style={{ color: 'var(--color-text-muted)' }}>({c.msg_count}条)</span>
-                  </div>
-                ))}
+                <span className="ov-badge" style={{
+                  background: s.key === 'knowledge'
+                    ? (stats.kb === '就绪' ? 'rgba(80,250,123,0.15)' : 'rgba(255,85,85,0.15)')
+                    : 'var(--color-bg-input)',
+                  color: s.key === 'knowledge'
+                    ? (stats.kb === '就绪' ? '#50fa7b' : '#ff5555')
+                    : 'var(--color-text-secondary)',
+                }}>{s.badge}</span>
               </div>
-            )}
-
-            {/* 记忆 */}
-            {memories.length > 0 && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: '#ff79c6', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>🧠</span>记忆 ({memories.length})
-                </div>
-                {memories.map(m => (
-                  <div
-                    key={m.id}
-                    onClick={() => navigate('/library?tab=memories')}
-                    style={{
-                      padding: '8px 12px', marginBottom: 5, borderRadius: 5,
-                      background: 'var(--color-bg-input)', fontSize: 14,
-                      borderLeft: `3px solid #bd93f9`,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <span style={{ color: 'var(--color-text-primary)' }}>{m.content}</span>
-                    <span style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 6 }}>{m.importance}/5</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </>
-        )}
+              <div className="ov-desc">{s.desc}</div>
+              <div className="ov-link">进入 {s.name} →</div>
+            </div>
+          ))}
+        </div>
       </div>
 
-      {/* 底部对话入口 */}
-      <div style={{
-        flexShrink: 0, paddingTop: 12, borderTop: '1px solid var(--color-border)',
-        display: 'flex', gap: 8, alignItems: 'flex-end',
-      }}>
+      {/* 底部 AI 快捷输入条 */}
+      <QuickInputBar />
+    </div>
+  )
+}
+
+function QuickInputBar() {
+  const [text, setText] = useState('')
+  const navigate = useNavigate()
+  const send = () => {
+    const t = text.trim()
+    if (!t) return
+    setPendingMessage(t)
+    navigate('/chat')
+  }
+  return (
+    <div className="dash-quickbar">
+      <div className="dash-quickbar-inner">
         <textarea
-          value={chatInput}
-          onChange={e => setChatInput(e.target.value)}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              handleSendChat()
-            }
-          }}
-          placeholder="输入消息开始对话... (Enter 发送, Shift+Enter 换行)"
-          rows={2}
-          style={{
-            flex: 1, padding: '8px 12px', borderRadius: 8,
-            background: 'var(--color-bg-input)', border: '1px solid var(--color-border)',
-            color: 'var(--color-text-primary)', fontSize: 13, fontFamily: 'inherit',
-            resize: 'none', outline: 'none', minHeight: 40, maxHeight: 100,
-          }}
+          className="dash-quick-input" rows={1}
+          placeholder="输入内容，AI 自动识别日程 / 笔记 / 记忆..."
+          value={text}
+          onChange={e => setText(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
         />
-        <button
-          className="btn btn-primary"
-          onClick={handleSendChat}
-          disabled={!chatInput.trim() || sending}
-          style={{ padding: '8px 16px', borderRadius: 8, fontSize: 13 }}
-        >
-          {sending ? '⏳' : '发送 💬'}
+        <button className="dash-quick-send" onClick={send} disabled={!text.trim()} title="发送 (Enter)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
         </button>
+      </div>
+      <div className="dash-quick-chips">
+        {['记一条笔记', '加个日程', '总结今天'].map(c => (
+          <span key={c} className="dash-chip" onClick={() => setText(c)}>{c}</span>
+        ))}
       </div>
     </div>
   )

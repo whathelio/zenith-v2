@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { api, type Note, type Memory, type Skill, type SkillSuggestion } from '../shared/api'
 import { TransformButton } from '../components/TransformButton'
 
@@ -22,7 +23,18 @@ const SKILL_CONFIRMED_COLORS: Record<number, { bg: string; text: string; label: 
 type Tab = 'notes' | 'memories' | 'skills'
 
 export default function LibraryView() {
-  const [activeTab, setActiveTab] = useState<Tab>('notes')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialTab = (searchParams.get('tab') as Tab) || 'notes'
+  const [activeTab, setActiveTab] = useState<Tab>(
+    ['notes', 'memories', 'skills'].includes(initialTab) ? initialTab : 'notes'
+  )
+
+  useEffect(() => {
+    const tab = searchParams.get('tab') as Tab
+    if (tab && ['notes', 'memories', 'skills'].includes(tab)) {
+      setActiveTab(tab)
+    }
+  }, [searchParams])
 
   // Notes state
   const [notes, setNotes] = useState<Note[]>([])
@@ -207,7 +219,7 @@ export default function LibraryView() {
           {tabs.map(t => (
             <button
               key={t.key}
-              onClick={() => setActiveTab(t.key)}
+              onClick={() => { setActiveTab(t.key); setSearchParams({ tab: t.key }) }}
               style={{
                 padding: '8px 16px', fontSize: 13, fontWeight: 600,
                 background: activeTab === t.key ? 'var(--color-accent-primary)' : 'transparent',

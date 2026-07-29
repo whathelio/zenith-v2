@@ -1,11 +1,10 @@
-"""Zenith v2 Python 代码运行器 — 双路径隔离执行
+"""Zenith v2 Python 代码运行器 — Docker 真隔离执行
 
-执行路径（按优先级）：
-1. Docker 容器（若可用）— 真隔离：--read-only --network=none --memory --cpus --cap-drop=ALL
-2. 加固子进程（降级）— resource.setrlimit + 模块黑名单 + 清空危险 env
-3. 禁用 — 由调用方 config.is_code_execution_enabled() 把关，返回 403
+执行路径：
+1. Docker 容器 — 真隔离：--read-only --network=none --memory --cpus --cap-drop=ALL
+2. 拒绝执行 — 若 Docker 不可用，直接返回错误，不降级到子进程
 
-⚠️ 即使 Docker 路径，也仅限本地单用户。多用户/公网部署参阅 SECURITY.md。
+⚠️ 仅限本地单用户。多用户/公网部署参阅 SECURITY.md。
 """
 from __future__ import annotations
 
@@ -286,13 +285,21 @@ async def _run_subprocess_hardened(code: str, timeout: int = 30) -> dict:
 
 async def run(code: str, timeout: int = 30) -> dict:
     """
-    执行 Python 代码。自动检测 Docker 可用性，优先用容器隔离。
+    执行 Python 代码。仅支持 Docker 容器隔离。
 
     调用前必须已检查 config.is_code_execution_enabled()。
+    无 Docker 时直接拒绝执行，不降级到子进程。
     Returns: {"success": bool, "output": str}
     """
     from .config import docker_available
 
-    if docker_available():
-        return await _run_in_docker(code, timeout)
-    return await _run_subprocess_hardened(code, timeout)
+    if not docker_available():
+        return {
+            "success": False,
+            "output": (
+                "❌ 代码执行不可用：未检测到 Docker。\n"
+                "代码执行仅支持 Docker 容器真隔离，不再支持子进程降级模式。\n"
+                "请安装 Docker Desktop 后重试。详见 SECURITY.md。"
+            )
+        }
+    return await _run_in_docker(code, timeout)

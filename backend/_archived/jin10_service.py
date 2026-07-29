@@ -29,14 +29,20 @@ MCP_PROTOCOL_VERSION = "2025-11-25"
 
 
 def _load_jin10_config() -> dict:
-    """从 config.yaml 读取 jin10 配置段"""
+    """从 config.yaml 读取 jin10 配置段，api_token 优先从环境变量读取"""
+    import os
+    jin10_cfg = {}
     try:
         with open(CONFIG_YAML, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         jin10_cfg = cfg.get("jin10", {})
-        return jin10_cfg
     except Exception:
-        return {}
+        pass
+    # .env 优先级高于 config.yaml
+    env_token = os.environ.get("ZENITH_JIN10_API_TOKEN", "").strip()
+    if env_token:
+        jin10_cfg["api_token"] = env_token
+    return jin10_cfg
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
 from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
 from .llm_client import chat_stream, plan_time, call_llm
-from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate
+from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate, extract_memories_from_text
 from .confirm_flow import get_pending_proposals, confirm_proposal, reject_proposal, modify_proposal
 from .confirm_flow import TutorialFlow, list_active_tutorials
 from .context_compressor import maybe_compress
@@ -104,18 +104,20 @@ async def _memory_maintenance_loop():
 
 
 async def _auto_distill_conv(conv_id: str):
-    """后台自动蒸馏对话内容：提取经验/决策/知识 → 存入记忆库"""
+    """后台自动提取对话记忆（共用 _do_extract 内核，与 periodic 同路径）"""
     import logging
     logger = logging.getLogger("zenith.distill")
     try:
-        result = await distill_conversation(conv_id)
-        saved = result.get("saved_count", 0)
-        if saved > 0:
-            logger.info("自动蒸馏完成: 对话%s, 已保存%d条记忆", conv_id, saved)
-        else:
-            logger.debug("自动蒸馏完成: 对话%s, 无新记忆提取", conv_id)
+        msgs = db.msg_list(conv_id)
+        text = "\n".join(m.get("content", "") for m in msgs if m.get("role") in ("user", "assistant"))
+        if not text.strip():
+            return
+        result = await extract_memories_from_text(text, conv_id)
+        new_count = result.get("new", 0)
+        if new_count > 0:
+            logger.info("对话结束记忆提取: conv=%s, 新增%d条", conv_id, new_count)
     except Exception as e:
-        logging.getLogger("zenith.distill").warning("自动蒸馏失败: %s", e)
+        logging.getLogger("zenith.distill").warning("对话结束记忆提取失败: %s", e)
 
 
 # ===== 完成日程 → 自动提炼经验记忆 =====
@@ -242,7 +244,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8766", "http://127.0.0.1:8766", "http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -299,6 +301,18 @@ async def knowledge_health():
         return await knowledge_service.health()
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": str(e), "code": "GATEWAY_DOWN"})
+
+
+@app.get("/api/knowledge/status")
+async def knowledge_status():
+    """轻量健康检查 — 给前端条件渲染用，3秒超时"""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get("http://127.0.0.1:8788/health")
+            return {"available": resp.status_code == 200}
+    except Exception:
+        return {"available": False}
 
 
 @app.post("/api/knowledge/search")
@@ -490,7 +504,7 @@ async def summarize_conversation(conv_id: str):
     # 自动存储提炼的经验到记忆库（带去重）
     experiences = result.get("experiences", [])
     saved_memories = []
-    from .memory_engine import _is_duplicate
+    from .memory_engine import _is_duplicat, extract_memories_from_text
     for exp in experiences:
         content = exp.get("content", "").strip()
         if not content or _is_duplicate(content):
@@ -881,38 +895,21 @@ async def _process_conv(
 
 
 def _build_skill_injection(current_query: str) -> str:
-    """根据当前查询匹配已确认技能，返回注入到 system prompt 的文本"""
+    """从记忆库检索 type='skill' 匹配当前查询，注入 system prompt"""
     if not current_query or len(current_query.strip()) < 2:
         return ""
     try:
-        matched = db.skill_find_by_scene(current_query.strip())
-        if not matched:
-            return ""
-        # 只取已确认的技能，最多 3 条
-        confirmed = [s for s in matched if s.get("confirmed_by_user")]
-        if not confirmed:
+        results = db.mem_search(current_query.strip()[:30], limit=5)
+        skill_mems = [m for m in results if m.get("type") == "skill"]
+        if not skill_mems:
             return ""
         parts = ["【已记录技能参考】"]
-        for skill in confirmed[:3]:
-            steps = skill.get("steps", [])
-            if isinstance(steps, str):
-                try:
-                    steps = json.loads(steps)
-                except Exception:
-                    steps = [steps]
-            scene = skill.get("trigger_scene", "")
-            parts.append(f"## {skill.get('name', '未命名技能')}")
-            if scene:
-                parts.append(f"触发场景：{scene}")
-            if steps:
-                parts.append("步骤：")
-                for i, step in enumerate(steps, 1):
-                    parts.append(f"  {i}. {step}")
-            parts.append("")
+        for m in skill_mems[:3]:
+            c = m.get("content", "")
+            parts.append(f"- {c[:300]}")
         return "\n".join(parts).strip()
     except Exception:
         return ""
-
 
 @app.post("/api/chat")
 async def chat(request: Request):
@@ -1549,221 +1546,8 @@ async def transform_item(data: dict = Body(default=None)):
     # 3. 创建目标条目 (proposed 状态)
     created_id = None
     created_item = None
-    source_tag = f"transform_from_{source_type}"
 
-    if target_type == "schedule":
-        result.setdefault("status", "proposed")
-        result["source"] = source_tag
-        result.setdefault("priority", "normal")
-        result.setdefault("category", "other")
-        created_id = db.sch_add(result)
-        created_item = db.sch_get(created_id)
-    elif target_type == "note":
-        result.setdefault("status", "proposed")
-        result["source"] = source_tag
-        result.setdefault("content", "")
-        result.setdefault("tags", "")
-        created_id = db.note_add(result)
-        created_item = db.note_get(created_id)
-    else:  # memory
-        mem_type = result.get("type", "fact")
-        if mem_type not in ("personal_info", "preference", "event", "decision", "fact", "experience"):
-            mem_type = "fact"
-        created_id = db.mem_add(
-            type_=mem_type,
-            content=result.get("content", ""),
-            importance=int(result.get("importance", 3)),
-            keywords=result.get("keywords", ""),
-            source_conv_id=source_tag,
-        )
-        all_mems = db.mem_list()
-        created_item = next((m for m in all_mems if m["id"] == created_id), None)
-
-    # 4. 标记源条目为已转化（用 cancelled 软删除，避免 CHECK 约束冲突）
-    if source_type == "schedule":
-        orig = db.sch_get(source_id)
-        orig_desc = (orig or {}).get("description", "") if orig else ""
-        db.sch_update(source_id, {
-            "status": "cancelled",
-            "description": f"[已转化→{target_type}] {orig_desc}".strip(),
-        })
-
-    return {
-        "success": True,
-        "source_type": source_type,
-        "source_id": source_id,
-        "target_type": target_type,
-        "created_id": created_id,
-        "created_item": created_item,
-        "preview": result,
-    }
-
-
-# Skills API
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/skills")
-async def list_skills(search: str = "", confirmed: int = -1):
-    return db.skill_list(search=search, confirmed=confirmed)
-
-
-@app.post("/api/skills")
-async def add_skill(data: dict = Body(default=None)):
-    sid = db.skill_add(data)
-    skill = db.skill_get(sid)
-    return {"success": True, "id": sid, **skill}
-
-
-@app.get("/api/skills/{sid}")
-async def get_skill(sid: int):
-    skill = db.skill_get(sid)
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    return skill
-
-
-@app.put("/api/skills/{sid}")
-async def update_skill(sid: int, data: dict = Body(default=None)):
-    db.skill_update(sid, data)
-    skill = db.skill_get(sid)
-    return {"success": True, **skill}
-
-
-@app.delete("/api/skills/{sid}")
-async def delete_skill(sid: int):
-    db.skill_del(sid)
-    return {"success": True}
-
-
-@app.post("/api/skills/{sid}/confirm")
-async def confirm_skill(sid: int):
-    """用户确认技能卡片"""
-    db.skill_update(sid, {"confirmed_by_user": 1})
-    skill = db.skill_get(sid)
-    return {"success": True, **skill}
-
-
-@app.post("/api/skills/{sid}/use")
-async def use_skill(sid: int):
-    """标记技能被使用，递增 usage_count"""
-    db.skill_increment_usage(sid)
-    skill = db.skill_get(sid)
-    return {"success": True, **skill}
-
-
-@app.get("/api/skills/match")
-async def match_skills(scene: str):
-    """根据触发场景查找匹配的已确认技能"""
-    skills = db.skill_find_by_scene(scene)
-    return skills
-
-
-# ===== 技能反馈迭代机制 =====
-
-_SKILL_FEEDBACK_PROMPT = """分析以下技能及其反馈，生成改进建议。
-
-技能信息：
-名称: {name}
-触发场景: {trigger_scene}
-当前步骤:
-{steps}
-
-使用反馈（来自实际使用经验）:
-{feedback}
-
-诊断问题并提出改进建议。输出 JSON（只输出 JSON）：
-{{"analysis": "问题诊断（2-3句话）", "improved_steps": ["新步骤1", "新步骤2", ...], "reason": "改进理由"}}"""
-
-
-@app.post("/api/skills/{sid}/feedback")
-async def submit_skill_feedback(sid: int, data: dict = Body(default=None)):
-    """提交技能使用反馈 → 存储为 experience 记忆"""
-    skill = db.skill_get(sid)
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    content = data.get("content", "").strip()
-    if not content:
-        raise HTTPException(400, "反馈内容不能为空")
-    rating = int(data.get("rating", 3))
-    keywords = data.get("keywords", "") or f"技能反馈,{skill.get('name', '')}"
-    mem_id = db.mem_add(
-        type_="experience",
-        content=f"[技能反馈] {skill['name']}: {content}",
-        importance=min(rating, 5),
-        keywords=keywords,
-        source_conv_id=f"skill_feedback_{sid}",
-    )
-    db.skill_increment_usage(sid)
-    return {"success": True, "memory_id": mem_id}
-
-
-@app.get("/api/skills/{sid}/suggestions")
-async def get_skill_suggestions(sid: int):
-    """聚合技能反馈 → LLM 生成改进建议"""
-    skill = db.skill_get(sid)
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    # 查询该技能的所有反馈记忆
-    all_mems = db.mem_list()
-    feedback_mems = [m for m in all_mems if m.get("source_conv_id") == f"skill_feedback_{sid}"]
-    if len(feedback_mems) < 2:
-        return {"ready": False, "feedback_count": len(feedback_mems), "min_required": 2}
-
-    # 格式化步骤和反馈
-    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(skill.get("steps", [])))
-    feedback_text = "\n".join(f"- {m['content']}" for m in feedback_mems[-10:])
-
-    prompt = _SKILL_FEEDBACK_PROMPT.format(
-        name=skill.get("name", ""),
-        trigger_scene=skill.get("trigger_scene", ""),
-        steps=steps_text,
-        feedback=feedback_text,
-    )
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        resp = await call_llm(messages, temperature=0.3, max_tokens=1200,
-                              response_format={"type": "json_object"})
-        raw = resp.get("content", "")
-        m = re.search(r'\{[\s\S]*\}', raw)
-        parsed = json.loads(m.group()) if m else json.loads(raw)
-    except Exception as e:
-        raise HTTPException(500, f"LLM 建议生成失败: {e}")
-
-    return {
-        "ready": True,
-        "feedback_count": len(feedback_mems),
-        "analysis": parsed.get("analysis", ""),
-        "current_steps": skill.get("steps", []),
-        "improved_steps": parsed.get("improved_steps", []),
-        "reason": parsed.get("reason", ""),
-    }
-
-
-@app.post("/api/skills/{sid}/improve")
-async def apply_skill_improvement(sid: int, data: dict = Body(default=None)):
-    """应用改进建议到技能"""
-    new_steps = data.get("steps", [])
-    if not new_steps:
-        raise HTTPException(400, "steps 不能为空")
-
-    skill = db.skill_get(sid)
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill not found")
-
-    # 存储旧版本（作为反馈记忆保留历史）
-    old_steps = skill.get("steps", [])
-    db.mem_add(
-        type_="fact",
-        content=f"[技能版本记录] {skill['name']} v{skill.get('usage_count', 0)}: {' → '.join(old_steps)}",
-        importance=2,
-        keywords=f"技能版本,{skill.get('name', '')}",
-        source_conv_id=f"skill_version_{sid}",
-    )
-
-    db.skill_update(sid, {"steps": new_steps})
-    updated = db.skill_get(sid)
-    return {"success": True, **updated}
+# [C.5] Skills merged into memories — /api/skills endpoints removed
 
 
 # API: Code Execution
@@ -2057,60 +1841,28 @@ async def market_report_detail(report_id: int):
 
 @app.post("/api/market/run-analysis")
 async def run_market_analysis():
-    """手动触发市场分析（异步）"""
-    from .market_analyzer import get_market_analyzer
-    analyzer = get_market_analyzer()
-    try:
-        result = await analyzer.run_daily_analysis()
-        return {"success": True, **result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return {"success": False, "error": "市场分析模块已封存"}
 
 
 @app.get("/api/market/refresh-data")
 async def refresh_market_data():
-    """手动刷新 CFTC + 宏观数据"""
-    from .cftc_service import get_cftc_service
-    from .macro_data import get_macro_service
-
-    cftc_svc = get_cftc_service()
-    macro_svc = get_macro_service()
-
-    try:
-        cftc_result = await cftc_svc.fetch_incremental()
-        macro_result = await macro_svc.fetch_all_indicators()
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-    return {
-        "success": True,
-        "cftc": {"status": cftc_result.get("status"), "report_date": cftc_result.get("report_date")},
-        "macro_count": len(macro_result.get("indicators", [])),
-    }
+    return {"success": False, "error": "市场分析模块已封存"}
 
 
 @app.get("/api/market/predictions")
 async def market_predictions(date: str = "", verified: str = ""):
-    """预测列表"""
-    return db.prediction_list(date=date, verified=verified)
+    """预测列表 — 模块已封存"""
+    return []
 
 
 @app.get("/api/market/predictions/hit-rate")
 async def market_predictions_hit_rate(days: int = 30):
-    """命中率统计"""
-    return db.prediction_get_hit_rate(days=days)
+    return {"hit_rate": 0, "total": 0}
 
 
 @app.post("/api/market/predictions/verify")
 async def verify_predictions():
-    """手动触发预测验证"""
-    from .market_analyzer import get_market_analyzer
-    analyzer = get_market_analyzer()
-    try:
-        result = await analyzer.verify_yesterday_predictions()
-        return {"success": True, **result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return {"success": False, "error": "市场分析模块已封存"}
 
 
 # ═══════════════════════════════════════════════════════
@@ -2184,4 +1936,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     print(f"=> Zenith v2 backend starting on http://localhost:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=port)

@@ -1,27 +1,8 @@
 import { useState, useEffect, useMemo } from 'react'
 import { api, type Goal, type GoalStats } from '../shared/api'
+import { formatDate, formatMoney, formatMoneyShort, parseLocalDate } from '../shared/utils'
 
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
-
-function formatDate(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-
-function parseLocalDate(s: string): Date {
-  const [y, m, d] = s.split('-').map(Number)
-  return new Date(y, m - 1, d)
-}
-
-function formatMoney(v: number): string {
-  if (v >= 100000) return `${(v / 10000).toFixed(1)}万`
-  if (v >= 10000) return `${(v / 10000).toFixed(2)}万`
-  return v.toLocaleString()
-}
-
-function formatMoneyShort(v: number): string {
-  if (v >= 10000) return `${(v / 10000).toFixed(1)}万`
-  return v.toFixed(0)
-}
 
 export interface GoalDetailModalProps {
   goal: Goal
@@ -52,7 +33,7 @@ export default function GoalDetailModal({
     setCurrentValueInput(String(goal.current_value))
     // P2-2: 加载关联日程
     api.listGoalSchedules(goal.id).then(r => setLinkedSchedules(r)).catch(() => setLinkedSchedules([]))
-  }, [goal.id])
+  }, [goal])
 
   const progress = useMemo(() => {
     const range = goal.target_value - goal.start_value

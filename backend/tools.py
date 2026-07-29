@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import re
 import json
+import asyncio
 import logging
 from .database import sch_add, sch_list, sch_update, note_add, note_list, note_update, note_get, mem_search, mem_add, mem_del, mem_list
-from .database import prediction_list, prediction_get_hit_rate
-from .database import skill_add, skill_get, skill_increment_usage
 from . import knowledge_service
 from .config import is_code_execution_enabled
 
@@ -538,76 +537,58 @@ TOOLS_SCHEMA = [
 ]
 
 
+# ── 工具处理器注册表 ──
+_TOOL_HANDLERS = {
+    "add_schedule":       lambda a: _handle_add_schedule(a),
+    "add_note":           lambda a: _handle_add_note(a),
+    "list_schedule":      lambda a: _handle_list_schedule(a),
+    "list_notes":         lambda a: _handle_list_notes(a),
+    "execute_code":       lambda a: _handle_execute_code(a),
+    "search_memory":      lambda a: _handle_search_memory(a),
+    "complete_schedule":  lambda a: _handle_complete_schedule(a),
+    "time_plan":           lambda a: _handle_time_plan(),
+    "create_plan_schedule": lambda a: _handle_create_plan_schedule(a),
+    "web_fetch":          lambda a: _handle_web_fetch(a),
+    "web_search":         lambda a: _handle_web_search(a),
+    "analyze_content":     lambda a: _handle_analyze_content(a),
+    "create_tutorial":     lambda a: _handle_create_tutorial(a),
+    "scan_file_safety":    lambda a: _handle_scan_file_safety(a),
+    "mt5_tick":           lambda a: _handle_mt5_tick(a),
+    "mt5_rates":          lambda a: _handle_mt5_rates(a),
+    "mt5_volume_profile":  lambda a: _handle_mt5_volume_profile(a),
+    "mt5_positions":       lambda a: _handle_mt5_positions(),
+    "distill_conversation": lambda a: _handle_distill_conv(a),
+    "distill_schedules":   lambda a: _handle_distill_schedules(a),
+    "distill_memories":    lambda a: _handle_distill_memories(a),
+    "distill_all":         lambda a: _handle_distill_all(a),
+    "distill_daily":       lambda a: _handle_distill_daily(a),
+    "distill_weekly":      lambda a: _handle_distill_weekly(a),
+    "consolidate_memories": lambda a: _handle_consolidate_memories(a),
+    "sync_calendar":       lambda a: _handle_sync_calendar(a),
+    "smart_classify":      lambda a: _handle_smart_classify(a),
+    "distill_note":        lambda a: _handle_distill_note(a),
+    "retrieve_docs":       lambda a: _handle_retrieve_docs(a),
+    "query_wiki":          lambda a: _handle_query_wiki(a),
+    "kb_stats":            lambda a: _handle_kb_stats(a),
+}
+
+
 async def execute_tool(name: str, args: dict) -> dict:
     """
-    执行工具并返回结果。
-    confirm 字段指示是否需要用户确认。
+    执行工具并返回统一格式 {success, result, ...}。
+    通过注册表字典分发，替代长 if/elif 链。
     """
+    handler = _TOOL_HANDLERS.get(name)
+    if handler is None:
+        return {"success": False, "result": f"未知工具: {name}"}
     try:
-        if name == "add_schedule":
-            return await _handle_add_schedule(args)
-        elif name == "add_note":
-            return _handle_add_note(args)
-        elif name == "list_schedule":
-            return _handle_list_schedule(args)
-        elif name == "list_notes":
-            return _handle_list_notes(args)
-        elif name == "execute_code":
-            return await _handle_execute_code(args)
-        elif name == "search_memory":
-            return _handle_search_memory(args)
-        elif name == "complete_schedule":
-            return _handle_complete_schedule(args)
-        elif name == "time_plan":
-            return await _handle_time_plan()
-        elif name == "create_plan_schedule":
-            return _handle_create_plan_schedule(args)
-        elif name == "web_fetch":
-            return await _handle_web_fetch(args)
-        elif name == "web_search":
-            return await _handle_web_search(args)
-        elif name == "analyze_content":
-            return await _handle_analyze_content(args)
-        elif name == "create_tutorial":
-            return _handle_create_tutorial(args)
-        elif name == "scan_file_safety":
-            return _handle_scan_file_safety(args)
-        elif name == "mt5_tick":
-            return _handle_mt5_tick(args)
-        elif name == "mt5_rates":
-            return _handle_mt5_rates(args)
-        elif name == "mt5_volume_profile":
-            return _handle_mt5_volume_profile(args)
-        elif name == "mt5_positions":
-            return _handle_mt5_positions()
-        elif name == "distill_conversation":
-            return await _handle_distill_conv(args)
-        elif name == "distill_schedules":
-            return await _handle_distill_schedules(args)
-        elif name == "distill_memories":
-            return await _handle_distill_memories(args)
-        elif name == "distill_all":
-            return await _handle_distill_all(args)
-        elif name == "distill_daily":
-            return await _handle_distill_daily(args)
-        elif name == "distill_weekly":
-            return await _handle_distill_weekly(args)
-        elif name == "consolidate_memories":
-            return await _handle_consolidate_memories(args)
-        elif name == "sync_calendar":
-            return await _handle_sync_calendar(args)
-        elif name == "smart_classify":
-            return await _handle_smart_classify(args)
-        elif name == "distill_note":
-            return await _handle_distill_note(args)
-        elif name == "retrieve_docs":
-            return await _handle_retrieve_docs(args)
-        elif name == "query_wiki":
-            return await _handle_query_wiki(args)
-        elif name == "kb_stats":
-            return await _handle_kb_stats(args)
-        else:
-            return {"success": False, "result": f"未知工具: {name}"}
+        result = handler(args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        # 统一格式
+        if isinstance(result, dict) and "success" in result:
+            return result
+        return {"success": True, "result": result}
     except Exception as e:
         return {"success": False, "result": str(e)}
 
@@ -1162,14 +1143,10 @@ SMART_CLASSIFY_PROMPT = """\
     "is_memory": false,
     "keywords": ["关键词1", "关键词2"]
   },
-  "plan": {
-    "start_time": "YYYY-MM-DDTHH:MM:SS+08:00 或空字符串",
-    "end_time": "YYYY-MM-DDTHH:MM:SS+08:00 或空字符串",
-    "location": "地点（可选）",
-    "priority": "low|normal|high"
-  },
+  "schedule": null,
   "memory_info": null,
   "skill_card": null,
+  "note": null,
   "summary": "一句话摘要"
 }
 
@@ -1187,49 +1164,30 @@ is_memory 判定细则（命中任一即 true）：
 - decision: 已做的决定（"我决定每周日复盘"、"我选方案B"）
 - experience: 可复用的经验/教训（注意：如果是步骤化方法论，应同时 is_skill=true）
 
-如果 is_plan=true，必须同时输出 plan 字段，并基于"当前时间"推算 start_time。
-示例（假设当前时间为 2026-07-18 00:22:52）：
-  用户输入："明天下午三点开会" → start_time 应填 "2026-07-19T15:00:00+08:00"
-  用户输入："提醒我周末买菜" → start_time 可填 "2026-07-19T09:00:00+08:00"
-  用户输入："下周一汇报" → start_time 应填 "2026-07-21T09:00:00+08:00"
-  用户输入没有时间信息 → start_time 为空字符串
+【ACTION RULES — 直接输出最终动作，不要创建中间产物】
+is_plan=true 时必须输出 schedule 字段，基于"当前时间"推算 start_time：
+  示例（假设当前时间为 2026-07-18 00:22:52）：
+    用户输入："明天下午三点开会" → start_time 应填 "2026-07-19T15:00:00+08:00"
+    用户输入："周末买菜" → start_time 可填 "2026-07-19T09:00:00+08:00"
+    用户输入没有时间信息 → start_time 为空字符串
 
-如果 is_memory=true，必须同时输出 memory_info：
-{
-  "classification": {..., "is_memory": true},
-  "plan": {...},
-  "memory_info": {
-    "type": "personal_info|preference|fact|decision|experience",
-    "content": "精炼后的记忆内容（去掉口语化冗余）",
-    "importance": 1-5,
-    "keywords": "关键词,逗号分隔"
-  },
-  "skill_card": null,
-  "summary": "一句话摘要"
-}
+is_memory=true 时必须输出 memory_info：
+  { "type": "personal_info|preference|fact|decision|experience", "content": "精炼后的记忆内容", "importance": 1-5, "keywords": "关键词" }
 
-如果 is_skill=true，必须同时输出 skill_card：
-{
-  "classification": {..., "is_skill": true},
-  "plan": {...},
-  "memory_info": null,
-  "skill_card": {
-    "name": "技能名称（简短）",
-    "trigger_scene": "什么时候应该用这个技能",
-    "steps": ["步骤1", "步骤2", ...],
-    "tags": ["标签1", "标签2"]
-  },
-  "summary": "一句话摘要"
-}
+is_skill=true 时必须输出 skill_card：
+  { "name": "技能名称", "trigger_scene": "触发场景", "steps": ["步骤1","步骤2"], "tags": ["标签"] }
+
+is_thought=true 且 isn_plan=false 时，若需要保存整理后的笔记则输出 note：
+  { "should_create": true, "title": "笔记标题", "content": "精炼后的内容", "tags": ["标签"] }
+  若不需要单独笔记则 should_create=false
 
 混合示例："我决定每周日做复盘，步骤是先看日程再看笔记最后写总结"
 → is_plan=false, is_thought=false, is_skill=true, is_memory=true (decision)
 → memory_info.type=decision, content="决定每周日做复盘"
 → skill_card 描述复盘步骤
 
-非技能、非记忆时，skill_card 和 memory_info 必须为 null。
-
-只输出JSON，不要加任何解释文字。"""
+不需要的字段填 null，不要填空对象。
+只输出JSON，不要��任何解释文字。"""
 
 
 def _extract_json(text: str) -> dict:
@@ -1376,6 +1334,8 @@ def _find_time_conflict(start_time: str, end_time: str = "", exclude_id: int | N
 def _suggest_alternative_time(start_time: str, duration_minutes: int = 30, step_minutes: int = 30, max_try: int = 5) -> str:
     """当检测到时间冲突时，向后顺延寻找可用时间段。"""
     from datetime import datetime, timedelta
+    duration_minutes = duration_minutes or 30
+    step_minutes = step_minutes or 30
     try:
         dt = datetime.fromisoformat(start_time)
     except Exception:
@@ -1687,51 +1647,32 @@ async def _handle_smart_classify(args: dict) -> dict:
     skill_card = parsed.get("skill_card")
     memory_info = parsed.get("memory_info")
     summary = parsed.get("summary", "")
-    plan_info = parsed.get("plan", {}) or {}
+    schedule_info = parsed.get("schedule")  # ← unified: LLM outputs schedule directly
+    note_info = parsed.get("note")          # ← unified: LLM outputs note directly
 
-    # 1. 所有输入先作为 raw note（便签）记录
     recorded_at = now_tz().isoformat()
     keywords = ",".join(classification.get("keywords", []))
-    nid = note_add({
-        "title": summary or text[:30],
-        "content": text,
-        "tags": keywords,
-        "source": "smart_classify",
-        "status": "proposed",
-        "stage": "raw",
-        "recorded_at": recorded_at,
-    })
 
-    actions = [f"便签记录 (ID:{nid})"]
-    created_ids = {"note_id": nid}
+    actions = []
+    created_ids = {}
 
-    # 2. 如果是技能，直接创建技能卡片（技能需要立即被确认/使用）
+    # 1. is_skill → 创建技能记忆（type='skill'）
     if classification.get("is_skill") and skill_card:
-        sk_id = skill_add({
-            "name": skill_card.get("name", summary),
-            "trigger_scene": skill_card.get("trigger_scene", ""),
-            "steps": skill_card.get("steps", []),
-            "tags": skill_card.get("tags", []),
-            "source_conv_id": conv_id,
-        })
-        actions.append(f"技能卡片 (ID:{sk_id})")
-        created_ids["skill_id"] = sk_id
-
-        # 同时生成一条经验记忆（来源于技能）
+        skill_content = f"技能：{skill_card.get('name', summary)}\n触发：{skill_card.get('trigger_scene', '')}\n步骤：{json.dumps(skill_card.get('steps', []), ensure_ascii=False)}"
+        tags = skill_card.get("tags", []) + classification.get("keywords", [])
         mem_id = mem_add(
-            type_="experience",
-            content=f"技能: {skill_card.get('name', '')} — {skill_card.get('trigger_scene', '')}",
+            type_="skill",
+            content=skill_content,
             importance=4,
-            keywords=",".join(skill_card.get("tags", []) + classification.get("keywords", [])),
+            keywords=",".join(tags),
             source_conv_id=conv_id,
             recorded_at=recorded_at,
-            distilled_from=nid,
         )
-        actions.append(f"经验记忆 (ID:{mem_id})")
+        actions.append(f"技能记忆 (ID:{mem_id})")
+        created_ids["skill_memory_id"] = mem_id
         created_ids["memory_id"] = mem_id
 
-    # 2.5 is_memory 快路径：立即入记忆库（跳过 raw 蒸馏阶段）
-    #     若 is_skill=true 且 memory_info.type=experience，跳过（避免和技能经验记忆重复）
+    # 2. is_memory → 直接入记忆库（带去重）
     elif classification.get("is_memory") and memory_info:
         mem_type = memory_info.get("type", "fact")
         if mem_type not in ("personal_info", "preference", "event", "decision", "fact", "experience"):
@@ -1745,10 +1686,9 @@ async def _handle_smart_classify(args: dict) -> dict:
             mem_importance = 3
         mem_importance = max(1, min(5, mem_importance))
 
-        # 录入时去重检查（不删除已有记忆）：相似度>0.7 跳过创建
         dup_id = _find_duplicate_memory(mem_content, mem_keywords, mem_type)
         if dup_id is not None:
-            actions.append(f"记忆已存在 (ID:{dup_id})，跳过创建")
+            actions.append(f"记忆已存在 (ID:{dup_id})")
             created_ids["memory_id"] = dup_id
         else:
             mem_id = mem_add(
@@ -1758,54 +1698,51 @@ async def _handle_smart_classify(args: dict) -> dict:
                 keywords=mem_keywords,
                 source_conv_id=conv_id,
                 recorded_at=recorded_at,
-                distilled_from=nid,
             )
             actions.append(f"记忆 (ID:{mem_id})")
             created_ids["memory_id"] = mem_id
 
-        # 把记忆 ID 关联回原 note
-        import json as _json
-        try:
-            distilled_into = _json.loads(note_get(nid).get("distilled_into", "[]") or "[]")
-        except Exception:
-            distilled_into = []
-        mid_for_link = created_ids.get("memory_id")
-        if isinstance(distilled_into, list):
-            distilled_into.append({"type": "memory", "id": mid_for_link})
-        else:
-            distilled_into = [{"type": "memory", "id": mid_for_link}]
-        note_update(nid, {
-            "stage": "distilled",
-            "distilled_at": recorded_at,
-            "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+    # 3. is_plan → 直接创建日程（来自 LLM 的统一输出，不再二次蒸馏）
+    if classification.get("is_plan") and schedule_info:
+        sch_title = schedule_info.get("title") or summary or text[:30]
+        sch_start = schedule_info.get("start_time", "")
+        sch_priority = schedule_info.get("priority", "normal")
+        if sch_priority not in ("low", "normal", "high"):
+            sch_priority = "normal"
+
+        # 时间冲突检测
+        if sch_start:
+            conflict = _find_time_conflict(sch_start)
+            if conflict:
+                alt = _suggest_alternative_time(sch_start)
+                actions.append(f"⚠ 时间冲突: {conflict.get('title','')}，建议顺延至 {alt}")
+                sch_start = alt
+
+        sid = sch_add({
+            "title": sch_title,
+            "start_time": sch_start if sch_start else recorded_at,
+            "description": schedule_info.get("description", text),
+            "priority": sch_priority,
+            "status": "proposed",
+            "source": "ai_detect",
         })
+        actions.append(f"日程 (ID:{sid})")
+        created_ids["schedule_id"] = sid
 
-    # 3. 对 plan 类型立即进行蒸馏分流（时间敏感）
-    if classification.get("is_plan"):
-        distill_result = await _distill_raw_note(
-            nid,
-            text,
-            classification,
-            plan_info,
-            conv_id=conv_id,
-            recorded_at=recorded_at,
-        )
-        created_ids.update(distill_result.get("created_ids", {}))
-        actions.extend(distill_result.get("actions", []))
-
-    # 4. is_thought 自动蒸馏（不再停留 raw 阶段等待手动）
-    #    若同时 is_plan=true，plan 蒸馏已经覆盖了内容，跳过避免重复
+    # 4. is_thought → 若 LLM 输出需要创建笔记则直接建 refined note
     if classification.get("is_thought") and not classification.get("is_plan"):
-        distill_result = await _distill_raw_note(
-            nid,
-            text,
-            classification,
-            plan_info,
-            conv_id=conv_id,
-            recorded_at=recorded_at,
-        )
-        created_ids.update(distill_result.get("created_ids", {}))
-        actions.extend(distill_result.get("actions", []))
+        if note_info and note_info.get("should_create"):
+            nid = note_add({
+                "title": note_info.get("title", summary or text[:30]),
+                "content": note_info.get("content", text),
+                "tags": ",".join(note_info.get("tags", [])) or keywords,
+                "source": "smart_classify",
+                "status": "proposed",
+                "stage": "refined",
+                "recorded_at": recorded_at,
+            })
+            actions.append(f"笔记 (ID:{nid})")
+            created_ids["note_id"] = nid
 
     # 构建返回结果
     result_lines = [
@@ -1815,15 +1752,11 @@ async def _handle_smart_classify(args: dict) -> dict:
         f"  摘要: {summary}",
     ]
     if skill_card:
-        result_lines.extend([
-            f"  技能卡片: {skill_card.get('name', '')}",
-            f"  触发场景: {skill_card.get('trigger_scene', '')}",
-            f"  步骤数: {len(skill_card.get('steps', []))}",
-        ])
+        result_lines.append(f"  技能: {skill_card.get('name', '')}")
     if memory_info:
         result_lines.append(f"  记忆类型: {memory_info.get('type', 'fact')}")
     if actions:
-        result_lines.append(f"\n  已自动创建: {' | '.join(actions)}")
+        result_lines.append(f"\n  已创建: {' | '.join(actions)}")
 
     return {
         "success": True,

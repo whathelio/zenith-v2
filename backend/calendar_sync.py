@@ -11,7 +11,7 @@ from typing import Optional
 
 from .timezone import now_tz
 from . import database as db
-from .jin10_service import get_jin10_service
+from ._archived.jin10_service import get_jin10_service
 
 logger = logging.getLogger("zenith.calendar_sync")
 

@@ -4,7 +4,6 @@ import DashboardView from './features/DashboardView'
 import ChatView from './features/ChatView'
 import SettingsView from './features/SettingsView'
 import CalendarView from './features/CalendarView'
-import GoalsView from './features/GoalsView'
 import LibraryView from './features/LibraryView'
 import KnowledgeView from './features/KnowledgeView'
 
@@ -23,7 +22,6 @@ export default function App() {
         <Route path="/notes" element={<Navigate to="/library?tab=notes" replace />} />
         <Route path="/memories" element={<Navigate to="/library?tab=memories" replace />} />
         <Route path="/skills" element={<Navigate to="/library?tab=skills" replace />} />
-        <Route path="/goals" element={<GoalsView />} />
       </Route>
 
       {/* 独立页面 — 自己管理布局 */}

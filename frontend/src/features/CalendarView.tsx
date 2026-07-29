@@ -4,28 +4,13 @@ import { api, type Schedule, type CalendarTemplate, type Goal, type GoalStats } 
 import { TransformButton } from '../components/TransformButton'
 import GoalDetailModal from '../components/GoalDetailModal'
 import { useCalendarGoal } from '../contexts/CalendarGoalContext'
+import { formatDate, formatMoney, formatMoneyShort } from '../shared/utils'
+import { GOAL_COLORS } from '../shared/constants'
 import {
   STATUS_COLORS, STATUS_BG_COLORS, STATUS_NAMES, STATUS_ICONS,
   PRIORITY_COLORS, PRIORITY_NAMES, CATEGORY_LABELS, IMPACT_COLORS, IMPACT_LABELS,
   isScheduleOverdue, sortSchedules, formatDateTime,
 } from '../shared/scheduleHelpers'
-
-const GOAL_COLORS = ['#50fa7b', '#8be9fd', '#ff79c6', '#f1fa8c', '#bd93f9']
-
-function formatMoney(v: number): string {
-  if (v >= 100000) return `${(v / 10000).toFixed(1)}万`
-  if (v >= 10000) return `${(v / 10000).toFixed(2)}万`
-  return v.toFixed(0)
-}
-
-function formatMoneyShort(v: number): string {
-  if (v >= 10000) return `${(v / 10000).toFixed(1)}万`
-  return v.toFixed(0)
-}
-
-function formatDate(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
 
 function getToday(): string {
   return formatDate(new Date())
@@ -889,7 +874,13 @@ export default function CalendarView() {
           goal={detailGoal}
           stats={ctxStats[detailGoal.id] || null}
           onClose={() => setDetailGoal(null)}
-          onUpdate={reloadGoals}
+          onUpdate={async () => {
+            reloadGoals()
+            try {
+              const g = await api.getGoal(detailGoal.id)
+              setDetailGoal(g)
+            } catch {}
+          }}
         />
       )}
     </>
@@ -916,7 +907,7 @@ function GoalTrackerPanel({
   const [editForm, setEditForm] = useState<Partial<Goal>>({})
   const [currentValueInput, setCurrentValueInput] = useState<string>('')
   // S3：显示字段统一走 Context
-  const { goalDisplayField } = useCalendarGoal()
+  const { goalDisplayField, setShowGoalModal, setEditingGoal } = useCalendarGoal()
 
   if (goals.length === 0) return null
 
@@ -968,13 +959,24 @@ function GoalTrackerPanel({
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <span style={{ fontSize: 14, fontWeight: 600, color: '#50fa7b' }}>🎯 目标追踪</span>
-        <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{goals.length} 个目标</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{goals.length} 个目标</span>
+          <button
+            className="btn btn-sm"
+            onClick={() => { setEditingGoal(null); setShowGoalModal(true) }}
+            style={{ fontSize: 11, padding: '2px 10px', background: 'var(--color-accent-primary)', color: '#fff', border: 'none' }}
+          >
+            + 新建
+          </button>
+        </div>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 10 }}>
         {goals.map((g, idx) => {
           const s = stats[g.id]
-          const progress = s?.progress ?? ((g.current_value - g.start_value) / (g.target_value - g.start_value) * 100)
+          const range = g.target_value - g.start_value
+          const rawProgress = s?.progress ?? (range > 0 ? ((g.current_value - g.start_value) / range) * 100 : 0)
+          const progress = isFinite(rawProgress) ? Math.max(0, Math.min(rawProgress, 100)) : 0
           const color = GOAL_COLORS[idx % GOAL_COLORS.length]
           const activeDays = g.active_days || []
           const rate = g.daily_target || 5

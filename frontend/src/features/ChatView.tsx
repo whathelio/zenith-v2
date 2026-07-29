@@ -4,8 +4,8 @@ import ChatConvPanel from '../components/ChatConvPanel'
 import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
 import ProposalsBar from '../components/ProposalsBar'
-import ReminderBanner from '../components/ReminderBanner'
 import { api, type Message, type Proposal, type ConversationSummary } from '../shared/api'
+import { takePendingMessage } from '../shared/pendingMessage'
 
 let _msgIdCounter = 0
 
@@ -70,6 +70,13 @@ export default function ChatView() {
       loadConversation(firstId)
     }
   }, [convId, conversations])
+
+  // 从 Dashboard 底部快捷输入过来的待发送消息：会话就绪后自动发送
+  useEffect(() => {
+    if (!activeConv) return
+    const p = takePendingMessage()
+    if (p) handleSend(p)
+  }, [activeConv])
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })

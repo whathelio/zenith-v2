@@ -1,6 +1,7 @@
 """Zenith v2 SQLite 数据库 — WAL 模式 + 外键约束"""
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 import json
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path(__file__).parent.parent / "data" / "zenith.db"
+_TESTING = os.environ.get("ZENITH_TESTING") == "1"
+_test_conn = None
 
 
 def _conn():
@@ -180,6 +183,37 @@ def _migrate_market_reports():
         if "markdown_text" not in cols:
             c.execute("ALTER TABLE market_reports ADD COLUMN markdown_text TEXT DEFAULT ''")
             c.commit()
+    finally:
+        c.close()
+
+
+def _migrate_memories_fts():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        c.execute("PRAGMA foreign_keys=OFF")
+        ft_exists = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+        ).fetchone()
+        if not ft_exists:
+            c.executescript("""
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content, keywords, content='memories', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES ('delete', old.id, old.content, old.keywords);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES ('delete', old.id, old.content, old.keywords);
+    INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
+END;
+""")
+            c.execute("INSERT INTO memories_fts(rowid, content, keywords) SELECT id, content, keywords FROM memories")
+            c.commit()
+        c.execute("PRAGMA foreign_keys=ON")
     finally:
         c.close()
 
@@ -574,12 +608,35 @@ def mem_list(type_: str = "") -> list:
     return [dict(r) for r in rs]
 
 
-def mem_search(keyword: str = "") -> list:
+def mem_search(keyword: str = "", limit: int = 30) -> list:
     with db() as c:
+        kw = keyword.strip()
+        if not kw:
+            return []
+        try:
+            tokens = []
+            for t in kw.split():
+                if t.isascii() and len(t) > 1:
+                    tokens.append(f"{t}*")
+                else:
+                    tokens.append(t)
+            fts_query = " OR ".join(tokens) if tokens else kw
+            rs = c.execute(
+                "SELECT m.* FROM memories m "
+                "JOIN memories_fts fts ON m.id = fts.rowid "
+                "WHERE memories_fts MATCH ? "
+                "ORDER BY rank "
+                "LIMIT ?",
+                (fts_query, limit)
+            ).fetchall()
+            if rs:
+                return [dict(r) for r in rs]
+        except Exception:
+            pass
         rs = c.execute(
             "SELECT * FROM memories WHERE content LIKE ? OR keywords LIKE ? "
-            "ORDER BY importance DESC",
-            (f"%{keyword}%", f"%{keyword}%")
+            "ORDER BY importance DESC LIMIT ?",
+            (f"%{kw}%", f"%{kw}%", limit)
         ).fetchall()
     return [dict(r) for r in rs]
 
@@ -1263,180 +1320,6 @@ def prediction_get_hit_rate(days: int = 30) -> dict:
     return {"total": total, "hit": hit, "miss": total - hit,
             "hit_rate": round(hit / total * 100, 1) if total > 0 else 0}
 
-
-# ---------------------------------------------------------------------------
-# Skills (技能卡片)
-# ---------------------------------------------------------------------------
-
-def skill_add(data: dict) -> int:
-    now = _now()
-    steps = data.get("steps", [])
-    tags = data.get("tags", [])
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO skills (name, trigger_scene, steps, tags, usage_count, "
-            "confirmed_by_user, source_conv_id, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (
-                data["name"],
-                data.get("trigger_scene", ""),
-                json.dumps(steps) if isinstance(steps, list) else steps,
-                json.dumps(tags) if isinstance(tags, list) else tags,
-                0,
-                0,
-                data.get("source_conv_id", ""),
-                now,
-            )
-        )
-        return cur.lastrowid
-
-
-def skill_list(search: str = "", confirmed: int = -1) -> list:
-    """列出技能卡片。confirmed=-1表示全部，0=未确认，1=已确认"""
-    import json as _json
-    q = "SELECT * FROM skills WHERE 1=1"
-    ps = []
-    if search:
-        q += " AND (name LIKE ? OR trigger_scene LIKE ? OR tags LIKE ?)"
-        ps.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
-    if confirmed >= 0:
-        q += " AND confirmed_by_user = ?"
-        ps.append(confirmed)
-    q += " ORDER BY usage_count DESC, created_at DESC"
-    with db() as c:
-        rs = c.execute(q, ps).fetchall()
-    results = []
-    for r in rs:
-        d = dict(r)
-        # 解析 JSON 字段
-        try:
-            d["steps"] = _json.loads(d.get("steps", "[]"))
-        except (ValueError, TypeError):
-            d["steps"] = []
-        try:
-            d["tags"] = _json.loads(d.get("tags", "[]"))
-        except (ValueError, TypeError):
-            d["tags"] = []
-        results.append(d)
-    return results
-
-
-def skill_get(sid: int) -> Optional[dict]:
-    import json as _json
-    with db() as c:
-        r = c.execute("SELECT * FROM skills WHERE id = ?", (sid,)).fetchone()
-    if not r:
-        return None
-    d = dict(r)
-    try:
-        d["steps"] = _json.loads(d.get("steps", "[]"))
-    except (ValueError, TypeError):
-        d["steps"] = []
-    try:
-        d["tags"] = _json.loads(d.get("tags", "[]"))
-    except (ValueError, TypeError):
-        d["tags"] = []
-    return d
-
-
-_SKILL_COLUMNS = {"name", "trigger_scene", "steps", "tags", "confirmed_by_user"}
-
-
-def skill_update(sid: int, data: dict):
-    import json as _json
-    fs = []
-    ps = []
-    for k, v in data.items():
-        if k not in _SKILL_COLUMNS:
-            continue
-        if v is not None:
-            # steps 和 tags 需要转 JSON 存储
-            if k in ("steps", "tags"):
-                if isinstance(v, list):
-                    v = _json.dumps(v)
-                elif isinstance(v, str):
-                    # 如果已经是 JSON 字符串则保留，否则保持原样
-                    try:
-                        _json.loads(v)
-                    except (ValueError, TypeError):
-                        pass
-                else:
-                    v = _json.dumps(v)
-            fs.append(f"{k} = ?")
-            ps.append(v)
-    if not fs:
-        return
-    ps.append(sid)
-    with db() as c:
-        c.execute(f"UPDATE skills SET {', '.join(fs)} WHERE id = ?", ps)
-
-
-def skill_del(sid: int):
-    with db() as c:
-        c.execute("DELETE FROM skills WHERE id = ?", (sid,))
-
-
-def skill_increment_usage(sid: int):
-    """技能被调用时递增 usage_count"""
-    with db() as c:
-        c.execute("UPDATE skills SET usage_count = usage_count + 1 WHERE id = ?", (sid,))
-
-
-def skill_find_by_scene(scene: str) -> list:
-    """根据触发场景查找匹配的技能。
-
-    匹配策略：从用户输入中提取 2-3 字 n-gram，在 trigger_scene 中做子串匹配。
-    匹配 n-gram 数量越多，排名越靠前。由于技能数量少，直接在 Python 中匹配。
-    """
-    import json as _json
-    import re as _re
-
-    if not scene or not scene.strip():
-        return []
-
-    # 提取用户查询的 2-3 字 n-gram（中文）和 2+ 字母词（英文）
-    query = scene.strip().lower()
-    bigrams = {query[i:i+2] for i in range(len(query) - 1) if len(query[i:i+2].strip()) == 2}
-    trigrams = {query[i:i+3] for i in range(len(query) - 2) if len(query[i:i+3].strip()) == 3}
-    en_words = set(_re.findall(r"[a-z0-9]{2,}", query))
-    query_keywords = bigrams | trigrams | en_words
-
-    if not query_keywords:
-        return []
-
-    # 获取所有已确认技能
-    with db() as c:
-        rs = c.execute(
-            "SELECT * FROM skills WHERE confirmed_by_user = 1 ORDER BY usage_count DESC"
-        ).fetchall()
-
-    results = []
-    for r in rs:
-        d = dict(r)
-        try:
-            d["steps"] = _json.loads(d.get("steps", "[]"))
-        except (ValueError, TypeError):
-            d["steps"] = []
-        try:
-            d["tags"] = _json.loads(d.get("tags", "[]"))
-        except (ValueError, TypeError):
-            d["tags"] = []
-
-        trigger = (d.get("trigger_scene") or "").lower()
-        if not trigger:
-            continue
-
-        # 计算匹配的关键词数量
-        matched_keywords = {kw for kw in query_keywords if kw in trigger}
-        if not matched_keywords:
-            continue
-
-        d["_match_score"] = len(matched_keywords)
-        results.append(d)
-
-    # 按匹配分数降序，返回前 3 条
-    results.sort(key=lambda x: x.pop("_match_score", 0), reverse=True)
-    return results[:3]
 
 
 # ---------------------------------------------------------------------------

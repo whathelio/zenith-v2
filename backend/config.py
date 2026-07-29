@@ -1,7 +1,8 @@
-"""Zenith v2 配置管理 — YAML + JSON 双格式支持"""
+"""Zenith v2 配置管理 — YAML + .env 双格式支持"""
 from __future__ import annotations
 
 import json
+import os
 import yaml
 from pathlib import Path
 from typing import Optional
@@ -11,7 +12,32 @@ DATA_DIR = PROJECT_DIR / "data"
 CONFIG_DIR = PROJECT_DIR / "config"
 CONFIG_JSON = DATA_DIR / "config.json"
 CONFIG_YAML = CONFIG_DIR / "config.yaml"
+ENV_FILE = PROJECT_DIR / ".env"
 DB_PATH = DATA_DIR / "zenith.db"
+
+
+def _load_dotenv() -> dict:
+    """手动加载 .env 文件（零依赖，不引入 python-dotenv）"""
+    env_vars = {}
+    if not ENV_FILE.exists():
+        return env_vars
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    env_vars[key] = value
+                    os.environ.setdefault(key, value)
+    return env_vars
+
+
+# 启动时加载 .env
+_DOTENV_VARS = _load_dotenv()
 
 SYSTEM_PROMPT = (
     "你是 Zenith，用户的本地智能助手。\n"
@@ -113,6 +139,10 @@ def get_api_base() -> str:
 
 
 def get_api_key() -> str:
+    """获取 API Key：优先级 .env > config.yaml"""
+    env_key = os.environ.get("ZENITH_LLM_API_KEY", "").strip()
+    if env_key:
+        return env_key
     return load_config().get("api_key", "").strip()
 
 

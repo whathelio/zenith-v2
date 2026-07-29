@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Outlet, Link, useNavigate } from 'react-router-dom'
 import { api, type CalendarData, type Goal, type GoalStats } from '../shared/api'
+import { formatDate, formatMoney, formatMoneyShort } from '../shared/utils'
+import { GOAL_COLORS, getGoalColor } from '../shared/constants'
 import {
   CalendarGoalContext,
   type GoalDisplayField,
@@ -11,22 +13,6 @@ import {
 } from '../contexts/CalendarGoalContext'
 
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
-const GOAL_COLORS = ['#50fa7b', '#8be9fd', '#ff79c6', '#f1fa8c', '#bd93f9']
-
-function formatDate(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-
-function formatMoney(v: number): string {
-  if (v >= 100000) return `${(v / 10000).toFixed(1)}万`
-  if (v >= 10000) return `${(v / 10000).toFixed(2)}万`
-  return v.toFixed(0)
-}
-
-function formatMoneyShort(v: number): string {
-  if (v >= 10000) return `${(v / 10000).toFixed(1)}万`
-  return v.toFixed(0)
-}
 
 function parseLocalDate(s: string): Date {
   const [y, m, d] = s.split('-').map(Number)
@@ -93,6 +79,17 @@ export default function AppLayout() {
   // 目标 CRUD
   const [showGoalModal, setShowGoalModal] = useState(false)
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null)
+
+  // 知识库网关可用性（C.6 条件渲染）
+  const [kbAvailable, setKbAvailable] = useState(false)
+  useEffect(() => {
+    let mounted = true
+    fetch('/api/knowledge/status')
+      .then(r => r.json())
+      .then(d => { if (mounted) setKbAvailable(d.available) })
+      .catch(() => { if (mounted) setKbAvailable(false) })
+    return () => { mounted = false }
+  }, [])
   const [showGoalDelete, setShowGoalDelete] = useState<Goal | null>(null)
 
   // 提议同步（来自 ChatView 的 CustomEvent）
@@ -318,9 +315,8 @@ export default function AppLayout() {
             <Link to="/" className="btn btn-sm">🏠 主页</Link>
             <Link to="/chat" className="btn btn-sm">💬 对话</Link>
             <Link to="/calendar" className="btn btn-sm">📋 日程</Link>
-            <Link to="/library" className="btn btn-sm">📚 笔记库</Link>
-            <Link to="/knowledge" className="btn btn-sm">🧠 知识库</Link>
-            <Link to="/goals" className="btn btn-sm">🎯 目标</Link>
+            <Link to="/library" className="btn btn-sm">📚 知识库</Link>
+            {kbAvailable && <Link to="/knowledge" className="btn btn-sm">🔗 外部知识</Link>}
             <Link to="/settings" className="btn btn-sm">⚙ 设置</Link>
           </div>
         </div>
@@ -500,7 +496,9 @@ export default function AppLayout() {
 
                 {goals.map((g, idx) => {
                   const s = goalStats[g.id]
-                  const progress = s?.progress ?? ((g.current_value - g.start_value) / (g.target_value - g.start_value) * 100)
+                  const range = g.target_value - g.start_value
+                  const rawProgress = s?.progress ?? (range > 0 ? ((g.current_value - g.start_value) / range) * 100 : 0)
+                  const progress = isFinite(rawProgress) ? Math.max(0, Math.min(rawProgress, 100)) : 0
                   const color = GOAL_COLORS[idx % GOAL_COLORS.length]
                   const activeDays = g.active_days || []
                   const rate = g.daily_target || 5

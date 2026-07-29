@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **流式对话** — SiliconFlow / OpenAI 兼容 API
+- **流式对话** — DeepSeek / OpenAI 兼容 API
 - **记忆引擎** — LLM 自动提取对话记忆 → 分类存储 → 后续注入上下文
 - **日程管理** — AI 检测意图 → 创建/确认/取消/完成，支持批量操作
 - **日历整合** — 周视图日历 + 事件 CRUD + 财经快捷模板
@@ -36,7 +36,7 @@ pip install -r requirements.txt
 
 启动后首次访问会自动打开设置页面，填写你的 API Key 和 API Base URL。
 
-默认兼容 SiliconFlow (https://api.siliconflow.cn)，也支持任何 OpenAI 兼容接口。
+默认兼容 DeepSeek (https://api.deepseek.com/v1)，也支持任何 OpenAI 兼容接口。
 
 ### 4. 启动
 
@@ -89,16 +89,14 @@ zenith-v2/
 │   ├── tools.py            # Function Calling 工具
 │   ├── memory_engine.py    # 记忆提取引擎
 │   ├── knowledge_service.py # 知识库薄代理
-│   ├── market_analyzer.py  # 市场分析引擎
+│   ├── _archived/           # 已封存模块（market_analyzer/jin10/cftc/macro）
 │   ├── unified_distill.py  # 知识蒸馏模块
 │   ├── confirm_flow.py     # 确认流程 + 教程
 │   ├── schedule_reminder.py
 │   ├── context_compressor.py
 │   ├── file_analyzer.py
 │   ├── config.py
-│   ├── cftc_service.py     # CFTC 数据服务
-│   ├── macro_data.py       # 宏观数据服务
-│   └── mt5_service.py      # MT5 桥接（仅 Windows）
+│   ├── mt5_service.py      # MT5 桥接（仅 Windows）
 ├── frontend/
 │   ├── src/                # React + TypeScript 源码
 │   ├── dist/               # 构建产物（已包含）
@@ -122,10 +120,8 @@ zenith-v2/
 
 ## 技术栈
 
-- **后端**: Python FastAPI + SQLite (peewee ORM)
-- **前端**: React + TypeScript + Vite
-- **设计**: Dracula 主题 (Shinsekai 设计系统)
-- **LLM**: 兼容 OpenAI Chat Completions API
+- **技术栈**: Python FastAPI + SQLite + React + TypeScript + Vite
+- **LLM**: DeepSeek v4 Pro（兼容 OpenAI Chat Completions API）
 
 ## License
 
