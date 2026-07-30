@@ -286,6 +286,8 @@ def _semantic_similarity(a: str, b: str) -> float:
 
 def _legacy_jaccard(a: str, b: str) -> float:
     """降级：字符级 Jaccard bigram 相似度"""
+    if not a or not b:
+        return 0.0
     set_a = set(a[i:i+2] for i in range(len(a) - 1))
     set_b = set(b[i:i+2] for i in range(len(b) - 1))
     if not set_a or not set_b:
@@ -330,13 +332,16 @@ def mem_consolidate():
     for i, m in enumerate(recent):
         if m["id"] in seen_ids:
             continue
+        content = m.get("content") or ""
+        if not content:
+            continue
 
         # 用关键词搜索候选（非全量比对）
         keywords = m.get("keywords", "")
         if keywords:
             candidates = mem_search(keywords.split(",")[0], limit=10)
         else:
-            candidates = mem_search(m["content"][:20], limit=10)
+            candidates = mem_search(content[:20], limit=10)
 
         for other in candidates:
             if other["id"] == m["id"] or other["id"] in seen_ids:
@@ -344,7 +349,10 @@ def mem_consolidate():
             if other.get("type") != m.get("type"):
                 continue
 
-            sim = _similarity(m["content"], other["content"])
+            other_content = other.get("content") or ""
+            if not other_content:
+                continue
+            sim = _similarity(content, other_content)
             if sim >= 0.7:
                 keeper = m if m["importance"] >= other["importance"] else other
                 to_del = other if m["importance"] >= other["importance"] else m
