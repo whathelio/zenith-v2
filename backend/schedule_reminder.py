@@ -90,10 +90,12 @@ def get_due_reminders() -> dict:
 
         remind_before = int(s.get("remind_before") or 0)
 
-        # 已逾期
+        # 已逾期（仅显示最近 7 天内的，避免旧任务永久悬挂）
         if start < now:
             if s.get("status") not in ("done", "cancelled"):
-                overdue.append(s)
+                age = now - start
+                if age < timedelta(days=7):
+                    overdue.append(s)
             continue
 
         # remind_before 提醒
