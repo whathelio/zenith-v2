@@ -29,17 +29,18 @@ export default function DashboardView() {
     let alive = true
     ;(async () => {
       try {
-        const [conv, notes, memories, skills] = await Promise.all([
+        const [conv, notes, memories] = await Promise.all([
           api.listConversations(),
           api.listNotes(),
           api.listMemories(),
-          api.listSkills(),
         ])
         if (!alive) return
+        let skills = 0
+        try { skills = (await api.listSkills()).length } catch {}
         let kb = '离线'
         try { const h = await api.knowledgeHealth(); kb = h.status === 'ok' ? '就绪' : '异常' } catch { kb = '离线' }
         if (!alive) return
-        setStats({ conv: conv.length, notes: notes.length, memories: memories.length, skills: skills.length, kb })
+        setStats({ conv: conv.length, notes: notes.length, memories: memories.length, skills, kb })
       } catch {
         setStats(s => ({ ...s, kb: '离线' }))
       }
