@@ -64,7 +64,7 @@ def is_port_open(host: str, port: int) -> bool:
         return False
 
 
-def wait_for_server(timeout: float = 15.0) -> bool:
+def wait_for_server(timeout: float = 30.0) -> bool:
     """等待服务器就绪，返回是否成功"""
     start = time.time()
     while time.time() - start < timeout:
@@ -127,7 +127,7 @@ def main():
     if wait_for_server():
         log("Server ready")
     else:
-        log("Server timeout (15s), opening browser anyway")
+        log("Server timeout (30s), opening browser anyway")
 
     # 打开浏览器
     webbrowser.open(URL)
