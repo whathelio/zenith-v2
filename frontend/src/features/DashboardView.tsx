@@ -10,7 +10,7 @@ const WK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'
 export default function DashboardView() {
   const { todayStr, data, loading } = useCalendarGoal()
   const navigate = useNavigate()
-  const [stats, setStats] = useState({ conv: 0, notes: 0, memories: 0, skills: 0, kb: '检测中' })
+  const [stats, setStats] = useState({ conv: 0, notes: 0, memories: 0, skills: 0, mcp: 0, kb: '检测中' })
   const [localCal, setLocalCal] = useState<CalendarData | null>(null)
 
   // 当天日程：优先用 AppLayout 已加载的 context 数据
@@ -35,12 +35,12 @@ export default function DashboardView() {
           api.listMemories(),
         ])
         if (!alive) return
-        let skills = 0
-        try { skills = (await api.listSkills()).length } catch {}
+        let skills = 0; let mcp = 0
+        try { const s = await api.getModulesStats(); skills = s.skills; mcp = s.mcp_enabled } catch {}
         let kb = '离线'
         try { const h = await api.knowledgeHealth(); kb = h.status === 'ok' ? '就绪' : '异常' } catch { kb = '离线' }
         if (!alive) return
-        setStats({ conv: conv.length, notes: notes.length, memories: memories.length, skills, kb })
+        setStats({ conv: conv.length, notes: notes.length, memories: memories.length, skills, mcp, kb })
       } catch {
         setStats(s => ({ ...s, kb: '离线' }))
       }
@@ -60,6 +60,7 @@ export default function DashboardView() {
     { key: 'notes', name: '笔记', path: '/notes', color: '#bd93f9', icon: 'note', badge: String(stats.notes), desc: 'AI 智能分类、内容互转与 Markdown 渲染' },
     { key: 'memories', name: '记忆库', path: '/memories', color: '#ffb86c', icon: 'memory', badge: String(stats.memories), desc: '自动蒸馏提取、多维分类与记忆整理' },
     { key: 'skills', name: '技能卡片', path: '/skills', color: '#ff79c6', icon: 'skill', badge: String(stats.skills), desc: '可复用操作流程，AI 自动匹配场景' },
+    { key: 'mcp', name: 'MCP 服务', path: '/library?tab=mcp', color: '#8be9fd', icon: 'knowledge', badge: `${stats.mcp} 在线`, desc: '外部 MCP 工具服务配置与状态' },
     { key: 'knowledge', name: '知识库', path: '/knowledge', color: '#f1fa8c', icon: 'knowledge', badge: stats.kb, desc: 'PDF 入库 + 向量检索 + 上下文增强' },
   ]
 

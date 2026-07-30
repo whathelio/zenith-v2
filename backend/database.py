@@ -420,21 +420,6 @@ CREATE TABLE IF NOT EXISTS market_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_market_date ON market_reports(report_date);
 
-CREATE TABLE IF NOT EXISTS skills (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    trigger_scene TEXT NOT NULL,
-    steps TEXT DEFAULT '[]',
-    tags TEXT DEFAULT '[]',
-    usage_count INTEGER DEFAULT 0,
-    confirmed_by_user INTEGER DEFAULT 0,
-    source_conv_id TEXT DEFAULT '',
-    created_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
-CREATE INDEX IF NOT EXISTS idx_skills_confirmed ON skills(confirmed_by_user);
-
 -- 预测追踪表
 CREATE TABLE IF NOT EXISTS market_predictions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -708,6 +693,12 @@ def mem_search(keyword: str = "", limit: int = 30) -> list:
 def mem_del(mid: int):
     with db() as c:
         c.execute("DELETE FROM memories WHERE id = ?", (mid,))
+
+
+def mem_get(mid: int) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM memories WHERE id = ?", (mid,)).fetchone()
+    return dict(r) if r else None
 
 
 def mem_for_inject(limit: int = 20) -> list:

@@ -123,6 +123,9 @@ DEFAULT_CONFIG = {
         "log_path": "data/audit/",
         "retention_days": 90,
     },
+
+    # MCP 服务器配置
+    "mcp_servers": [],
 }
 
 

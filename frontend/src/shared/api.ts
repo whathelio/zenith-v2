@@ -325,6 +325,26 @@ interface SkillSuggestion {
   reason?: string
 }
 
+interface McpServer {
+  name: string
+  url: string
+  enabled: boolean
+}
+
+interface ModuleSkill {
+  id: number
+  name: string
+  trigger_scene: string
+  steps: string[]
+  tags: string[]
+  usage_count: number
+  confirmed_by_user: number
+  source_conv_id: string
+  created_at: string
+  importance: number
+  content: string
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, {
     headers: { 'Content-Type': 'application/json' },
@@ -568,31 +588,23 @@ export const api = {
   verifyPredictions: () =>
     request<{ success: boolean; total: number; hit: number; miss: number; hit_rate: number; details: any[] }>('/market/predictions/verify', { method: 'POST' }),
 
-  // Skills
-  listSkills: (search = '', confirmed = -1) =>
-    request<Skill[]>(`/skills?search=${encodeURIComponent(search)}&confirmed=${confirmed}`),
-  createSkill: (data: Partial<Skill>) =>
-    request<{ success: boolean; id: number } & Skill>('/skills', { method: 'POST', body: JSON.stringify(data) }),
-  getSkill: (id: number) =>
-    request<Skill>(`/skills/${id}`),
-  updateSkill: (id: number, data: Partial<Skill>) =>
-    request<{ success: boolean } & Skill>(`/skills/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  // Skills (from memories via /api/modules/skills)
+  listSkills: (search = '') =>
+    request<ModuleSkill[]>(`/modules/skills?search=${encodeURIComponent(search)}`),
   deleteSkill: (id: number) =>
-    request<{ success: boolean }>(`/skills/${id}`, { method: 'DELETE' }),
-  confirmSkill: (id: number) =>
-    request<{ success: boolean } & Skill>(`/skills/${id}/confirm`, { method: 'POST' }),
-  useSkill: (id: number) =>
-    request<{ success: boolean } & Skill>(`/skills/${id}/use`, { method: 'POST' }),
-  matchSkills: (scene: string) =>
-    request<Skill[]>(`/skills/match?scene=${encodeURIComponent(scene)}`),
+    request<{ success: boolean }>(`/modules/skills/${id}`, { method: 'DELETE' }),
 
-  // ── Skill 反馈迭代 ──
-  feedbackSkill: (id: number, content: string, rating: number) =>
-    request<{ success: boolean; memory_id: number }>(`/skills/${id}/feedback`, { method: 'POST', body: JSON.stringify({ content, rating }) }),
-  getSkillSuggestions: (id: number) =>
-    request<SkillSuggestion>(`/skills/${id}/suggestions`),
-  improveSkill: (id: number, steps: string[]) =>
-    request<{ success: boolean } & Skill>(`/skills/${id}/improve`, { method: 'POST', body: JSON.stringify({ steps }) }),
+  // MCP Configurations
+  listMcpServers: () =>
+    request<{ servers: McpServer[]; count: number }>('/modules/mcp'),
+  addMcpServer: (data: { name: string; url: string; enabled?: boolean }) =>
+    request<{ success: boolean; server: McpServer }>('/modules/mcp', { method: 'POST', body: JSON.stringify(data) }),
+  deleteMcpServer: (name: string) =>
+    request<{ success: boolean }>(`/modules/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Modules Stats (for dashboard)
+  getModulesStats: () =>
+    request<{ skills: number; mcp_servers: number; mcp_enabled: number }>('/modules/stats'),
 
   // ── Transform API ── 记忆/笔记/行程互转
   transform: (sourceType: string, sourceId: number, targetType: string) =>
@@ -630,4 +642,4 @@ export const api = {
   },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion, ModuleSkill, McpServer }
