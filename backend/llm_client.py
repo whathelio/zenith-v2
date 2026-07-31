@@ -1,11 +1,14 @@
-"""Zenith v2 LLM 客户端 — 支持流式对话 + Function Calling"""
+"""Zenith v2 LLM 客户端 — 支持流式对话 + Function Calling + 多 Provider"""
 from __future__ import annotations
 
 import json
 import logging
 import httpx
 from typing import AsyncGenerator, Optional
-from .config import load_config, get_api_base, get_api_key, get_model
+from .config import (
+    load_config, get_provider, get_provider_api_key,
+    get_background_provider,
+)
 
 logger = logging.getLogger("zenith.llm")
 
@@ -15,25 +18,59 @@ async def chat_stream(
     tools: Optional[list[dict]] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    provider_name: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
-    SSE 流式对话。
-    Yields: {"type":"text","content":"..."} | {"type":"tool_call","name":"...","args":{...}}
+    SSE 流式对话，支持多 Provider 路由。
+
+    参数:
+        messages: 对话消息列表（OpenAI 格式）
+        tools: Function calling 工具定义
+        temperature: 温度（覆盖 provider 默认值）
+        max_tokens: 最大 token 数（覆盖 provider 默认值）
+        provider_name: 指定 provider 名称，空则用 default_provider
+
+    Yields:
+        {"type":"text","content":"..."} | {"type":"tool_call","name":"...","args":{...}}
     """
     cfg = load_config()
-    base_url = get_api_base()
-    api_key = get_api_key()
-    model = get_model()
+    provider = get_provider(provider_name)
+    provider_type = provider.get("type", "openai")
+    api_key = get_provider_api_key(provider)
+    model = provider.get("model", "")
+    base_url = provider.get("api_base", "").rstrip("/")
 
     if not api_key:
-        yield {"type": "text", "content": "\n\n> ⚠ 请先配置 API Key：设置 → 填入 API Key"}
+        yield {"type": "text", "content": f"\n\n> ⚠ Provider '{provider['name']}' 未配置 API Key"}
         return
 
+    # 根据 provider 类型分发
+    if provider_type == "anthropic":
+        async for event in _chat_stream_anthropic(
+            provider, api_key, model, base_url, messages, tools,
+            temperature, max_tokens, cfg
+        ):
+            yield event
+    else:
+        # openai 兼容（DeepSeek / SiliconFlow / Ollama 等）
+        async for event in _chat_stream_openai(
+            api_key, model, base_url, messages, tools,
+            temperature, max_tokens, cfg
+        ):
+            yield event
+
+
+async def _chat_stream_openai(
+    api_key: str, model: str, base_url: str,
+    messages: list[dict], tools: Optional[list[dict]],
+    temperature: Optional[float], max_tokens: Optional[int],
+    cfg: dict,
+) -> AsyncGenerator[dict, None]:
+    """OpenAI 兼容格式流式调用"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-
     payload = {
         "model": model,
         "messages": messages,
@@ -41,7 +78,6 @@ async def chat_stream(
         "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", 4096),
         "stream": True,
     }
-    # GLM-5.2 默认开启 thinking 会消耗大量 token 导致 content 为空，显式禁用
     if "glm" in model.lower():
         payload["thinking"] = {"type": "disabled"}
     if tools:
@@ -70,6 +106,11 @@ async def chat_stream(
                         content = delta.get("content", "")
                         if content:
                             yield {"type": "text", "content": content}
+
+                        # DeepSeek 等模型返回 reasoning_content — 思考过程
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning:
+                            yield {"type": "thinking", "content": reasoning}
 
                         tc = delta.get("tool_calls")
                         if tc:
@@ -109,22 +150,145 @@ async def chat_stream(
         yield {"type": "text", "content": f"\n\n> ❌ 连接错误: {e}"}
 
 
+async def _chat_stream_anthropic(
+    provider: dict, api_key: str, model: str, base_url: str,
+    messages: list[dict], tools: Optional[list[dict]],
+    temperature: Optional[float], max_tokens: Optional[int],
+    cfg: dict,
+) -> AsyncGenerator[dict, None]:
+    """Anthropic Messages API 流式调用"""
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+    # 提取 system message（Anthropic 要求放在顶层）
+    system_parts = []
+    conv_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_parts.append(m["content"])
+        else:
+            conv_messages.append(m)
+
+    payload: dict = {
+        "model": model,
+        "messages": conv_messages,
+        "max_tokens": max_tokens or cfg.get("max_tokens", 4096),
+        "stream": True,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+    # Anthropic tool 格式转换
+    if tools:
+        anthropic_tools = []
+        for t in tools:
+            fn = t.get("function", {})
+            anthropic_tools.append({
+                "name": fn.get("name", t.get("name", "")),
+                "description": fn.get("description", t.get("description", "")),
+                "input_schema": fn.get("parameters", t.get("parameters", {"type": "object", "properties": {}})),
+            })
+        payload["tools"] = anthropic_tools
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST", f"{base_url}/messages",
+                headers=headers, json=payload
+            ) as resp:
+                resp.raise_for_status()
+
+                current_tool = {}
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    etype = event.get("type", "")
+                    if etype == "content_block_delta":
+                        delta = event.get("delta", {})
+                        d_type = delta.get("type", "")
+                        if d_type == "text_delta":
+                            yield {"type": "text", "content": delta.get("text", "")}
+                        elif d_type == "thinking_delta":
+                            # Anthropic extended thinking — 思考过程
+                            yield {"type": "thinking", "content": delta.get("thinking", "")}
+                        elif d_type == "input_json_delta":
+                            partial = delta.get("partial_json", "")
+                            if partial:
+                                current_tool.setdefault("args", "")
+                                current_tool["args"] += partial
+                    elif etype == "content_block_start":
+                        block = event.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            current_tool = {
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "args": "",
+                            }
+                    elif etype == "content_block_stop":
+                        if current_tool.get("name"):
+                            try:
+                                args = json.loads(current_tool["args"])
+                            except (json.JSONDecodeError, TypeError):
+                                args = {}
+                            yield {
+                                "type": "tool_call",
+                                "name": current_tool["name"],
+                                "args": args,
+                                "id": current_tool.get("id", ""),
+                            }
+                        current_tool = {}
+                    elif etype == "message_stop":
+                        break
+
+    except httpx.ConnectError:
+        yield {"type": "text", "content": f"\n\n> ❌ 无法连接到 {base_url}"}
+    except httpx.HTTPStatusError as e:
+        yield {"type": "text", "content": f"\n\n> ❌ API 错误 ({e.response.status_code})"}
+    except Exception as e:
+        yield {"type": "text", "content": f"\n\n> ❌ 连接错误: {e}"}
+
+
 async def call_llm(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
     temperature: float = 0.7,
     max_tokens: int = 2000,
     response_format: Optional[dict] = None,
+    use_background: bool = False,
 ) -> dict:
-    """非流式 LLM 调用，用于记忆提取、日程分析等后台任务"""
-    cfg = load_config()
-    base_url = get_api_base()
-    api_key = get_api_key()
-    model = get_model()
+    """非流式 LLM 调用，用于记忆提取、日程分析等后台任务。
+
+    参数:
+        use_background: True 时使用 background_provider（便宜模型），
+                        False 时使用 default_provider（前台模型）。
+    """
+    provider = get_background_provider() if use_background else get_provider()
+    api_key = get_provider_api_key(provider)
+    model = provider.get("model", "")
+    base_url = provider.get("api_base", "").rstrip("/")
+    provider_type = provider.get("type", "openai")
 
     if not api_key:
-        return {"role": "assistant", "content": "API Key 未配置"}
+        return {"role": "assistant", "content": f"Provider '{provider['name']}' 未配置 API Key"}
 
+    if provider_type == "anthropic":
+        return await _call_llm_anthropic(
+            provider, api_key, model, base_url, messages, tools,
+            temperature, max_tokens
+        )
+
+    # OpenAI 兼容格式
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -137,7 +301,6 @@ async def call_llm(
         "max_tokens": max_tokens,
         "stream": False,
     }
-    # GLM-5.2 禁用 thinking 避免 token 被 reasoning 耗尽
     if "glm" in model.lower():
         payload["thinking"] = {"type": "disabled"}
     if tools:
@@ -154,6 +317,67 @@ async def call_llm(
             r.raise_for_status()
             data = r.json()
             return data["choices"][0]["message"]
+    except Exception as e:
+        return {"role": "assistant", "content": f"Error: {e}"}
+
+
+async def _call_llm_anthropic(
+    provider: dict, api_key: str, model: str, base_url: str,
+    messages: list[dict], tools: Optional[list[dict]],
+    temperature: float, max_tokens: int,
+) -> dict:
+    """Anthropic 非流式调用"""
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+    # 提取 system message
+    system_parts = []
+    conv_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_parts.append(m["content"])
+        else:
+            conv_messages.append(m)
+
+    payload: dict = {
+        "model": model,
+        "messages": conv_messages,
+        "max_tokens": max_tokens,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+    if temperature:
+        payload["temperature"] = temperature
+
+    if tools:
+        anthropic_tools = []
+        for t in tools:
+            fn = t.get("function", {})
+            anthropic_tools.append({
+                "name": fn.get("name", t.get("name", "")),
+                "description": fn.get("description", t.get("description", "")),
+                "input_schema": fn.get("parameters", t.get("parameters", {"type": "object", "properties": {}})),
+            })
+        payload["tools"] = anthropic_tools
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{base_url}/messages",
+                headers=headers, json=payload
+            )
+            r.raise_for_status()
+            data = r.json()
+            # Anthropic 响应转 OpenAI 格式
+            content_blocks = data.get("content", [])
+            text_parts = []
+            for block in content_blocks:
+                if block.get("type") == "text":
+                    text_parts.append(block["text"])
+            return {"role": "assistant", "content": "\n".join(text_parts)}
     except Exception as e:
         return {"role": "assistant", "content": f"Error: {e}"}
 

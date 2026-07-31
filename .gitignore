@@ -24,12 +24,24 @@ data/.deps_installed
 data/logs/
 data/distill/
 data/code_temp/
+data/audit/
 
 # Config (may contain API keys)
 config/config.yaml
+config/mcp_overrides.json
 
 # Environment secrets
 .env
+
+# 脱敏映射表（{{SEC_xxx}} ↔ 明文，绝不上传）
+tools/secure_map.json
+tools/*.map.json
+
+# 临时/调试文件
+out.txt
+_aux*.py
+端口
+进程名*）*
 
 # IDE
 .vscode/

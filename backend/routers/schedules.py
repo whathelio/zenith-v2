@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Body, Request
 from .. import database as db
 from ..schedule_reminder import get_due_reminders
+from ..validators.sanitize_guard import guard_store
 
 router = APIRouter(tags=["schedules"])
 
@@ -33,6 +34,10 @@ async def create_schedule(request: Request):
     data = await request.json() or {}
     if not data.get("title"):
         raise HTTPException(400, "title 为必填字段")
+    # 落库守卫：拒绝明文密钥写入知识库
+    risk = guard_store(f"{data.get('title', '')}\n{data.get('description', '')}")
+    if risk:
+        raise HTTPException(400, risk["message"])
     data["source"] = data.get("source", "manual")
     start_time = data.get("start_time", "")
     if start_time:
@@ -53,6 +58,10 @@ async def update_schedule(sid: int, data: dict = Body(default=None)):
     old = db.sch_get(sid)
     if not old:
         raise HTTPException(404, "日程不存在")
+    if data:
+        risk = guard_store(f"{data.get('title', '')}\n{data.get('description', '')}")
+        if risk:
+            raise HTTPException(400, risk["message"])
     if data.get("apply_to") == "instance" and old.get("recurrence"):
         instance = dict(old)
         instance.pop("id", None)
@@ -74,7 +83,9 @@ async def update_schedule(sid: int, data: dict = Body(default=None)):
                 target = float(g.get("target_value", 1))
                 daily = float(g.get("daily_target", 5))
                 if strategy == "linear":
-                    db.goal_update(goal_id, {"current_value": current + daily})
+                    # daily_target 统一按百分比理解：线性策略的每日固定增量 = 起始值 × 日化率
+                    base = float(g.get("start_value") or current)
+                    db.goal_update(goal_id, {"current_value": current + base * daily / 100})
                 elif strategy == "compound":
                     db.goal_update(goal_id, {"current_value": current * (1 + daily / 100)})
     return {"success": True}

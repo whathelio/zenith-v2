@@ -75,28 +75,39 @@ def _build_wrapper(code: str) -> str:
 
 
 def _parse_output(stdout_text: str, stderr_text: str = "") -> dict:
-    """解析带 __STDOUT__/__STDERR__ 分隔符的输出。返回 {"success", "output"}。
-
-    success 由调用方根据 returncode 设置；这里只负责 output 文本。
+    """解析带 __STDOUT__/__STDERR__ 分隔符的输出。返回结构化结果：
+    {"success", "output", "stdout", "stderr", "exit_code", "lang"}
     """
+    out, err = "", ""
     if "__STDOUT__" in stdout_text:
         _, _, rest = stdout_text.partition("__STDOUT__")
         if "__STDERR__" in rest:
             out, _, err = rest.partition("__STDERR__")
         else:
             out, err = rest, ""
-        final = out.strip()
-        if err.strip():
-            final += f"\n\n[stderr]\n{err.strip()}"
     else:
-        final = stdout_text.strip()
+        out = stdout_text
         if stderr_text:
-            final += f"\n\n[stderr]\n{stderr_text}"
+            err = stderr_text
+
+    out = out.strip()
+    err = err.strip()
+
+    final = out
+    if err:
+        final += f"\n\n[stderr]\n{err}"
 
     if len(final) > MAX_OUTPUT_LEN:
         final = final[:MAX_OUTPUT_LEN] + "\n\n... (输出被截断)"
 
-    return {"success": True, "output": final or "(无输出)"}
+    return {
+        "success": True,
+        "output": final or "(无输出)",
+        "stdout": out,
+        "stderr": err,
+        "exit_code": None,
+        "lang": "python",
+    }
 
 
 def _static_safety_check(code: str) -> str | None:
@@ -166,7 +177,8 @@ async def _run_in_docker(code: str, timeout: int = 30) -> dict:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return {"success": False, "output": f"⏱ 执行超时 ({timeout}s)"}
+            return {"success": False, "output": f"⏱ 执行超时 ({timeout}s)",
+                    "stdout": "", "stderr": f"执行超时 ({timeout}s)", "exit_code": -1, "lang": "python"}
 
         out_text = stdout.decode("utf-8", errors="replace")
         err_text = stderr.decode("utf-8", errors="replace")
@@ -180,6 +192,7 @@ async def _run_in_docker(code: str, timeout: int = 30) -> dict:
 
         result = _parse_output(out_text, err_text)
         result["success"] = proc.returncode == 0
+        result["exit_code"] = proc.returncode
         if not result["success"] and not result["output"].strip():
             result["output"] = f"❌ 容器执行失败 (exit {proc.returncode})\n[stderr]\n{err_text[:1000]}"
         return result
@@ -256,7 +269,8 @@ async def _run_subprocess_hardened(code: str, timeout: int = 30) -> dict:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return {"success": False, "output": f"⏱ 执行超时 ({timeout}s)"}
+            return {"success": False, "output": f"⏱ 执行超时 ({timeout}s)",
+                    "stdout": "", "stderr": f"执行超时 ({timeout}s)", "exit_code": -1, "lang": "python"}
 
         out_text = stdout.decode("utf-8", errors="replace")
         err_text = stderr.decode("utf-8", errors="replace")
@@ -268,6 +282,7 @@ async def _run_subprocess_hardened(code: str, timeout: int = 30) -> dict:
 
         result = _parse_output(out_text, err_text)
         result["success"] = proc.returncode == 0
+        result["exit_code"] = proc.returncode
         return result
 
     except Exception as e:

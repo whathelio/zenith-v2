@@ -41,15 +41,16 @@ function recalcDailyTarget(g: Goal, newEndDate: string): number {
 function calcDailyGoalAmounts(g: Goal): Map<string, number> {
   const map = new Map<string, number>()
   const cv = g.current_value
-  const tv = g.target_value
   const rate = g.daily_target / 100
   if (rate <= 0 || cv <= 0 || !g.end_date) return map
   const todayDate = formatDate(new Date())
   const remainDays = Math.max(daysBetween(todayDate, g.end_date), 1)
+  // 第 i 天的「日化目标金额」= 当日应新增金额（复投）：cv × (1+rate)^i × rate
+  // 注意：这里算的是当日增量，不是累计余额——之前误用累计余额导致日历数字逐日暴涨、显示错乱
   for (let i = 0; i <= remainDays; i++) {
     const dateKey = addDaysStr(todayDate, i)
-    const expected = cv * Math.pow(1 + rate, i)
-    map.set(dateKey, Math.min(expected, tv))
+    const delta = cv * Math.pow(1 + rate, i) * rate
+    map.set(dateKey, delta)
   }
   return map
 }

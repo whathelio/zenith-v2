@@ -4,6 +4,7 @@ const BASE = '/api'
 interface Conversation {
   id: string
   title: string
+  persona_name?: string
   created_at: string
   updated_at: string
   msg_count: number
@@ -196,6 +197,26 @@ interface Settings {
   system_prompt: string
   context_compress_threshold: number
   memory_extract_interval: number
+  providers: Provider[]
+  default_provider: string
+  background_provider: string
+  personas: Persona[]
+  socratic_mode: boolean
+}
+
+interface Provider {
+  name: string
+  type: 'openai' | 'anthropic'
+  api_base: string
+  api_key: string
+  model: string
+}
+
+interface Persona {
+  name: string
+  system_prompt: string
+  tone: string
+  style: string
 }
 
 interface AnalysisDocument {
@@ -327,8 +348,48 @@ interface SkillSuggestion {
 
 interface McpServer {
   name: string
-  url: string
+  url?: string
   enabled: boolean
+  serverUrl?: string
+  command?: string
+  args?: string[]
+  headers?: Record<string, string>
+  description?: string
+  disabled?: boolean
+}
+
+interface ImportSkillResult extends Partial<ModuleSkill> {
+  success: boolean
+  id: number
+  source: string
+  name: string
+  mcp_required: string[]
+}
+
+interface ImportMcpResult {
+  success: boolean
+  server: McpServer
+  replaced: boolean
+  detection: { type: string; confident: boolean; note?: string }
+  source: string
+}
+
+interface SkillFileEntry {
+  name: string
+  directory: string
+  description: string
+  body: string
+  mcp_required: string[]
+  has_scripts: boolean
+  file_size: number
+  last_modified: string
+}
+
+interface ModulesStats {
+  skills: number
+  mcp_servers: number
+  mcp_enabled: number
+  skill_files?: number
 }
 
 interface ModuleSkill {
@@ -336,6 +397,7 @@ interface ModuleSkill {
   name: string
   trigger_scene: string
   steps: string[]
+  mcp_required?: string[]
   tags: string[]
   usage_count: number
   confirmed_by_user: number
@@ -361,28 +423,69 @@ export const api = {
   // Conversations
   listConversations: () => request<Conversation[]>('/conversations'),
   getConversation: (id: string) => request<Conversation>(`/conversations/${id}`),
-  createConversation: (title?: string) =>
+  createConversation: (title?: string, personaName?: string) =>
     request<Conversation>('/conversations', {
       method: 'POST',
-      body: JSON.stringify({ title: title || 'New Chat' }),
+      body: JSON.stringify({ title: title || 'New Chat', persona_name: personaName || '' }),
     }),
   deleteConversation: (id: string) =>
     request<{ success: boolean }>(`/conversations/${id}`, { method: 'DELETE' }),
-  renameConversation: (id: string, title: string) =>
-    request<{ success: boolean; title: string }>(`/conversations/${id}`, {
-      method: 'PUT', body: JSON.stringify({ title }),
-    }),
+  renameConversation: (id: string, title: string, personaName?: string) => {
+    const body: Record<string, string> = { title }
+    if (personaName !== undefined) body.persona_name = personaName
+    return request<{ success: boolean; title: string }>(`/conversations/${id}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    })
+  },
 
   // Chat (SSE via POST fetch)
-  chat: async (message: string, conversationId: string, signal?: AbortSignal) => {
+  chat: async (message: string, conversationId: string, signal?: AbortSignal, providerName?: string) => {
+    const body: Record<string, string> = { message, conversation_id: conversationId }
+    if (providerName) body.provider_name = providerName
     const res = await fetch(BASE + '/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, conversation_id: conversationId }),
+      body: JSON.stringify(body),
       signal,
     })
     return res
   },
+
+  // 重新生成最后一条 AI 回复（返回 SSE 流）
+  regenerate: async (conversationId: string, providerName?: string, signal?: AbortSignal) => {
+    const body: Record<string, string> = { conversation_id: conversationId }
+    if (providerName) body.provider_name = providerName
+    const res = await fetch(BASE + '/chat/regenerate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    })
+    return res
+  },
+
+  // 编辑消息并重新生成（user 消息返回 SSE 流；assistant 消息返回 JSON）
+  editMessage: async (conversationId: string, msgId: number, content: string, providerName?: string) => {
+    const body: Record<string, any> = { conversation_id: conversationId, msg_id: msgId, content }
+    if (providerName) body.provider_name = providerName
+    const res = await fetch(BASE + '/chat/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return res
+  },
+
+  // 删除消息及其后所有消息
+  deleteMessage: (msgId: number) =>
+    request<{ success: boolean; deleted: number }>(`/chat/messages/${msgId}`, { method: 'DELETE' }),
+
+  // 停止当前对话生成
+  stopChat: (conversationId: string) =>
+    request<{ success: boolean; stopped: boolean }>('/chat/stop', {
+      method: 'POST',
+      body: JSON.stringify({ conversation_id: conversationId }),
+    }),
 
   // Schedules
   listSchedules: (status = '') =>
@@ -593,18 +696,42 @@ export const api = {
     request<ModuleSkill[]>(`/modules/skills?search=${encodeURIComponent(search)}`),
   deleteSkill: (id: number) =>
     request<{ success: boolean }>(`/modules/skills/${id}`, { method: 'DELETE' }),
+  importSkillFile: (filePath: string) =>
+    request<ImportSkillResult>('/modules/skills/import-file', {
+      method: 'POST',
+      body: JSON.stringify({ file_path: filePath }),
+    }),
+  listSkillFiles: (dir = '') =>
+    request<{ skills_dir: string; count: number; skills: SkillFileEntry[] }>(
+      `/modules/skills/files${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`
+    ),
+  importSkillsFromDir: (dir = '') =>
+    request<{ scanned: number; imported: number; errors: number }>('/modules/skills/import', {
+      method: 'POST',
+      body: JSON.stringify({ dir }),
+    }),
 
   // MCP Configurations
   listMcpServers: () =>
-    request<{ servers: McpServer[]; count: number }>('/modules/mcp'),
-  addMcpServer: (data: { name: string; url: string; enabled?: boolean }) =>
+    request<{ servers: McpServer[]; count: number; enabled: number }>('/modules/mcp'),
+  addMcpServer: (data: { name: string; url?: string; serverUrl?: string; command?: string; args?: string[]; enabled?: boolean; description?: string }) =>
     request<{ success: boolean; server: McpServer }>('/modules/mcp', { method: 'POST', body: JSON.stringify(data) }),
+  updateMcpServer: (name: string, data: Partial<McpServer>) =>
+    request<{ success: boolean }>(`/modules/mcp/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   deleteMcpServer: (name: string) =>
     request<{ success: boolean }>(`/modules/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  importMcpFile: (filePath: string, options?: { name?: string; args?: string[]; description?: string; disabled?: boolean }) =>
+    request<ImportMcpResult>('/modules/mcp/import-file', {
+      method: 'POST',
+      body: JSON.stringify({ file_path: filePath, ...options }),
+    }),
 
   // Modules Stats (for dashboard)
   getModulesStats: () =>
-    request<{ skills: number; mcp_servers: number; mcp_enabled: number }>('/modules/stats'),
+    request<ModulesStats>('/modules/stats'),
 
   // ── Transform API ── 记忆/笔记/行程互转
   transform: (sourceType: string, sourceId: number, targetType: string) =>
@@ -642,4 +769,4 @@ export const api = {
   },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion, ModuleSkill, McpServer }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion, ModuleSkill, McpServer, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats }

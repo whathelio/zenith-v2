@@ -16,7 +16,7 @@ export function formatMoneyShort(v: number): string {
     return (v / 1e8).toFixed(1) + '亿'
   }
   if (v >= 10000) {
-    return (v / 10000).toFixed(1) + 'w'
+    return (v / 10000).toFixed(1) + '万'
   }
   return v.toFixed(0)
 }

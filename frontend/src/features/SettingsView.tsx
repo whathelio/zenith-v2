@@ -11,6 +11,11 @@ const defaultSettings: Settings = {
   system_prompt: '',
   context_compress_threshold: 20,
   memory_extract_interval: 5,
+  providers: [],
+  default_provider: '',
+  background_provider: '',
+  personas: [],
+  socratic_mode: true,
 }
 
 const PRESETS = [
@@ -232,7 +237,142 @@ export default function SettingsView() {
                 placeholder="定义 AI 助手的行为和角色..." />
             </div>
 
-            {/* 5. 高级 */}
+            {/* 5. Provider 管理 */}
+            <div className="settings-section">
+              <h3>Provider 管理</h3>
+              <div className="form-hint" style={{ marginBottom: 12 }}>
+                配置多个 LLM Provider，对话时可切换。openai 类型兼容 DeepSeek/SiliconFlow/Ollama；anthropic 类型使用 Claude API。
+              </div>
+              {settings.providers?.map((p, i) => (
+                <div key={i} style={{
+                  display: 'flex', gap: 8, marginBottom: 8, padding: 10,
+                  background: 'var(--color-bg-input)', borderRadius: 8,
+                  border: '1px solid var(--color-border)', flexWrap: 'wrap'
+                }}>
+                  <input className="form-input" style={{ width: 100 }} value={p.name}
+                    onChange={e => {
+                      const next = [...settings.providers]
+                      next[i] = { ...next[i], name: e.target.value }
+                      update('providers', next)
+                    }} placeholder="名称" />
+                  <select className="form-input" style={{ width: 90 }} value={p.type}
+                    onChange={e => {
+                      const next = [...settings.providers]
+                      next[i] = { ...next[i], type: e.target.value as 'openai' | 'anthropic' }
+                      update('providers', next)
+                    }}>
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                  </select>
+                  <input className="form-input" style={{ flex: 1, minWidth: 180 }} value={p.api_base}
+                    onChange={e => {
+                      const next = [...settings.providers]
+                      next[i] = { ...next[i], api_base: e.target.value }
+                      update('providers', next)
+                    }} placeholder="API 端点" />
+                  <input className="form-input" style={{ width: 130 }} value={p.model}
+                    onChange={e => {
+                      const next = [...settings.providers]
+                      next[i] = { ...next[i], model: e.target.value }
+                      update('providers', next)
+                    }} placeholder="模型名" />
+                  <input className="form-input" type="password" style={{ width: 140 }}
+                    value={p.api_key} placeholder="API Key"
+                    onChange={e => {
+                      const next = [...settings.providers]
+                      next[i] = { ...next[i], api_key: e.target.value }
+                      update('providers', next)
+                    }} />
+                  <button className="btn btn-sm" style={{ color: 'var(--color-accent-danger)' }}
+                    onClick={() => {
+                      const next = settings.providers.filter((_, j) => j !== i)
+                      update('providers', next)
+                    }}>✕</button>
+                </div>
+              ))}
+              <button className="btn btn-sm"
+                onClick={() => {
+                  const next = [...(settings.providers || []), { name: '', type: 'openai' as const, api_base: '', api_key: '', model: '' }]
+                  update('providers', next)
+                }}
+              >+ 添加 Provider</button>
+              <div className="form-row" style={{ marginTop: 12 }}>
+                <div className="form-group">
+                  <label className="form-label">默认 Provider（前台对话）</label>
+                  <select className="form-input" value={settings.default_provider}
+                    onChange={e => update('default_provider', e.target.value)}>
+                    <option value="">自动（第一个）</option>
+                    {settings.providers?.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">后台 Provider（蒸馏/记��提取）</label>
+                  <select className="form-input" value={settings.background_provider}
+                    onChange={e => update('background_provider', e.target.value)}>
+                    <option value="">自动（同默认）</option>
+                    {settings.providers?.map(p => <option key={p.name} value={p.name}>{p.name}</option>)}
+                  </select>
+                  <div className="form-hint">推荐用便宜模型（如 Ollama/qwen 或硅基流动免费模型）处理后台任务</div>
+                </div>
+              </div>
+            </div>
+
+            {/* 6. Persona 管理 */}
+            <div className="settings-section">
+              <h3>工作模式 (Persona)</h3>
+              <div className="form-hint" style={{ marginBottom: 12 }}>
+                不同的工作模式定义不同的助手语气和回答风格。对话中可选择，不选则使用默认模式。
+              </div>
+              {settings.personas?.map((p, i) => (
+                <div key={i} style={{
+                  display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 8,
+                  padding: 10, background: 'var(--color-bg-input)', borderRadius: 8,
+                  border: '1px solid var(--color-border)',
+                }}>
+                  <div style={{ flex: 1 }}>
+                    <input className="form-input" style={{ fontWeight: 600, marginBottom: 4 }} value={p.name}
+                      onChange={e => {
+                        const next = [...settings.personas]
+                        next[i] = { ...next[i], name: e.target.value }
+                        update('personas', next)
+                      }} placeholder="模式名称" />
+                    <textarea className="form-input" rows={3} value={p.system_prompt}
+                      onChange={e => {
+                        const next = [...settings.personas]
+                        next[i] = { ...next[i], system_prompt: e.target.value }
+                        update('personas', next)
+                      }} placeholder="系统提示词（定义语气和风格）" />
+                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                      <input className="form-input" style={{ width: 100 }} value={p.tone}
+                        onChange={e => {
+                          const next = [...settings.personas]
+                          next[i] = { ...next[i], tone: e.target.value }
+                          update('personas', next)
+                        }} placeholder="语气" />
+                      <input className="form-input" style={{ width: 120 }} value={p.style}
+                        onChange={e => {
+                          const next = [...settings.personas]
+                          next[i] = { ...next[i], style: e.target.value }
+                          update('personas', next)
+                        }} placeholder="风格" />
+                    </div>
+                  </div>
+                  <button className="btn btn-sm" style={{ color: 'var(--color-accent-danger)' }}
+                    onClick={() => {
+                      const next = settings.personas.filter((_, j) => j !== i)
+                      update('personas', next)
+                    }}>✕</button>
+                </div>
+              ))}
+              <button className="btn btn-sm"
+                onClick={() => {
+                  const next = [...(settings.personas || []), { name: '', system_prompt: '', tone: '', style: '' }]
+                  update('personas', next)
+                }}
+              >+ 添加 Persona</button>
+            </div>
+
+            {/* 7. 高级 */}
             <div className="settings-section">
               <h3>高级设置</h3>
               <div className="form-row">

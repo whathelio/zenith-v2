@@ -1,8 +1,9 @@
 @echo off
 chcp 65001 >nul
-cd /d "O:\下载文件\新建文件夹\zenith-v2"
 
-REM 启动 Zenith
-start "" ".venv\Scripts\pythonw.exe" "start.py" 8766
+REM Zenith v2 启动入口（兼容旧快捷方式）
+REM 实际逻辑已统一至 zenith.bat
 
+cd /d "%~dp0"
+call "%~dp0zenith.bat"
 exit

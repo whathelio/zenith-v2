@@ -124,8 +124,40 @@ DEFAULT_CONFIG = {
         "retention_days": 90,
     },
 
-    # MCP 服务器配置
-    "mcp_servers": [],
+    # MCP 服务器配置（仿 WorkBuddy mcp.json 格式）
+    "mcp_servers": [
+        {"name": "fact-check-mcp", "disabled": True, "serverUrl": "https://localhost/mcp/fact-check", "description": "事实核查验证"},
+        {"name": "code-verify-mcp", "disabled": True, "serverUrl": "https://localhost/mcp/code-verify", "description": "代码执行验证"},
+        {"name": "guard-mcp", "disabled": True, "serverUrl": "https://localhost/mcp/guard", "description": "执行门控验证"},
+    ],
+
+    # MCP 配置来源：优先读取 WorkBuddy 的真实 mcp.json（含 4 个 zenith-auditor 依赖项）
+    # 支持 ${ENV} 占位符（如 jin10 的 Bearer Token 应写为 "Bearer ${ZENITH_JIN10_API_TOKEN}"）
+    "mcp": {
+        "workbuddy_config_path": "~/.workbuddy/mcp.json",
+        # 若 mcp.json 缺失或为空，回退到上方 mcp_servers 占位
+        "prefer_workbuddy": True,
+    },
+
+    # 技能目录（仿 WorkBuddy ~/.workbuddy/skills/）
+    "skills_dir": "~/.workbuddy/skills",
+
+    # 多 Provider 配置
+    "default_provider": "",
+    "background_provider": "",
+    "providers": [
+        {
+            "name": "siliconflow",
+            "type": "openai",
+            "api_base": "https://api.siliconflow.cn/v1",
+            "api_key": "",
+            "model": "deepseek-ai/DeepSeek-V3",
+        },
+    ],
+
+    # Persona 配置
+    "personas": [],
+    "socratic_mode": True,
 }
 
 
@@ -178,6 +210,20 @@ def get_model() -> str:
     return load_config().get("model", DEFAULT_CONFIG["model"])
 
 
+def get_mcp_config_path() -> Path:
+    """返回 WorkBuddy mcp.json 的绝对路径（支持 ~ 展开与 ${ENV} 占位符）"""
+    cfg = load_config().get("mcp", {})
+    raw = cfg.get("workbuddy_config_path", "~/.workbuddy/mcp.json")
+    # 支持 ${ENV} 占位符
+    for key, val in os.environ.items():
+        raw = raw.replace(f"${{{key}}}", val)
+    return Path(raw).expanduser()
+
+
+def prefer_workbuddy_mcp() -> bool:
+    return bool(load_config().get("mcp", {}).get("prefer_workbuddy", True))
+
+
 def get_temperature() -> float:
     return float(load_config().get("temperature", DEFAULT_CONFIG["temperature"]))
 
@@ -223,3 +269,71 @@ def docker_available() -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         _DOCKER_AVAILABLE_CACHE = False
     return _DOCKER_AVAILABLE_CACHE
+
+
+# ===== Provider 管理 =====
+
+def get_providers() -> list[dict]:
+    """返回所有 provider 配置列表"""
+    return list(load_config().get("providers", []))
+
+
+def get_provider(name: str = "") -> dict:
+    """获取指定 provider 的完整配置。
+    name 为空时使用 default_provider；未找到时回退到 providers[0]。
+    """
+    cfg = load_config()
+    providers: list[dict] = cfg.get("providers", [])
+    if not providers:
+        raise RuntimeError(
+            "无可用 LLM Provider，请在 config.yaml 中配置 providers 数组"
+        )
+    if not name:
+        name = cfg.get("default_provider", "")
+    if name:
+        for p in providers:
+            if p.get("name") == name:
+                return dict(p)
+        import logging
+        logging.getLogger("zenith.config").warning(
+            "Provider '%s' 不存在，回退到 %s", name, providers[0].get("name", "unknown")
+        )
+    return dict(providers[0])
+
+
+def get_background_provider() -> dict:
+    """获取后台任务专用 provider（蒸馏/记忆提取/日程检测）。
+    若未配置 background_provider，自动回退到 default_provider。
+    """
+    cfg = load_config()
+    name = cfg.get("background_provider", "")
+    return get_provider(name)
+
+
+def get_provider_api_key(provider: dict) -> str:
+    """获取 provider 的 api_key，支持多层回退。
+    优先级：ZENITH_{NAME}_API_KEY > provider.api_key > ZENITH_LLM_API_KEY > 全局 api_key
+    """
+    pname = provider.get("name", "")
+    # 1. 该 provider 专属的环境变量
+    env_var = f"ZENITH_{pname.upper().replace('-', '_')}_API_KEY"
+    env_key = os.environ.get(env_var, "").strip()
+    if env_key:
+        return env_key
+    # 2. provider 配置中的 api_key
+    pk = provider.get("api_key", "").strip()
+    if pk:
+        return pk
+    # 3. 回退到全局 ZENITH_LLM_API_KEY（v2 旧版兼容）
+    global_env = os.environ.get("ZENITH_LLM_API_KEY", "").strip()
+    if global_env:
+        return global_env
+    # 4. 回退到 config.yaml 全局 api_key（旧设置页兼容）
+    cfg = load_config()
+    global_key = cfg.get("api_key", "").strip()
+    return global_key
+
+
+def get_personas() -> list[dict]:
+    """返回所有 Persona 配置列表"""
+    return list(load_config().get("personas", []))

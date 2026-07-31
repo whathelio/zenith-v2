@@ -1,34 +1,40 @@
-"""Zenith v2 Launcher — 纯 Python 启动器
-替代 zenith.bat，解决 cmd start 命令兼容性问题。
-双击 .pyw 不会弹出控制台窗口。
+"""Zenith v2 Launcher — start.py 友好入口（双击 .pyw 不弹控制台）
+
+v2（2026-07-31）：统一为 start.py 薄封装，消除与 zenith.bat 的行为差异。
+- 主服务启动 / 单实例锁 / 健康检查 / 打开浏览器 全部委托 start.py（含 --wait 一致的
+  浏览器冷却与知识库中台托管）
+- 本文件只做：前置检查 → 拉起 start.py → 等待健康 → 异常弹窗提示
+- 不再重复启动 api_gateway / task_worker（已由 start.py 统一幂等托管）
 """
 
 import subprocess
 import sys
 import os
 import time
-import webbrowser
-import socket
+import urllib.request
+import json
 import ctypes
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 PYTHONW = PROJECT_DIR / ".venv" / "Scripts" / "pythonw.exe"
+PYTHON = PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
 START_PY = PROJECT_DIR / "start.py"
-API_GATEWAY = PROJECT_DIR.parent / "api_gateway.py"
-TASK_WORKER = PROJECT_DIR.parent / "task_worker.py"
 CONFIG = PROJECT_DIR / "config" / "config.yaml"
 LOG_FILE = PROJECT_DIR / "launcher.log"
 
 PORT = 8766
-URL = f"http://localhost:{PORT}"
+HEALTH_URL = f"http://127.0.0.1:{PORT}/api/health"
 
 
 def log(msg: str):
     """写日志到文件"""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {msg}\n")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def show_error(msg: str):
@@ -55,22 +61,18 @@ def check_prerequisites() -> bool:
     return True
 
 
-def is_port_open(host: str, port: int) -> bool:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
-            return s.connect_ex((host, port)) == 0
-    except Exception:
-        return False
-
-
-def wait_for_server(timeout: float = 30.0) -> bool:
-    """等待服务器就绪，返回是否成功"""
-    start = time.time()
-    while time.time() - start < timeout:
-        if is_port_open("127.0.0.1", PORT):
-            return True
-        # 检查子进程是否还活着
+def wait_for_health(timeout: float = 30.0) -> bool:
+    """等待 /api/health 返回 ok（与 start.py 的健康检查口径一致）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(HEALTH_URL, timeout=1) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if data.get("status") == "ok":
+                        return True
+        except Exception:
+            pass
         time.sleep(0.5)
     return False
 
@@ -81,33 +83,9 @@ def main():
     if not check_prerequisites():
         sys.exit(1)
 
-    # 检测是否已有实例在运行
-    if is_port_open("127.0.0.1", PORT):
-        log("Server already running, opening browser")
-        webbrowser.open(URL)
-        sys.exit(0)
-
-    # 设置环境变量
+    # 启动主服务（start.py 负责单实例锁 / 健康检查 / 浏览器冷却 / 知识库中台托管）
     env = os.environ.copy()
     env["ZENITH_ROOT"] = str(PROJECT_DIR.parent)
-    env["ZENITH_API_KEY"] = "zenith-internal-v2"
-    env["KNOWLEDGE_API_KEY"] = "zenith-internal-v2"
-    env["ZENITH_RAG_EMBED_MODEL"] = str(PROJECT_DIR.parent / "bge-small-model")
-
-    # 从 config.yaml 提取 API key
-    try:
-        import yaml
-        with open(CONFIG, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-        if config:
-            for key, env_key in [("api_key", "LLM_API_KEY"), ("api_base", "LLM_BASE_URL"), ("model", "LLM_MODEL")]:
-                val = config.get(key, "")
-                if val:
-                    env[env_key] = str(val)
-    except Exception as e:
-        log(f"Config read warning: {e}")
-
-    # 启动主服务
     log(f"Starting server: {PYTHONW} {START_PY} {PORT}")
     try:
         proc = subprocess.Popen(
@@ -115,6 +93,8 @@ def main():
             cwd=str(PROJECT_DIR),
             env=env,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         log(f"Server PID: {proc.pid}")
     except Exception as e:
@@ -122,38 +102,12 @@ def main():
         show_error(f"启动服务器失败:\n{e}")
         sys.exit(1)
 
-    # 等待服务就绪
-    log("Waiting for server...")
-    if wait_for_server():
+    # 等待就绪（start.py 会在就绪后自行打开浏览器）
+    if wait_for_health():
         log("Server ready")
     else:
-        log("Server timeout (30s), opening browser anyway")
-
-    # 打开浏览器
-    webbrowser.open(URL)
-    log("Browser opened")
-
-    # 启动知识库 API 中台
-    if API_GATEWAY.exists():
-        time.sleep(1)
-        subprocess.Popen(
-            [str(PYTHONW), str(API_GATEWAY)],
-            cwd=str(PROJECT_DIR.parent),
-            env=env,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        log("Started API gateway")
-
-    # 启动异步任务 worker
-    if TASK_WORKER.exists():
-        time.sleep(1)
-        subprocess.Popen(
-            [str(PYTHONW), str(TASK_WORKER), "--poll", "2.0"],
-            cwd=str(PROJECT_DIR.parent),
-            env=env,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        log("Started task worker")
+        log("Server timeout (30s) — 请查看 zenith.log")
+        show_error("Zenith v2 未在 30 秒内就绪。\n请查看日志: zenith-v2\\zenith.log")
 
     log("Launcher done")
     sys.exit(0)

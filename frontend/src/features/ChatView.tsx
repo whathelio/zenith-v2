@@ -4,7 +4,7 @@ import ChatConvPanel from '../components/ChatConvPanel'
 import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
 import ProposalsBar from '../components/ProposalsBar'
-import ToolCallBubble, { type ToolCallEntry } from '../components/ToolCallBubble'
+import { toTraceEntry, type TraceEntry } from '../components/TraceCard'
 import { api, type Message, type Proposal, type ConversationSummary } from '../shared/api'
 import { takePendingMessage } from '../shared/pendingMessage'
 
@@ -26,7 +26,14 @@ export default function ChatView() {
   const [summarizing, setSummarizing] = useState(false)
   const [summaryResult, setSummaryResult] = useState<ConversationSummary | null>(null)
   const [convCollapsed, setConvCollapsed] = useState(false)
-  const [toolCallBubbles, setToolCallBubbles] = useState<ToolCallEntry[]>([])
+  const [toolCallBubbles, setToolCallBubbles] = useState<TraceEntry[]>([])
+  const [thinkingText, setThinkingText] = useState('')
+  const [thinkingStart, setThinkingStart] = useState<number | undefined>(undefined)
+  const [thinkingDone, setThinkingDone] = useState(false)
+  const [selectedProvider, setSelectedProvider] = useState('')
+  const [providers, setProviders] = useState<{ name: string; model: string }[]>([])
+  const [selectedPersona, setSelectedPersona] = useState('')
+  const [personas, setPersonas] = useState<{ name: string }[]>([])
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -52,6 +59,7 @@ export default function ChatView() {
       const conv = await api.getConversation(id)
       setActiveConv(conv)
       setMessages(conv.messages || [])
+      setSelectedPersona((conv as any).persona_name || '')
     } catch (e: any) {
       setError(e.message)
     }
@@ -60,6 +68,8 @@ export default function ChatView() {
   useEffect(() => {
     loadConversations()
     loadProposals()
+    loadProviders()
+    loadPersonas()
   }, [loadConversations])
 
   useEffect(() => {
@@ -86,7 +96,7 @@ export default function ChatView() {
 
   const handleNewChat = async () => {
     try {
-      const conv = await api.createConversation()
+      const conv = await api.createConversation(undefined, selectedPersona)
       await loadConversations()
       setMessages([])
       setActiveConv(conv)
@@ -124,13 +134,129 @@ export default function ChatView() {
     }
   }
 
-  const handleSend = async (text: string) => {
-    if (!text.trim() || isLoading) return
+  /** 重置一轮对话的临时状态（发送/重新生成/编辑前调用） */
+  const resetRoundState = () => {
     setError('')
     setReminder('')
     setProposals([])
     setToolCallBubbles([])
     setStreamingText('')
+    setThinkingText('')
+    setThinkingStart(undefined)
+    setThinkingDone(false)
+  }
+
+  /** SSE 流统一消费：text / thinking / tool_call / reminder / proposal ... */
+  const consumeSSE = useCallback(async (res: Response): Promise<string> => {
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('No response body')
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let assistantText = ''
+    let convIdRef = activeConv?.id || ''
+
+    abortRef.current?.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const dataStr = line.slice(6)
+          if (!dataStr) continue
+          try {
+            const data = JSON.parse(dataStr)
+
+            if (data.type === 'text') {
+              assistantText += data.content
+              setStreamingText(assistantText)
+            } else if (data.type === 'thinking') {
+              setThinkingStart(prev => prev || Date.now())
+              setThinkingText(prev => prev + (data.content || ''))
+            } else if (data.type === 'full_text') {
+              if (data.conversation_id && data.conversation_id !== convIdRef) {
+                convIdRef = data.conversation_id
+                navigate(`/chat/${data.conversation_id}`, { replace: true })
+              }
+            } else if (data.type === 'reminder') {
+              setReminder(data.content)
+              setReminderDismissed(false)
+            } else if (data.type === 'proposal') {
+              setProposals(prev => [...prev, data.data])
+            } else if (data.type === 'proposals') {
+              setProposals(data.proposals)
+            } else if (data.type === 'tool_results') {
+              loadProposals()
+            } else if (data.type === 'tool_call_start') {
+              setToolCallBubbles(prev => [...prev, toTraceEntry({
+                id: data.id,
+                name: data.name,
+                args: data.args || {},
+                status: 'pending',
+                round: data.round,
+              })])
+            } else if (data.type === 'tool_call_end') {
+              setToolCallBubbles(prev => prev.map(b =>
+                b.id === data.id ? {
+                  ...b,
+                  status: 'done',
+                  resultSummary: data.result_summary,
+                  durationMs: data.duration_ms,
+                  success: data.success,
+                  stdout: data.stdout,
+                  stderr: data.stderr,
+                  exitCode: data.exit_code,
+                  lang: data.lang,
+                } : b
+              ))
+            } else if (data.type === 'warning') {
+              // 校验警告 — 暂以静默方式展示在痕迹中
+            } else if (data.type === 'error') {
+              setError(data.message || '生成出错')
+            } else if (data.type === 'done') {
+              setThinkingDone(true)
+            }
+          } catch {
+            // skip malformed JSON
+          }
+        }
+      }
+    } catch (e: any) {
+      if (ac.signal.aborted) {
+        // 流被取消（用户停止 / 组件卸载）
+        return assistantText
+      }
+      setError(e.message)
+    } finally {
+      abortRef.current = null
+    }
+    return assistantText
+  }, [activeConv, navigate])
+
+  const appendAssistant = useCallback((convId: string, text: string) => {
+    if (!text.trim()) return
+    const assistantMsg: Message = {
+      id: ++_msgIdCounter,
+      conversation_id: convId,
+      role: 'assistant',
+      content: text,
+      created_at: new Date().toISOString(),
+    }
+    setMessages(prev => [...prev, assistantMsg])
+  }, [])
+
+  const handleSend = async (text: string) => {
+    if (!text.trim() || isLoading) return
+    resetRoundState()
 
     const userMsg: Message = {
       id: ++_msgIdCounter,
@@ -156,107 +282,105 @@ export default function ChatView() {
     }
 
     setIsLoading(true)
-    let assistantText = ''
-
-    // 创建 AbortController — 组件卸载时取消 fetch，但后端后台任务继续处理
-    abortRef.current?.abort()
-    const ac = new AbortController()
-    abortRef.current = ac
+    const convId = activeConv?.id || userMsg.conversation_id
 
     try {
-      const res = await api.chat(text, activeConv?.id || userMsg.conversation_id, ac.signal)
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response body')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const dataStr = line.slice(6)
-          if (!dataStr) continue
-          try {
-            const data = JSON.parse(dataStr)
-
-            if (data.type === 'text') {
-              assistantText += data.content
-              setStreamingText(assistantText)
-            } else if (data.type === 'full_text') {
-              // 后端发送完整文本和新对话 ID
-              if (data.conversation_id && data.conversation_id !== (activeConv?.id || userMsg.conversation_id)) {
-                navigate(`/chat/${data.conversation_id}`, { replace: true })
-              }
-            } else if (data.type === 'reminder') {
-              setReminder(data.content)
-              setReminderDismissed(false)
-            } else if (data.type === 'proposal') {
-              setProposals(prev => [...prev, data.data])
-            } else if (data.type === 'proposals') {
-              setProposals(data.proposals)
-            } else if (data.type === 'tool_results') {
-              // 工具结果 — 刷新提议列表
-              loadProposals()
-            } else if (data.type === 'tool_call_start') {
-              setToolCallBubbles(prev => [...prev, {
-                id: data.id,
-                name: data.name,
-                args: data.args || {},
-                status: 'pending',
-                round: data.round,
-              }])
-            } else if (data.type === 'tool_call_end') {
-              setToolCallBubbles(prev => prev.map(b =>
-                b.id === data.id ? {
-                  ...b,
-                  status: 'done',
-                  resultSummary: data.result_summary,
-                  durationMs: data.duration_ms,
-                  success: data.success,
-                } : b
-              ))
-            } else if (data.type === 'done') {
-              // done
-            }
-          } catch {
-            // skip malformed JSON
-          }
-        }
+      const res = await api.chat(text, convId, undefined, selectedProvider)
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }))
+        throw new Error(err.error || '请求失败')
       }
+      const assistantText = await consumeSSE(res)
+      appendAssistant(convId, assistantText)
     } catch (e: any) {
-      if (ac.signal.aborted) {
-        // SSE 流被取消（用户切换了模块）— 后端后台任务继续处理
-        // 返回后重新挂载时会从后端重新加载完整对话
-        return
-      }
       setError(e.message)
     } finally {
       setIsLoading(false)
-      abortRef.current = null
-    }
-
-    if (assistantText.trim()) {
-      const assistantMsg: Message = {
-        id: ++_msgIdCounter,
-        conversation_id: activeConv?.id || userMsg.conversation_id,
-        role: 'assistant',
-        content: assistantText,
-        created_at: new Date().toISOString(),
-      }
-      setMessages(prev => [...prev, assistantMsg])
-      setStreamingText('')
-    } else {
       setStreamingText('')
     }
 
     await loadConversations()
+  }
+
+  /** 重新生成最后一条 AI 回复 */
+  const handleRegenerate = async () => {
+    if (isLoading || !activeConv?.id) return
+    resetRoundState()
+    setIsLoading(true)
+    try {
+      const res = await api.regenerate(activeConv.id, selectedProvider)
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }))
+        throw new Error(err.error || '重新生成失败')
+      }
+      const assistantText = await consumeSSE(res)
+      // 后端已删除旧的 assistant 消息，重新拉取完整对话
+      await loadConversation(activeConv.id)
+      appendAssistant(activeConv.id, assistantText)
+    } catch (e: any) {
+      setError(e.message)
+      await loadConversation(activeConv.id)
+    } finally {
+      setIsLoading(false)
+      setStreamingText('')
+    }
+    await loadConversations()
+  }
+
+  /** 编辑消息（user 编辑触发重新生成；assistant 编辑仅保存） */
+  const handleEditMessage = async (msgId: number, content: string) => {
+    if (!activeConv?.id) return
+    resetRoundState()
+    setIsLoading(true)
+    try {
+      const res = await api.editMessage(activeConv.id, msgId, content, selectedProvider)
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }))
+        throw new Error(err.error || '编辑失败')
+      }
+      const ctype = res.headers.get('content-type') || ''
+      if (ctype.includes('text/event-stream')) {
+        const assistantText = await consumeSSE(res)
+        await loadConversation(activeConv.id)
+        appendAssistant(activeConv.id, assistantText)
+      } else {
+        // assistant 消息编辑 — 仅保存，刷新列表
+        await loadConversation(activeConv.id)
+      }
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setIsLoading(false)
+      setStreamingText('')
+    }
+    await loadConversations()
+  }
+
+  /** 删除消息（及之后所有消息） */
+  const handleDeleteMessage = async (msgId: number) => {
+    if (!activeConv?.id) return
+    try {
+      await api.deleteMessage(msgId)
+      await loadConversation(activeConv.id)
+      await loadConversations()
+    } catch (e: any) {
+      setError(e.message)
+    }
+  }
+
+  /** 停止当前生成 */
+  const handleStop = async () => {
+    abortRef.current?.abort()
+    try {
+      if (activeConv?.id) await api.stopChat(activeConv.id)
+    } catch { /* silent */ }
+    setIsLoading(false)
+    setStreamingText('')
+    setThinkingText('')
+    setThinkingDone(true)
+    setToolCallBubbles([])
+    // 后端不保存半成品 — 重新拉取真实状态
+    if (activeConv?.id) await loadConversation(activeConv.id)
   }
 
   const handleConfirm = async (type: string, id: number) => {
@@ -290,6 +414,33 @@ export default function ChatView() {
     try {
       const ps = await api.getProposals()
       setProposals(ps)
+    } catch {
+      // silent
+    }
+  }
+
+  const loadProviders = async () => {
+    try {
+      const s = await api.getSettings()
+      const ps = (s as any).providers
+      if (ps && Array.isArray(ps)) {
+        setProviders(ps.map((p: any) => ({ name: p.name, model: p.model })))
+        if (!selectedProvider && (s as any).default_provider) {
+          setSelectedProvider((s as any).default_provider)
+        }
+      }
+    } catch {
+      // silent
+    }
+  }
+
+  const loadPersonas = async () => {
+    try {
+      const s = await api.getSettings()
+      const ps = (s as any).personas
+      if (ps && Array.isArray(ps)) {
+        setPersonas(ps.map((p: any) => ({ name: p.name })))
+      }
     } catch {
       // silent
     }
@@ -347,6 +498,59 @@ export default function ChatView() {
         <div className="chat-toolbar">
           <span className="chat-title">{activeConv?.title || '新对话'}</span>
           <div className="chat-toolbar-actions">
+            {providers.length > 0 && (
+              <select
+                className="provider-select"
+                value={selectedProvider}
+                onChange={(e) => setSelectedProvider(e.target.value)}
+                style={{
+                  background: 'var(--color-bg-input)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: '6px',
+                  padding: '4px 8px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                }}
+              >
+                {providers.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name} ({p.model})
+                  </option>
+                ))}
+              </select>
+            )}
+            {personas.length > 0 && (
+              <select
+                className="persona-select"
+                value={selectedPersona}
+                onChange={async (e) => {
+                  const name = e.target.value
+                  setSelectedPersona(name)
+                  if (activeConv?.id) {
+                    try {
+                      await api.renameConversation(activeConv.id, activeConv.title || 'New Chat', name)
+                    } catch { /* silent */ }
+                  }
+                }}
+                style={{
+                  background: 'var(--color-bg-input)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: '6px',
+                  padding: '4px 8px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                }}
+              >
+                <option value="">默认模式</option>
+                {personas.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            )}
             {activeConv && messages.length >= 2 && (
               <button
                 className="btn btn-sm"
@@ -404,6 +608,12 @@ export default function ChatView() {
             isLoading={isLoading}
             onSend={handleSend}
             toolCallBubbles={toolCallBubbles}
+            thinkingText={thinkingText}
+            thinkingDone={thinkingDone}
+            thinkingStartTime={thinkingStart}
+            onRegenerate={handleRegenerate}
+            onEditMessage={handleEditMessage}
+            onDeleteMessage={handleDeleteMessage}
           />
           {error && (
             <div style={{ padding: '8px 24px', color: 'var(--color-accent-danger)', fontSize: 'var(--font-size-sm)' }}>
@@ -421,7 +631,7 @@ export default function ChatView() {
             onModify={handleModify}
           />
         )}
-        <ChatInput onSend={handleSend} isLoading={isLoading} />
+        <ChatInput onSend={handleSend} isLoading={isLoading} onStop={handleStop} />
       </div>
 
       {/* 总结结果模态框 */}

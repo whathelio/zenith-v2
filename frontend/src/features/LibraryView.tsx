@@ -2,6 +2,38 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { api, type Note, type Memory, type ModuleSkill, type McpServer } from '../shared/api'
 import { TransformButton } from '../components/TransformButton'
+import { lookupPlaceholder } from '../shared/security'
+
+/** 将 {{SEC_xxx}} 占位符渲染为可点击令牌（点击本地展开明文，不发送、不落盘） */
+function renderSecrets(text: string): string {
+  if (!text) return ''
+  // 先 HTML 转义，再替换占位符为令牌
+  const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return escaped.replace(
+    /\{\{(SEC_\d+)\}\}/g,
+    (_, key) =>
+      `<span class="secret-token" data-secret="${key}" title="点击展开原始值（仅本地）">&#128274; <span style="color:var(--color-accent-warning)">${key}</span><span class="secret-val" style="display:none;margin-left:6px;color:var(--color-accent-danger);font-size:11px;word-break:break-all;font-family:monospace;background:var(--color-bg-muted);padding:1px 4px;border-radius:3px;"></span></span>`
+  )
+}
+
+/** 点击 secret-token 展开/折叠明文（从 localStorage 读取，映射丢失则提示） */
+function handleSecretClick(e: React.MouseEvent<HTMLElement>) {
+  const token = (e.target as HTMLElement).closest('.secret-token') as HTMLElement
+  if (!token) return
+  e.stopPropagation()
+  const valEl = token.querySelector('.secret-val') as HTMLElement
+  if (!valEl) return
+  if (valEl.style.display === 'none' || !valEl.style.display) {
+    const key = token.getAttribute('data-secret') || ''
+    const raw = lookupPlaceholder(key)
+    valEl.textContent = raw || '(映射已丢失，仅存在于本地映射表)'
+    valEl.style.display = 'inline'
+    token.classList.add('revealed')
+  } else {
+    valEl.style.display = 'none'
+    token.classList.remove('revealed')
+  }
+}
 
 const MEMORY_TYPE_COLORS: Record<string, string> = {
   personal_info: '#8be9fd', preference: '#ff79c6', event: '#50fa7b',
@@ -26,12 +58,12 @@ export default function LibraryView() {
   const [searchParams, setSearchParams] = useSearchParams()
   const initialTab = (searchParams.get('tab') as Tab) || 'notes'
   const [activeTab, setActiveTab] = useState<Tab>(
-    ['notes', 'memories', 'skills'].includes(initialTab) ? initialTab : 'notes'
+    ['notes', 'memories', 'skills', 'mcp'].includes(initialTab) ? initialTab : 'notes'
   )
 
   useEffect(() => {
     const tab = searchParams.get('tab') as Tab
-    if (tab && ['notes', 'memories', 'skills'].includes(tab)) {
+    if (tab && ['notes', 'memories', 'skills', 'mcp'].includes(tab)) {
       setActiveTab(tab)
     }
   }, [searchParams])
@@ -81,6 +113,17 @@ export default function LibraryView() {
   const [mcpLoading, setMcpLoading] = useState(true)
   const [showMcpAdd, setShowMcpAdd] = useState(false)
   const [newMcp, setNewMcp] = useState({ name: '', url: '', enabled: true })
+
+  // Skill 导入
+  const [showSkillImport, setShowSkillImport] = useState(false)
+  const [skillImportPath, setSkillImportPath] = useState('')
+  const [skillImportLoading, setSkillImportLoading] = useState(false)
+  // MCP 文件导入
+  const [showMcpFileImport, setShowMcpFileImport] = useState(false)
+  const [mcpFileImportPath, setMcpFileImportPath] = useState('')
+  const [mcpFileImportName, setMcpFileImportName] = useState('')
+  const [mcpFileImportArgs, setMcpFileImportArgs] = useState('')
+  const [mcpFileImportLoading, setMcpFileImportLoading] = useState(false)
 
   const [toast, setToast] = useState<string | null>(null)
 
@@ -173,6 +216,62 @@ export default function LibraryView() {
   const handleDeleteMcp = async (name: string) => {
     if (!confirm(`删除 MCP 服务器 "${name}"？`)) return
     try { await api.deleteMcpServer(name); loadMcpServers(); showToast('已删除') } catch {}
+  }
+
+  const handleToggleMcp = async (name: string, enabled: boolean) => {
+    try {
+      await api.updateMcpServer(name, { enabled: !enabled })
+      loadMcpServers()
+      showToast(enabled ? '已禁用' : '已启用')
+    } catch {}
+  }
+
+  // Skill 文件导入
+  const handleImportSkillFile = async () => {
+    const path = skillImportPath.trim()
+    if (!path) { showToast('请输入文件路径'); return }
+    setSkillImportLoading(true)
+    try {
+      const result = await api.importSkillFile(path)
+      showToast(`已导入技能: ${result.name} ✓`)
+      setSkillImportPath('')
+      setShowSkillImport(false)
+      loadSkills()
+    } catch (e: any) {
+      showToast(`导入失败: ${e?.message || e}`)
+    } finally { setSkillImportLoading(false) }
+  }
+
+  // Skill 目录批量导入
+  const handleImportSkillsDir = async () => {
+    setSkillImportLoading(true)
+    try {
+      const result = await api.importSkillsFromDir()
+      showToast(`扫描 ${result.scanned} 个, 导入 ${result.imported} 个, 错误 ${result.errors} 个 ✓`)
+      setShowSkillImport(false)
+      loadSkills()
+    } catch (e: any) {
+      showToast(`导入失败: ${e?.message || e}`)
+    } finally { setSkillImportLoading(false) }
+  }
+
+  // MCP 文件导入
+  const handleImportMcpFile = async () => {
+    const path = mcpFileImportPath.trim()
+    if (!path) { showToast('请输入脚本路径'); return }
+    setMcpFileImportLoading(true)
+    try {
+      const opts: any = {}
+      if (mcpFileImportName.trim()) opts.name = mcpFileImportName.trim()
+      if (mcpFileImportArgs.trim()) opts.args = mcpFileImportArgs.split(/\s+/).filter(Boolean)
+      const result = await api.importMcpFile(path, opts)
+      showToast(`已注册 MCP: ${result.server.name} (${result.detection.type}) ${result.replaced ? '已更新' : ''} ✓`)
+      setMcpFileImportPath(''); setMcpFileImportName(''); setMcpFileImportArgs('')
+      setShowMcpFileImport(false)
+      loadMcpServers()
+    } catch (e: any) {
+      showToast(`注册失败: ${e?.message || e}`)
+    } finally { setMcpFileImportLoading(false) }
   }
 
   const tabs: { key: Tab; label: string; icon: string }[] = [
@@ -286,9 +385,15 @@ export default function LibraryView() {
                           <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>{n.title}</div>
                           {n.content && (
                             <>
-                              <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 3, lineHeight: 1.5, whiteSpace: 'pre-wrap' }}>
-                                {n.content.length > 150 && !expandedNoteIds.has(n.id) ? n.content.slice(0, 150) + '...' : n.content}
-                              </div>
+                              <div
+                                style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 3, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+                                onClick={handleSecretClick}
+                                dangerouslySetInnerHTML={{
+                                  __html: n.content.length > 150 && !expandedNoteIds.has(n.id)
+                                    ? renderSecrets(n.content.slice(0, 150) + '...')
+                                    : renderSecrets(n.content),
+                                }}
+                              />
                               {n.content.length > 150 && (
                                 <button className="btn btn-sm" style={{ marginTop: 3, fontSize: 10, padding: '1px 6px', color: 'var(--color-accent-primary)', background: 'transparent', border: 'none', cursor: 'pointer' }} onClick={() => toggleNoteExpand(n.id)}>
                                   {expandedNoteIds.has(n.id) ? '收起 ▲' : '展开 ▼'}
@@ -408,7 +513,57 @@ export default function LibraryView() {
         {/* ===== Skills Tab ===== */}
         {activeTab === 'skills' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <input value={skillSearch} onChange={e => setSkillSearch(e.target.value)} placeholder="搜索技能..." style={{ flex: 1, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }} />
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input value={skillSearch} onChange={e => setSkillSearch(e.target.value)} placeholder="搜索技能..." style={{ flex: 1, minWidth: 140, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }} />
+              <button
+                className="btn btn-sm"
+                style={{ background: 'var(--color-accent-primary)', color: '#000', whiteSpace: 'nowrap' }}
+                onClick={() => { setShowSkillImport(!showSkillImport); setSkillImportPath('') }}
+              >
+                {showSkillImport ? '取消' : '📥 导入本地 Skill'}
+              </button>
+            </div>
+
+            {/* 导入弹窗 */}
+            {showSkillImport && (
+              <div style={{ padding: 14, background: 'var(--color-bg-panel)', border: '1px solid var(--color-accent-primary)', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>导入本地 Skill 文件</div>
+
+                {/* 单文件导入 */}
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    value={skillImportPath}
+                    onChange={e => setSkillImportPath(e.target.value)}
+                    placeholder="SKILL.md 路径，如 ~/.workbuddy/skills/stock-analyzer/SKILL.md"
+                    style={{ flex: 1, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
+                  />
+                  <button
+                    className="btn btn-sm"
+                    style={{ background: '#50fa7b', color: '#000', whiteSpace: 'nowrap' }}
+                    onClick={handleImportSkillFile}
+                    disabled={skillImportLoading}
+                  >
+                    {skillImportLoading ? '导入中...' : '导入'}
+                  </button>
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>支持 SKILL.md 文件路径或所在目录路径</div>
+
+                {/* 分隔线 */}
+                <div style={{ borderTop: '1px solid var(--color-border)', margin: '4px 0' }} />
+
+                {/* 批量导入 */}
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)' }}>批量扫描导入（从 WorkBuddy skills 目录）</div>
+                <button
+                  className="btn btn-sm"
+                  style={{ background: '#bd93f9', color: '#000', alignSelf: 'flex-start' }}
+                  onClick={handleImportSkillsDir}
+                  disabled={skillImportLoading}
+                >
+                  {skillImportLoading ? '扫描中...' : '📂 扫描 ~/.workbuddy/skills/ 并导入全部'}
+                </button>
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--color-text-muted)' }}>
               <span>总计 {skills.length}</span>
             </div>
@@ -439,6 +594,25 @@ export default function LibraryView() {
                           <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
                             {skill.content || skill.trigger_scene}
                           </div>
+                          {skill.mcp_required && skill.mcp_required.length > 0 && (
+                            <div style={{ marginTop: 10 }}>
+                              <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)', marginBottom: 4 }}>依赖 MCP:</div>
+                              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                {skill.mcp_required.map(dep => {
+                                  const srv = mcpServers.find(m => m.name === dep)
+                                  const status = !srv ? 'missing' : (srv.enabled ? 'ok' : 'disabled')
+                                  const c = status === 'ok' ? '#50fa7b' : status === 'disabled' ? '#f1fa8c' : '#ff5555'
+                                  const label = status === 'ok' ? '已启用' : status === 'disabled' ? '已禁用' : '未安装'
+                                  return (
+                                    <span key={dep} title={label} style={{ fontSize: 10, padding: '2px 8px', borderRadius: 4, background: 'rgba(255,255,255,0.04)', border: `1px solid ${c}`, color: c, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: c }} />
+                                      {dep}
+                                    </span>
+                                  )
+                                })}
+                              </div>
+                            </div>
+                          )}
                           <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                             <button onClick={e => { e.stopPropagation(); handleDeleteSkill(skill.id) }} style={{ fontSize: 11, padding: '4px 10px', borderRadius: 5, background: 'rgba(255,85,85,0.12)', color: '#ff5555', border: '1px solid rgba(255,85,85,0.3)', cursor: 'pointer' }}>删除</button>
                           </div>
@@ -456,9 +630,12 @@ export default function LibraryView() {
         {/* ===== MCP Tab ===== */}
         {activeTab === 'mcp' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button className="btn btn-sm" style={{ background: 'var(--color-accent-primary)', color: '#000' }} onClick={() => setShowMcpAdd(!showMcpAdd)}>{showMcpAdd ? '取消' : '+ 添加 MCP 服务'}</button>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button className="btn btn-sm" style={{ background: 'var(--color-accent-primary)', color: '#000' }} onClick={() => { setShowMcpAdd(!showMcpAdd); if (showMcpFileImport) setShowMcpFileImport(false) }}>{showMcpAdd ? '取消' : '+ 手动添加'}</button>
+              <button className="btn btn-sm" style={{ background: '#bd93f9', color: '#000' }} onClick={() => { setShowMcpFileImport(!showMcpFileImport); if (showMcpAdd) setShowMcpAdd(false); setMcpFileImportPath(''); setMcpFileImportName(''); setMcpFileImportArgs('') }}>{showMcpFileImport ? '取消' : '📥 导入本地脚本'}</button>
             </div>
+
+            {/* 手动添加弹窗 */}
             {showMcpAdd && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 12, background: 'var(--color-bg-input)', borderRadius: 8 }}>
                 <input value={newMcp.name} onChange={e => setNewMcp({ ...newMcp, name: e.target.value })} placeholder="服务名称（如 fact-check）" style={{ fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-panel)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }} />
@@ -469,6 +646,43 @@ export default function LibraryView() {
                 <button className="btn btn-sm" style={{ background: '#50fa7b', color: '#000', alignSelf: 'flex-start' }} onClick={handleAddMcp}>保存</button>
               </div>
             )}
+
+            {/* 导入本地脚本弹窗 */}
+            {showMcpFileImport && (
+              <div style={{ padding: 14, background: 'var(--color-bg-panel)', border: '1px solid #bd93f9', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>导入本地 MCP 脚本</div>
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>自动检测运行时 (.py→Python, .js→Node.js, .sh→Bash) 并识别 stdio/HTTP 类型</div>
+                <input
+                  value={mcpFileImportPath}
+                  onChange={e => setMcpFileImportPath(e.target.value)}
+                  placeholder="脚本路径，如 ~/.workbuddy/skills/zenith-auditor/scripts/fact_check_mcp.py"
+                  style={{ fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
+                />
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    value={mcpFileImportName}
+                    onChange={e => setMcpFileImportName(e.target.value)}
+                    placeholder="名称（留空=从文件名推导）"
+                    style={{ flex: 1, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
+                  />
+                  <input
+                    value={mcpFileImportArgs}
+                    onChange={e => setMcpFileImportArgs(e.target.value)}
+                    placeholder="额外参数（空格分隔）"
+                    style={{ flex: 1, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
+                  />
+                </div>
+                <button
+                  className="btn btn-sm"
+                  style={{ background: '#50fa7b', color: '#000', alignSelf: 'flex-start' }}
+                  onClick={handleImportMcpFile}
+                  disabled={mcpFileImportLoading}
+                >
+                  {mcpFileImportLoading ? '注册中...' : '注册'}
+                </button>
+              </div>
+            )}
+
             <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
               <span>总计 {mcpServers.length} 个服务 | 已启用 {mcpServers.filter(s => s.enabled).length} 个</span>
             </div>
@@ -478,17 +692,29 @@ export default function LibraryView() {
               <div className="empty-state"><p style={{ fontSize: 13 }}>暂无 MCP 服务</p></div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {mcpServers.map(s => (
+                {mcpServers.map(s => {
+                  const addr = s.serverUrl || s.url || (s.command ? `${s.command}${s.args && s.args.length ? ' ' + s.args.join(' ') : ''}` : '(未配置地址)')
+                  return (
                   <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: 'var(--color-bg-panel)', borderRadius: 8, border: '1px solid var(--color-border)' }}>
                     <span style={{ width: 8, height: 8, borderRadius: '50%', background: s.enabled ? '#50fa7b' : '#ff5555', flexShrink: 0 }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)' }}>{s.name}</div>
-                      <div style={{ fontSize: 10, color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.url}</div>
+                      <div style={{ fontSize: 10, color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={addr}>{addr}</div>
                     </div>
-                    <span style={{ fontSize: 10, color: s.enabled ? '#50fa7b' : '#ff5555' }}>{s.enabled ? '在线' : '离线'}</span>
+                    <span style={{ fontSize: 10, color: s.enabled ? '#50fa7b' : '#ff5555' }}>{s.enabled ? '已启用' : '已禁用'}</span>
+                    <label title="启用 / 禁用" style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--color-text-muted)', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={!!s.enabled}
+                        onChange={() => handleToggleMcp(s.name, s.enabled)}
+                        style={{ cursor: 'pointer', accentColor: '#50fa7b', width: 14, height: 14, margin: 0 }}
+                      />
+                      启用
+                    </label>
                     <button onClick={() => handleDeleteMcp(s.name)} style={{ fontSize: 10, color: '#ff5555', background: 'none', border: 'none', cursor: 'pointer' }}>删除</button>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>

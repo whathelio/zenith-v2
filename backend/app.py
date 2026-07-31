@@ -56,7 +56,15 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    yield
+    # 关闭时清理 MCP stdio 子进程连接池，避免残留进程
+    try:
+        from .mcp_client import close_all
+        import logging
+        await close_all()
+        logging.getLogger("zenith.app").info("MCP 连接池已清理")
+    except Exception as e:
+        import logging
+        logging.getLogger("zenith.app").warning("MCP 连接池清理失败: %s", e)
 
 
 async def _reminder_loop():
@@ -292,7 +300,8 @@ async def health():
 @app.post("/api/conversations")
 async def create_conversation(data: dict = Body(default=None)):
     title = (data or {}).get("title", "New Chat") if data else "New Chat"
-    return db.conv_create(title)
+    persona_name = (data or {}).get("persona_name", "") if data else ""
+    return db.conv_create(title, persona_name)
 
 
 @app.get("/api/conversations")
@@ -318,11 +327,14 @@ async def delete_conversation(conv_id: str):
 
 @app.put("/api/conversations/{conv_id}")
 async def rename_conversation(conv_id: str, data: dict = Body(default=None)):
-    """重命名对话"""
+    """重命名对话 / 更新 persona_name"""
     title = data.get("title", "").strip()
+    persona_name = data.get("persona_name", "")
     if not title:
         raise HTTPException(400, "title 不能为空")
     db.conv_update_title(conv_id, title)
+    if "persona_name" in data:
+        db.conv_update_persona(conv_id, persona_name if persona_name else None)
     return {"success": True, "title": title}
 
 

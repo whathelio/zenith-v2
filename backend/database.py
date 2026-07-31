@@ -5,6 +5,7 @@ import os
 import sqlite3
 import uuid
 import json
+import logging
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
@@ -156,7 +157,7 @@ def _migrate_memories():
 
 
 def _migrate_conversations():
-    """迁移 conversations 表 — 新增 summary 列用于存储对话摘要。"""
+    """迁移 conversations 表 — 新增 summary 列、persona_name 列。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
     try:
@@ -166,6 +167,8 @@ def _migrate_conversations():
         cols = {row[1] for row in info}
         if "summary" not in cols:
             c.execute("ALTER TABLE conversations ADD COLUMN summary TEXT DEFAULT ''")
+        if "persona_name" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN persona_name TEXT DEFAULT NULL")
             c.commit()
     finally:
         c.close()
@@ -456,12 +459,15 @@ CREATE INDEX IF NOT EXISTS idx_traces_conv ON conversation_traces(conv_id, creat
 # Conversations
 # ---------------------------------------------------------------------------
 
-def conv_create(title: str = "New Chat") -> dict:
+def conv_create(title: str = "New Chat", persona_name: str = "") -> dict:
     cid = uuid.uuid4().hex[:8]
     now = _now()
     with db() as c:
-        c.execute("INSERT INTO conversations (id, title, summary, created_at, updated_at) VALUES (?,?,?,?,?)", (cid, title, "", now, now))
-    return {"id": cid, "title": title, "summary": "", "created_at": now, "updated_at": now}
+        c.execute(
+            "INSERT INTO conversations (id, title, summary, persona_name, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            (cid, title, "", persona_name if persona_name else None, now, now)
+        )
+    return {"id": cid, "title": title, "summary": "", "persona_name": persona_name or None, "created_at": now, "updated_at": now}
 
 
 def conv_list() -> list:
@@ -521,6 +527,13 @@ def conv_update_summary(cid: str, summary: str):
         c.execute("UPDATE conversations SET summary = ?, updated_at = ? WHERE id = ?", (summary, now, cid))
 
 
+def conv_update_persona(cid: str, persona_name: str | None):
+    """更新对话的 Persona"""
+    now = _now()
+    with db() as c:
+        c.execute("UPDATE conversations SET persona_name = ?, updated_at = ? WHERE id = ?", (persona_name, now, cid))
+
+
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
@@ -558,6 +571,42 @@ def msg_count(cid: str) -> int:
             "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ? AND role != 'system'", (cid,)
         ).fetchone()
     return r["cnt"] if r else 0
+
+
+def msg_get(msg_id: int) -> Optional[dict]:
+    """按全局消息 ID 取单条消息"""
+    with db() as c:
+        r = c.execute("SELECT * FROM messages WHERE id = ?", (msg_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def msg_update(msg_id: int, content: str) -> bool:
+    """更新消息内容（编辑重发用），并刷新会话 updated_at"""
+    now = _now()
+    with db() as c:
+        cur = c.execute(
+            "UPDATE messages SET content = ?, created_at = ? WHERE id = ?",
+            (content, now, msg_id),
+        )
+        if cur.rowcount:
+            c.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = "
+                "(SELECT conversation_id FROM messages WHERE id = ?)",
+                (now, msg_id),
+            )
+            return True
+        return False
+
+
+def msg_del_from(msg_id: int) -> int:
+    """删除 id >= msg_id 的所有消息（含自身及后续），返回删除数量"""
+    with db() as c:
+        # 先定位所属会话以刷新 updated_at
+        row = c.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+        cur = c.execute("DELETE FROM messages WHERE id >= ?", (msg_id,))
+        if row:
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), row["conversation_id"]))
+        return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +684,15 @@ def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
 def mem_add(type_: str, content: str, importance: int = 3,
             keywords: str = "", source_conv_id: str = "",
             recorded_at: str = "", distilled_from: Optional[int] = None) -> int:
+    # 落库守卫：拒绝明文密钥写入记忆库（防蒸馏/对话把明文提进记忆）
+    from validators.sanitize_guard import guard_store
+    risk = guard_store(content, field="memory")
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝写入记忆（含明文密钥）: type=%s source=%s names=%s",
+            type_, source_conv_id, risk["names"]
+        )
+        return -1
     now = _now()
     with db() as c:
         cur = c.execute(
@@ -991,20 +1049,22 @@ def goal_update(gid: int, data: dict):
             v = json.dumps(list(v), ensure_ascii=False)
         fs.append(f"{k} = ?")
         ps.append(v)
-    # 如果变更了 start_value/target_value/daily_target，重新计算 end_date
-    if "start_value" in data or "target_value" in data or "daily_target" in data:
+    # 变更 start/target/daily/current 任一数值时，重算 end_date：
+    # 以「当前值」为基准、从「今天」起算剩余天数，得出真实 ETA（与前端"需 N 天"一致）
+    if any(k in data for k in ("start_value", "target_value", "daily_target", "current_value")):
         g = goal_get(gid)
         if g:
             daily = float(data.get("daily_target", g.get("daily_target", 5)))
             sv = float(data.get("start_value", g.get("start_value", 0)))
             tv = float(data.get("target_value", g.get("target_value", 1)))
-            if sv > 0 and tv > sv and daily > 0:
-                days = math.ceil(math.log(tv / sv) / math.log(1 + daily / 100))
-                st = data.get("start_date", g.get("start_date", _now()[:10]))
+            cv = float(data.get("current_value", g.get("current_value", 0)))
+            base = cv if cv > 0 else sv
+            if base > 0 and tv > base and daily > 0:
+                days = math.ceil(math.log(tv / base) / math.log(1 + daily / 100))
                 from datetime import timedelta as _td
                 from datetime import datetime as _dt
                 try:
-                    ed = (_dt.strptime(st, "%Y-%m-%d") + _td(days=days)).strftime("%Y-%m-%d")
+                    ed = (_dt.strptime(_now()[:10], "%Y-%m-%d") + _td(days=days)).strftime("%Y-%m-%d")
                     fs.append("end_date = ?")
                     ps.append(ed)
                 except (ValueError, TypeError):
@@ -1037,16 +1097,16 @@ def goal_get_stats(gid: int) -> Optional[dict]:
     from .timezone import now_tz, DEFAULT_TIMEZONE
     now = now_tz()
     try:
-        start = _dt.fromisoformat(g.get("start_date", now.isoformat()))
+        start = _dt.fromisoformat(g.get("start_date") or now.isoformat())
         if start.tzinfo is None:
             start = start.replace(tzinfo=DEFAULT_TIMEZONE)
-    except ValueError:
+    except (ValueError, TypeError):
         start = now
     try:
-        end = _dt.fromisoformat(g.get("end_date", now.isoformat()))
+        end = _dt.fromisoformat(g.get("end_date") or now.isoformat())
         if end.tzinfo is None:
             end = end.replace(tzinfo=DEFAULT_TIMEZONE)
-    except ValueError:
+    except (ValueError, TypeError):
         end = now
     days_passed = max((now - start).days, 1)
     daily_return = 0.0

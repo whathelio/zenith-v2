@@ -534,6 +534,32 @@ TOOLS_SCHEMA = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
+    # ── MCP 工具调用（B 级集成：让 Skill 步骤能真实调 MCP） ──
+    {
+        "type": "function",
+        "function": {
+            "name": "call_mcp",
+            "description": "调用已配置的 MCP 服务中的某个工具。例如事实核查(fact-check-mcp 的 verify_claim/check_groundedness/scan_contradictions/check_memory_conflict)、代码验证(code-verify-mcp 的 verify_execution/check_imports)、执行门控(guard-mcp)、缓存调度(cache-scheduler)、金十财经数据(jin10)。当用户要求严格验证/核查/硬性检查，或命中需要 MCP 工具的技能（如 zenith-auditor）时调用。不填 tool_name 则返回该服务可用工具列表。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mcp_name": {
+                        "type": "string",
+                        "description": "MCP 服务名称，如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler / jin10"
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "要调用的工具名，如 verify_claim / check_groundedness / scan_contradictions / verify_execution / check_imports。留空则列出该服务所有可用工具"
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "传给该 MCP 工具的参数字典，例如 {\"claim\": \"Python 最新稳定版是 3.13\", \"language\": \"zh\"}"
+                    }
+                },
+                "required": ["mcp_name"]
+            }
+        }
+    },
 ]
 
 
@@ -570,6 +596,7 @@ _TOOL_HANDLERS = {
     "retrieve_docs":       lambda a: _handle_retrieve_docs(a),
     "query_wiki":          lambda a: _handle_query_wiki(a),
     "kb_stats":            lambda a: _handle_kb_stats(a),
+    "call_mcp":            lambda a: _handle_call_mcp(a),
 }
 
 
@@ -742,7 +769,14 @@ async def _handle_execute_code(args: dict) -> dict:
         }
     from .code_runner import run
     r = await run(args.get("code", ""))
-    return {"success": r["success"], "result": r["output"]}
+    result = {"success": r["success"], "result": r["output"]}
+    # 结构化代码痕迹 — stdout/stderr/exit_code 透传给前端渲染
+    if r.get("stdout") is not None:
+        result["stdout"] = r.get("stdout", "")
+        result["stderr"] = r.get("stderr", "")
+        result["exit_code"] = r.get("exit_code")
+        result["lang"] = r.get("lang", "python")
+    return result
 
 
 def _handle_search_memory(args: dict) -> dict:
@@ -2258,3 +2292,134 @@ async def _handle_kb_stats(args: dict) -> dict:
         return {"success": True, "result": f"知识库状态: {h.get('status', '未知')}。详细统计请运行 zotero_parse_rag_core.py --stats"}
     except Exception as e:
         return {"success": False, "result": f"知识库离线: {e}"}
+
+
+# ═══════════════════════════════════════════════════════
+# MCP 工具调用（B 级集成：让 Skill 步骤能真实调 MCP）
+# ═══════════════════════════════════════════════════════
+
+async def _ensure_mcp_client(mcp_name: str):
+    """按 name 找到 server 配置，获取或创建已连接的 MCPClient（进程级长连接池）。
+
+    返回 (client, error_str)。stdio 子进程若已退出会自动重连。
+    """
+    from .mcp_client import MCPClient, MCPClientError, get_client, register_client
+    from .mcp_config import load_mcp_servers
+
+    server = next((s for s in load_mcp_servers() if s.get("name") == mcp_name), None)
+    if server is None:
+        available = ", ".join(s.get("name") for s in load_mcp_servers())
+        return None, f"未找到 MCP 服务 '{mcp_name}'。可用: {available}"
+    if server.get("disabled"):
+        return None, f"MCP 服务 '{mcp_name}' 已禁用（disabled），无法调用"
+
+    client = get_client(mcp_name)
+    if client is None:
+        client = MCPClient(server)
+    else:
+        # 检查 stdio 子进程是否仍存活；死了则重置后重连
+        if client.transport == "stdio" and (client._proc is None or client._proc.returncode is not None):
+            client._initialized = False
+            client._proc = None
+            client._session_id = None
+            client._pending.clear()
+
+    try:
+        await client.connect()
+        register_client(client)
+        return client, None
+    except MCPClientError as e:
+        return None, f"连接 MCP '{mcp_name}' 失败: {e}"
+
+
+def _format_mcp_result(result) -> str:
+    """把 MCP tool 返回的结构化结果格式化为 LLM 可读文本。"""
+    if result is None:
+        return "(无返回)"
+    if isinstance(result, dict):
+        # 单 text 字段直接展开，避免一层嵌套
+        if set(result.keys()) == {"text"}:
+            return str(result["text"])
+        try:
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(result)
+    if isinstance(result, list):
+        try:
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(result)
+    return str(result)
+
+
+async def _handle_call_mcp(args: dict) -> dict:
+    """调用已配置的 MCP 服务工具（B 级集成入口）。
+
+    发现模式：tool_name 留空时列出该服务可用工具。
+    """
+    mcp_name = (args.get("mcp_name") or "").strip()
+    tool_name = (args.get("tool_name") or "").strip()
+    tool_args = args.get("args") or {}
+
+    if not mcp_name:
+        return {"success": False, "result": "mcp_name 不能为空（如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler / jin10）"}
+
+    # 发现模式：列出可用工具
+    if not tool_name:
+        client, err = await _ensure_mcp_client(mcp_name)
+        if err:
+            return {"success": False, "result": err}
+        try:
+            tools_payload = await client.list_tools()
+            tools = tools_payload.get("tools", []) if isinstance(tools_payload, dict) else []
+        except Exception as e:
+            return {"success": False, "result": f"列举 {mcp_name} 工具失败: {e}"}
+        lines = [f"{mcp_name} 可用工具 ({len(tools)}):"]
+        for t in tools:
+            lines.append(f"- {t.get('name')}: {t.get('description', '')}")
+        return {
+            "success": True,
+            "result": "\n".join(lines),
+            "mcp_server": mcp_name,
+            "available_tools": [t.get("name") for t in tools],
+        }
+
+    # 参数容错：args 可能是字符串
+    if not isinstance(tool_args, dict):
+        try:
+            tool_args = json.loads(tool_args) if isinstance(tool_args, str) else {}
+        except Exception:
+            tool_args = {}
+
+    client, err = await _ensure_mcp_client(mcp_name)
+    if err:
+        return {"success": False, "result": err}
+
+    try:
+        result = await client.call_tool(tool_name, tool_args)
+    except Exception as e:
+        return await _mcp_tool_not_found(mcp_name, client, tool_name, str(e))
+
+    # 某些 MCP server 把 "未知工具" 作为 content 文本返回（非 JSON-RPC 错误）
+    if isinstance(result, dict) and "error" in result:
+        return await _mcp_tool_not_found(mcp_name, client, tool_name, str(result.get("error", "")))
+
+    return {
+        "success": True,
+        "result": _format_mcp_result(result),
+        "mcp_server": mcp_name,
+        "mcp_tool": tool_name,
+    }
+
+
+async def _mcp_tool_not_found(mcp_name: str, client, tool_name: str, err_msg: str) -> dict:
+    """工具名疑似不存在时，附上该服务可用工具，便于模型重试。"""
+    if any(k in err_msg.lower() for k in ("not found", "unknown", "method", "no tool", "no such")):
+        try:
+            tools_payload = await client.list_tools()
+            tools = tools_payload.get("tools", []) if isinstance(tools_payload, dict) else []
+            names = [t.get("name") for t in tools]
+            return {"success": False, "result": f"工具 '{tool_name}' 不存在。{mcp_name} 可用工具: {names}"}
+        except Exception:
+            pass
+    return {"success": False, "result": f"调用 {mcp_name}.{tool_name} 失败: {err_msg}"}

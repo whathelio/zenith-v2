@@ -20,6 +20,7 @@ from ..confirm_flow import get_pending_proposals
 from ..validators.auditor_skill import AUDITOR_SKILL_PROMPT
 from ..validators.output_validator import validate_output
 from ..validators.input_validator import validate_input
+from ..validators.execution_validator import validate_tool_result
 from ..audit.audit_log import log_event
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -27,9 +28,24 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 # 活跃的 SSE 流任务，按对话 ID 管理
 _active_streams: dict[str, asyncio.Task] = {}
 
+# 苏格拉底追问法注入 — 在分析/决策/学习类问题中引导用户自己思考
+SOCRATIC_INJECTION = """## 苏格拉底追问原则
+在回答用户关于分析、决策、学习、理解类问题时，优先使用苏格拉底式追问：
+- 不直接给答案，而是提出一个深刻的问题引导用户自己推理
+- 在给出结论前先问："你为什么这么想？"或"你试过从 X 角度考虑吗？"
+- 每次回答最多追问 1-2 个核心问题，避免问题轰炸
+- 当用户明确要求直接答案、或问题属于事实性查询时，切换到直接回答模式
+
+这些原则仅用于引导思维方式，不影响你调用工具和执行实际任务。"""
+
 
 def _build_skill_injection(current_query: str) -> str:
-    """从记忆库检索 type='skill' 匹配当前查询，注入 system prompt"""
+    """从记忆库检索 type='skill' 匹配当前查询，作为硬性指令注入 system prompt。
+
+    A 级实现：命中后注入完整技能定义（不再截断 300 字），并明确指令模型
+    "若用户请求适用该技能，必须严格按其步骤执行"。这保证技能在每次对话中
+    被可靠遵循（非 LLM 自觉），为后续 B 级后端真实执行打基础。
+    """
     if not current_query or len(current_query.strip()) < 2:
         return ""
     try:
@@ -37,10 +53,17 @@ def _build_skill_injection(current_query: str) -> str:
         skill_mems = [m for m in results if m.get("type") == "skill"]
         if not skill_mems:
             return ""
-        parts = ["【已记录技能参考】"]
+        parts = [
+            "【已启用技能 · 必须遵循】",
+            "以下技能与本次请求相关。若用户请求适用其中某个技能，你必须严格按其定义的「触发」与「步骤」执行，"
+            "不要跳过步骤，也不要仅作为参考。技能内容：",
+        ]
         for m in skill_mems[:3]:
-            c = m.get("content", "")
-            parts.append(f"- {c[:300]}")
+            c = m.get("content", "").strip()
+            if not c:
+                continue
+            name = c[3:].split("\n")[0].strip() if c.startswith("技能：") else "(未命名)"
+            parts.append(f"\n### 技能：{name}\n{c}")
         return "\n".join(parts).strip()
     except Exception:
         return ""
@@ -64,7 +87,7 @@ async def _auto_distill_conv(conv_id: str):
 
 async def _process_conv(
     conv_id: str, user_message: str, messages: list, cfg: dict,
-    event_queue: asyncio.Queue,
+    event_queue: asyncio.Queue, provider_name: str = "", persona_name: str = "",
 ):
     """后台任务：LLM 调用 + 工具执行 + 消息保存，不受客户端断连影响"""
     logger = logging.getLogger("zenith.chat")
@@ -81,11 +104,14 @@ async def _process_conv(
             round_text = ""
             round_tool_calls = []
 
-            async for chunk in chat_stream(messages, tools=TOOLS_SCHEMA):
+            async for chunk in chat_stream(messages, tools=TOOLS_SCHEMA, provider_name=provider_name):
                 if chunk["type"] == "text":
                     round_text += chunk["content"]
                     assistant_text += chunk["content"]
                     event_queue.put_nowait(json.dumps({'type': 'text', 'content': chunk["content"]}, ensure_ascii=False))
+                elif chunk["type"] == "thinking":
+                    # 思考过程 — DeepSeek reasoning_content / Anthropic thinking
+                    event_queue.put_nowait(json.dumps({'type': 'thinking', 'content': chunk["content"]}, ensure_ascii=False))
                 elif chunk["type"] == "tool_call":
                     round_tool_calls.append(chunk)
 
@@ -156,6 +182,11 @@ async def _process_conv(
                         'round': round_num,
                         'duration_ms': duration_ms,
                         'success': success,
+                        # 结构化代码痕迹（execute_code 专用）
+                        'stdout': result.get("stdout"),
+                        'stderr': result.get("stderr"),
+                        'exit_code': result.get("exit_code"),
+                        'lang': result.get("lang"),
                     }, ensure_ascii=False))
 
                 # Phase 1: 写入执行追踪
@@ -172,6 +203,28 @@ async def _process_conv(
                             },
                             round_num=round_num,
                         )
+                    except Exception:
+                        pass
+
+                # Phase 2: 工具结果验证（移植自 WorkBuddy MCP 逻辑）
+                if cfg.get("validators", {}).get("execution", {}).get("enabled", True):
+                    try:
+                        v_warnings = validate_tool_result(tool_name, tool_args, result_text)
+                        for w in v_warnings:
+                            event_queue.put_nowait(json.dumps({
+                                'type': 'warning',
+                                'level': w.get('level', 'warning'),
+                                'content': w.get('message', ''),
+                                'tool': tool_name,
+                            }, ensure_ascii=False))
+                            # 写入 traces
+                            if trace_enabled:
+                                try:
+                                    db.trace_add(conv_id, "validation",
+                                                 data={"type": w.get("type"), "message": w.get("message"),
+                                                       "tool": tool_name}, round_num=round_num)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -255,10 +308,20 @@ async def chat(request: Request):
 
     user_message = data.get("message", "")
     conv_id = data.get("conversation_id", "")
+    provider_name = data.get("provider_name", "")  # 多 Provider 支持
+    persona_name = data.get("persona_name", "")    # Persona 支持
 
     if not conv_id:
         conv = db.conv_create()
         conv_id = conv["id"]
+
+    # 如果请求未指定 persona，从对话记录中读取
+    if not persona_name and conv_id:
+        try:
+            conv_data = db.conv_get(conv_id)
+            persona_name = (conv_data or {}).get("persona_name", "") or ""
+        except Exception:
+            pass
 
     if not user_message.strip():
         return JSONResponse({"error": "消息不能为空"}, status_code=400)
@@ -284,18 +347,39 @@ async def chat(request: Request):
     db.msg_add(conv_id, "user", user_message)
     await maybe_compress(conv_id)
 
-    event_queue = asyncio.Queue()
+    return _start_sse(conv_id, user_message, cfg, provider_name, persona_name, persist_user=False)
 
+
+def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_query: str = "") -> list:
+    """构建 system + 历史消息（Persona / 苏格拉底 / 审计 / 记忆 / 技能注入链）"""
     system_parts = [cfg["system_prompt"]]
+
+    # Persona 注入 — 在 system_prompt 之后、审计之前（per-conversation 绑定）
+    if persona_name:
+        personas: list[dict] = cfg.get("personas", [])
+        persona = next((p for p in personas if p.get("name") == persona_name), None)
+        if persona:
+            system_parts.append(
+                f"## 当前工作模式: {persona['name']}\n"
+                f"{persona.get('system_prompt', '')}"
+            )
+        else:
+            logging.getLogger("zenith.chat").warning(
+                "Persona '%s' 不存在，回退默认模式", persona_name
+            )
+
+    # 苏格拉底追问模式（默认启用，可在 config 关闭）
+    if cfg.get("socratic_mode", True):
+        system_parts.append(SOCRATIC_INJECTION)
 
     # 审计员 Skill — 从源头减少幻觉（可配置关闭）
     if cfg.get("auditor_skill", {}).get("enabled", True):
         system_parts.append(AUDITOR_SKILL_PROMPT)
 
-    memory_injection = build_memory_injection(current_query=user_message)
+    memory_injection = build_memory_injection(current_query=current_query)
     if memory_injection:
         system_parts.append(memory_injection)
-    skill_injection = _build_skill_injection(current_query=user_message)
+    skill_injection = _build_skill_injection(current_query=current_query)
     if skill_injection:
         system_parts.append(skill_injection)
 
@@ -303,9 +387,30 @@ async def chat(request: Request):
     for m in db.msg_list(conv_id):
         if m["role"] != "system":
             messages.append({"role": m["role"], "content": m["content"]})
+    return messages
 
+
+def _start_sse(conv_id: str, user_message: str, cfg: dict,
+               provider_name: str = "", persona_name: str = "",
+               persist_user: bool = True) -> StreamingResponse:
+    """启动 SSE 后台对话任务。
+
+    persist_user=True：先插入用户消息再启动（chat 主路径）；
+    persist_user=False：用户消息已存在（regenerate/edit 复用）。
+    """
+    old_task = _active_streams.get(conv_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+        _active_streams.pop(conv_id, None)
+
+    if persist_user:
+        db.msg_add(conv_id, "user", user_message)
+
+    messages = _build_chat_messages(conv_id, cfg, persona_name, user_message)
+
+    event_queue = asyncio.Queue()
     process_task = asyncio.create_task(
-        _process_conv(conv_id, user_message, messages, cfg, event_queue)
+        _process_conv(conv_id, user_message, messages, cfg, event_queue, provider_name, persona_name)
     )
     _active_streams[conv_id] = process_task
 
@@ -328,6 +433,112 @@ async def chat(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _conv_persona(conv_id: str) -> str:
+    """读取会话绑定的 Persona 名称"""
+    try:
+        conv_data = db.conv_get(conv_id)
+        return (conv_data or {}).get("persona_name", "") or ""
+    except Exception:
+        return ""
+
+
+@router.post("/regenerate")
+async def regenerate(request: Request):
+    """重新生成最后一条 AI 回复 — 删除最后 assistant 消息后以最后用户消息重跑（SSE）"""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "无效的 JSON 请求"}, status_code=400)
+
+    conv_id = data.get("conversation_id", "")
+    provider_name = data.get("provider_name", "")
+    if not conv_id:
+        return JSONResponse({"error": "缺少 conversation_id"}, status_code=400)
+
+    msgs = db.msg_list(conv_id)
+    if not msgs:
+        return JSONResponse({"error": "对话为空，无法重新生成"}, status_code=400)
+    if msgs[-1]["role"] != "assistant":
+        return JSONResponse({"error": "没有可重新生成的上一条 AI 回复"}, status_code=400)
+
+    # 删除最后一条 assistant 消息
+    db.msg_del_from(msgs[-1]["id"])
+
+    # 找最后一条用户消息作为重跑输入
+    user_message = ""
+    for m in reversed(msgs[:-1]):
+        if m["role"] == "user":
+            user_message = m["content"]
+            break
+    if not user_message:
+        return JSONResponse({"error": "没有可用的用户消息"}, status_code=400)
+
+    cfg = load_config()
+    return _start_sse(conv_id, user_message, cfg, provider_name, _conv_persona(conv_id), persist_user=False)
+
+
+@router.post("/edit")
+async def edit_message(request: Request):
+    """编辑消息并重新生成：更新消息内容，删除其后所有消息。
+
+    user 消息 → 返回 SSE 流重新生成；assistant 消息 → 仅保存修改（JSON）。
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "无效的 JSON 请求"}, status_code=400)
+
+    conv_id = data.get("conversation_id", "")
+    msg_id = data.get("msg_id")
+    content = data.get("content", "")
+    provider_name = data.get("provider_name", "")
+    if not conv_id or not msg_id or not content.strip():
+        return JSONResponse({"error": "缺少 conversation_id / msg_id / content"}, status_code=400)
+
+    msg = db.msg_get(msg_id)
+    if not msg or msg["conversation_id"] != conv_id:
+        return JSONResponse({"error": "消息不存在"}, status_code=404)
+    if not db.msg_update(msg_id, content):
+        return JSONResponse({"error": "更新失败"}, status_code=500)
+    db.msg_del_from(msg_id + 1)
+
+    cfg = load_config()
+    if msg["role"] != "user":
+        # assistant 消息编辑 — 仅保存修改（前端可再触发 regenerate）
+        return {"success": True, "regenerate": False}
+
+    return _start_sse(conv_id, content, cfg, provider_name, _conv_persona(conv_id), persist_user=False)
+
+
+@router.delete("/messages/{msg_id}")
+async def delete_message(msg_id: int):
+    """删除消息及其后所有消息"""
+    deleted = db.msg_del_from(msg_id)
+    if deleted == 0:
+        return JSONResponse({"error": "消息不存在"}, status_code=404)
+    return {"success": True, "deleted": deleted}
+
+
+@router.post("/stop")
+async def stop_chat(request: Request):
+    """停止当前对话的后台生成任务（SSE 流正常结束，不保存半成品）"""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "无效的 JSON 请求"}, status_code=400)
+    conv_id = data.get("conversation_id", "")
+    task = _active_streams.get(conv_id) if conv_id else None
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _active_streams.pop(conv_id, None)
+        return {"success": True, "stopped": True}
+    return {"success": True, "stopped": False}
 
 
 # 来自 app.py 的重定向端点
