@@ -14,6 +14,14 @@ export default function KnowledgeView() {
   const [health, setHealth] = useState<string>('未知')
   const [uploading, setUploading] = useState(false)
   const [uploadResult, setUploadResult] = useState<string | null>(null)
+  const [docs, setDocs] = useState<Array<{ item_id: number; title: string; chunks: number; source?: string }>>([])
+
+  const loadDocs = useCallback(async () => {
+    try {
+      const r = await api.knowledgeListDocs()
+      if (r.docs) setDocs(r.docs)
+    } catch { /* 中台未启动时不报错 */ }
+  }, [])
 
   const checkHealth = useCallback(async () => {
     try {
@@ -25,6 +33,7 @@ export default function KnowledgeView() {
   }, [])
 
   useEffect(() => { checkHealth() }, [checkHealth])
+  useEffect(() => { loadDocs() }, [loadDocs])
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
@@ -35,6 +44,7 @@ export default function KnowledgeView() {
       const r = await api.knowledgeIngest(f)
       if (r.status === 'ok') {
         setUploadResult(`✅ 入库成功：${r.chunks} 个片段，覆盖率 ${(r.coverage * 100).toFixed(0)}%`)
+        loadDocs()
       } else if (r.status === 'rejected') {
         setUploadResult(`⚠ 审查未通过：${r.reason || '未知'}（覆盖率 ${((r.coverage || 0) * 100).toFixed(0)}%）`)
       } else {
@@ -88,6 +98,36 @@ export default function KnowledgeView() {
           {uploading && <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>入库中…</span>}
           {uploadResult && <span style={{ fontSize: 12 }}>{uploadResult}</span>}
         </div>
+
+        {/* 已入库文档列表 — 逐段学习入口 */}
+        {docs.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>已入库文档（{docs.length}）：</div>
+            {docs.map(d => (
+              <div key={d.item_id} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 12px', background: 'var(--color-bg-panel)',
+                border: '1px solid var(--color-border)', borderRadius: 6,
+              }}>
+                <span style={{ flex: 1, fontSize: 12, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  📄 {d.title} <span style={{ color: 'var(--color-text-muted)', fontSize: 10 }}>（{d.chunks} 段）</span>
+                </span>
+                <button
+                  className="btn btn-sm"
+                  onClick={async () => {
+                    try {
+                      const r = await api.startLearning('document', d.item_id)
+                      window.location.href = `/chat/${r.conversation_id}`
+                    } catch (e: any) { setError(e?.message || '创建学习对话失败') }
+                  }}
+                  style={{ background: 'var(--color-accent-primary)', color: '#fff', cursor: 'pointer' }}
+                >
+                  📖 逐段学习
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* 模式切换 */}
         <div style={{ display: 'flex', gap: 8 }}>

@@ -34,6 +34,10 @@ export default function ChatView() {
   const [providers, setProviders] = useState<{ name: string; model: string }[]>([])
   const [selectedPersona, setSelectedPersona] = useState('')
   const [personas, setPersonas] = useState<{ name: string }[]>([])
+  const [convBackground, setConvBackground] = useState('')
+  const [backgroundDraft, setBackgroundDraft] = useState('')
+  const [backgroundModal, setBackgroundModal] = useState(false)
+  const [convBgImage, setConvBgImage] = useState('')
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -58,8 +62,40 @@ export default function ChatView() {
     try {
       const conv = await api.getConversation(id)
       setActiveConv(conv)
-      setMessages(conv.messages || [])
+      const msgs: Message[] = conv.messages || []
+      setMessages(msgs)
       setSelectedPersona((conv as any).persona_name || '')
+      setConvBackground((conv as any).background || '')
+      const bgImg = (conv as any).background_image
+      setConvBgImage(bgImg ? `/api/conversations/${id}/background-image?t=${Date.now()}` : '')
+
+      // 回读历史执行痕迹（conversation_traces 表）— 切换模块回来不丢失工具气泡
+      try {
+        const traces = await api.getConvTraces(id)
+        const bubbles = traces
+          .filter((t: any) => t.trace_type === 'tool_call')
+          .map((t: any) => {
+            let data: any = {}
+            try { data = JSON.parse(t.data || '{}') } catch { data = {} }
+            return toTraceEntry({
+              id: String(t.id),
+              name: data.name || 'tool',
+              args: data.args || {},
+              status: 'done',
+              resultSummary: data.result_summary || data.result || '',
+              durationMs: data.duration_ms,
+              success: data.success,
+              round: t.round_num,
+              stdout: data.stdout,
+              stderr: data.stderr,
+              exit_code: data.exit_code,
+              lang: data.lang,
+            })
+          })
+        setToolCallBubbles(bubbles)
+      } catch {
+        // 历史 traces 读取失败不阻断对话加载
+      }
     } catch (e: any) {
       setError(e.message)
     }
@@ -385,8 +421,13 @@ export default function ChatView() {
 
   const handleConfirm = async (type: string, id: number) => {
     try {
-      await api.confirmProposal(type, id)
+      const res = await api.confirmProposal(type, id)
       setProposals(prev => prev.filter(p => !(p.type === type && p.id === id)))
+      // delete_message 确认后刷新当前对话（消息已删除）
+      if (type === 'action' && activeConv?.id) {
+        const payload = (res as any)?.action?.payload
+        if (payload?.msg_id) await loadConversation(activeConv.id)
+      }
     } catch (e: any) {
       setError(e.message)
     }
@@ -446,6 +487,49 @@ export default function ChatView() {
     }
   }
 
+  /** 保存对话背景 */
+  const handleSaveBackground = async () => {
+    if (!activeConv?.id) return
+    try {
+      await api.renameConversation(activeConv.id, activeConv.title || 'New Chat', undefined, backgroundDraft)
+      setConvBackground(backgroundDraft)
+      setBackgroundModal(false)
+      await loadConversations()
+    } catch (e: any) {
+      setError(e.message)
+    }
+  }
+
+  /** 打开背景编辑弹窗 */
+  const handleOpenBackground = () => {
+    setBackgroundDraft(convBackground)
+    setBackgroundModal(true)
+  }
+
+  /** 上传对话背景图片 */
+  const handleUploadBgImage = async (file: File | undefined) => {
+    if (!activeConv?.id || !file) return
+    try {
+      setError('')
+      await api.uploadBackgroundImage(activeConv.id, file)
+      await loadConversation(activeConv.id)
+    } catch (e: any) {
+      setError(e.message || '上传失败')
+    }
+  }
+
+  /** 清除对话背景图片 */
+  const handleClearBgImage = async () => {
+    if (!activeConv?.id) return
+    try {
+      await api.clearBackgroundImage(activeConv.id)
+      setConvBgImage('')
+      await loadConversation(activeConv.id)
+    } catch (e: any) {
+      setError(e.message || '清除失败')
+    }
+  }
+
   // proposals 变化时通知左侧面板
   useEffect(() => {
     window.dispatchEvent(new CustomEvent('zenith:proposals', { detail: proposals }))
@@ -493,10 +577,25 @@ export default function ChatView() {
       />
 
       {/* 主聊天区 */}
-      <div className="chat-main">
+      <div className="chat-main" style={convBgImage ? {
+        backgroundImage: `url("${convBgImage}")`,
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+        backgroundAttachment: 'local',
+      } : undefined}>
+        {/* 背景图半透明遮罩 — 保证文字可读性 */}
+        {convBgImage && <div className="chat-bg-overlay" />}
         {/* 工具条: 标题 + 总结按钮 */}
         <div className="chat-toolbar">
-          <span className="chat-title">{activeConv?.title || '新对话'}</span>
+          <span className="chat-title">
+            {(activeConv as any)?.source_type && <span title="学习对话">📖 </span>}
+            {activeConv?.title || '新对话'}
+            {(activeConv as any)?.source_type && (
+              <span style={{ fontSize: 10, color: 'var(--color-text-muted)', fontWeight: 400, marginLeft: 6 }}>
+                来自{((activeConv as any).source_type === 'note' ? '笔记' : '记忆')}#{(activeConv as any).source_id}
+              </span>
+            )}
+          </span>
           <div className="chat-toolbar-actions">
             {providers.length > 0 && (
               <select
@@ -550,6 +649,55 @@ export default function ChatView() {
                   </option>
                 ))}
               </select>
+            )}
+            {activeConv && (
+              <button
+                className="btn btn-sm"
+                onClick={handleOpenBackground}
+                title={convBackground ? '编辑对话背景（已设置）' : '设置对话背景'}
+                style={{
+                  background: convBackground ? 'rgba(240,160,48,0.15)' : 'var(--color-bg-input)',
+                  color: convBackground ? 'var(--color-accent-warning)' : 'var(--color-text-secondary)',
+                  border: `1px solid ${convBackground ? 'var(--color-accent-warning)' : 'var(--color-border)'}`,
+                  cursor: 'pointer',
+                }}
+              >
+                📖 背景
+              </button>
+            )}
+            {activeConv && (
+              <>
+                <input
+                  type="file"
+                  id="bg-image-input"
+                  accept="image/*"
+                  style={{ display: 'none' }}
+                  onChange={e => { handleUploadBgImage(e.target.files?.[0]); e.target.value = '' }}
+                />
+                <button
+                  className="btn btn-sm"
+                  onClick={() => document.getElementById('bg-image-input')?.click()}
+                  title={convBgImage ? '更换背景图片' : '设置对话背景图片'}
+                  style={{
+                    background: convBgImage ? 'rgba(189,147,249,0.15)' : 'var(--color-bg-input)',
+                    color: convBgImage ? 'var(--color-accent-primary)' : 'var(--color-text-secondary)',
+                    border: `1px solid ${convBgImage ? 'var(--color-accent-primary)' : 'var(--color-border)'}`,
+                    cursor: 'pointer',
+                  }}
+                >
+                  🖼 背景图
+                </button>
+                {convBgImage && (
+                  <button
+                    className="btn btn-sm"
+                    onClick={handleClearBgImage}
+                    title="清除背景图片"
+                    style={{ cursor: 'pointer', color: 'var(--color-accent-danger)' }}
+                  >
+                    ✕
+                  </button>
+                )}
+              </>
             )}
             {activeConv && messages.length >= 2 && (
               <button
@@ -756,6 +904,97 @@ export default function ChatView() {
               </Link>
               <button className="btn btn-sm" onClick={() => setSummaryResult(null)}>
                 关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 对话背景编辑模态框 */}
+      {backgroundModal && activeConv && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.5)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => setBackgroundModal(false)}
+        >
+          <div
+            style={{
+              background: 'var(--color-bg-panel)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 12,
+              padding: 24,
+              maxWidth: 560,
+              width: '90%',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 600 }}>📖 对话背景</h3>
+              <button
+                className="btn-icon"
+                style={{ width: 32, height: 32, fontSize: 18 }}
+                onClick={() => setBackgroundModal(false)}
+              >
+                ×
+              </button>
+            </div>
+
+            <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 10, lineHeight: 1.6 }}>
+              定义这个对话的世界观背景——你是谁、身处什么情境、有什么目标。
+              Zenith 会把它注入到 AI 的提示词中，让回答贴合你的设定。
+              支持 Markdown 格式，留空则使用默认背景。
+            </p>
+
+            <textarea
+              className="form-input"
+              rows={8}
+              value={backgroundDraft}
+              onChange={e => setBackgroundDraft(e.target.value)}
+              placeholder={'例如：\n你是我的投资研究助理。我们在 2026 年，正在一起分析 A 股市场的半导体板块。\n你的风格是数据驱动，每次结论都要附上数据来源。'}
+              style={{
+                width: '100%',
+                boxSizing: 'border-box',
+                fontFamily: 'inherit',
+                marginBottom: 12,
+              }}
+            />
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              {convBackground && (
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setBackgroundDraft('')}
+                  style={{ color: 'var(--color-accent-danger)', cursor: 'pointer' }}
+                >
+                  清除背景
+                </button>
+              )}
+              <button
+                className="btn btn-sm"
+                onClick={() => setBackgroundModal(false)}
+                style={{ cursor: 'pointer' }}
+              >
+                取消
+              </button>
+              <button
+                className="btn btn-sm"
+                onClick={handleSaveBackground}
+                style={{
+                  background: 'var(--color-accent-primary)',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                }}
+              >
+                💾 保存
               </button>
             </div>
           </div>

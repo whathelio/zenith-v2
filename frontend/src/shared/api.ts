@@ -5,6 +5,9 @@ interface Conversation {
   id: string
   title: string
   persona_name?: string
+  background?: string
+  source_type?: string
+  source_id?: string
   created_at: string
   updated_at: string
   msg_count: number
@@ -16,6 +19,7 @@ interface Message {
   conversation_id: string
   role: 'user' | 'assistant' | 'system'
   content: string
+  thinking?: string
   created_at: string
 }
 
@@ -39,6 +43,17 @@ interface Schedule {
   source: string
   confirmed_at: string | null
   created_at: string
+  /** 外部财经事件（来自金十日历缓存，非本地日程行） */
+  is_event?: boolean
+  is_external?: boolean
+  /** 前值/预期/实际 三值 + 利多利空 */
+  finance?: {
+    previous: string
+    consensus: string
+    actual: string
+    revised: string
+    affect_txt: string
+  }
 }
 
 interface Note {
@@ -178,7 +193,7 @@ interface CalendarMonth {
 }
 
 interface Proposal {
-  type: 'schedule' | 'note'
+  type: 'schedule' | 'note' | 'action'
   id: number
   title: string
   time?: string
@@ -423,6 +438,14 @@ export const api = {
   // Conversations
   listConversations: () => request<Conversation[]>('/conversations'),
   getConversation: (id: string) => request<Conversation>(`/conversations/${id}`),
+  getConvTraces: (convId: string) =>
+    request<any[]>(`/audit/conv-traces?conv_id=${encodeURIComponent(convId)}&limit=200`),
+  getTraceHistory: (params: { keyword?: string; trace_type?: string; conv_id?: string; limit?: number; offset?: number } = {}) => {
+    const qs = Object.entries(params)
+      .filter(([, v]) => v !== undefined && v !== '')
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&')
+    return request<any[]>(`/audit/trace-history${qs ? '?' + qs : ''}`)
+  },
   createConversation: (title?: string, personaName?: string) =>
     request<Conversation>('/conversations', {
       method: 'POST',
@@ -430,13 +453,31 @@ export const api = {
     }),
   deleteConversation: (id: string) =>
     request<{ success: boolean }>(`/conversations/${id}`, { method: 'DELETE' }),
-  renameConversation: (id: string, title: string, personaName?: string) => {
+  renameConversation: (id: string, title: string, personaName?: string, background?: string) => {
     const body: Record<string, string> = { title }
     if (personaName !== undefined) body.persona_name = personaName
+    if (background !== undefined) body.background = background
     return request<{ success: boolean; title: string }>(`/conversations/${id}`, {
       method: 'PUT', body: JSON.stringify(body),
     })
   },
+  uploadBackgroundImage: async (id: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(BASE + `/conversations/${id}/background-image`, {
+      method: 'POST', body: fd,
+    })
+    if (!res.ok) throw new Error('上传失败: ' + res.status)
+    return res.json()
+  },
+  clearBackgroundImage: (id: string) =>
+    request<{ success: boolean }>(`/conversations/${id}/background-image`, { method: 'DELETE' }),
+  // 学习对话工厂 — 从笔记/记忆/文档一键创建学习对话
+  startLearning: (sourceType: 'note' | 'memory' | 'document', sourceId: number) =>
+    request<{ success: boolean; conversation_id: string; title: string }>('/learning/start', {
+      method: 'POST',
+      body: JSON.stringify({ source_type: sourceType, source_id: sourceId }),
+    }),
 
   // Chat (SSE via POST fetch)
   chat: async (message: string, conversationId: string, signal?: AbortSignal, providerName?: string) => {
@@ -557,6 +598,10 @@ export const api = {
   // Memories
   listMemories: (type = '', search = '') =>
     request<Memory[]>(`/memories?type_=${type}&search=${encodeURIComponent(search)}`),
+  updateMemory: (id: number, data: Partial<Memory>) =>
+    request<{ success: boolean; memory: Memory }>(`/memories/${id}`, {
+      method: 'PUT', body: JSON.stringify(data),
+    }),
   deleteMemory: (id: number) =>
     request<{ success: boolean }>(`/memories/${id}`, { method: 'DELETE' }),
 
@@ -741,6 +786,7 @@ export const api = {
 
   // ── Knowledge API ── 转发到外部 api_gateway
   knowledgeHealth: () => request<{ status: string; service?: string; version?: string }>('/knowledge/health'),
+  knowledgeListDocs: () => request<{ docs: Array<{ item_id: number; title: string; chunks: number; source?: string }> }>('/knowledge/documents'),
   knowledgeSearch: (question: string, top_k = 5) =>
     request<{ answer?: string; error?: string }>('/knowledge/search', { method: 'POST', body: JSON.stringify({ question, top_k }) }),
   knowledgeWiki: (question: string) =>

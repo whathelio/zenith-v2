@@ -52,6 +52,16 @@ _GATEWAY_PATH = PROJECT_DIR.parent / "api_gateway.py"
 _WORKER_PATH = PROJECT_DIR.parent / "task_worker.py"
 _GATEWAY_PORT = 8788
 
+# RAG 运行环境（api_gateway / task_worker 依赖 pypdfium2/chromadb/torch，位于根工作区 .venv，
+# 该 venv 的 site-packages 已装好依赖，仅 pyvenv.cfg 指针需指向本机解释器）
+_RAG_VENV_PYTHONW = PROJECT_DIR.parent / ".venv" / "Scripts" / "pythonw.exe"
+_RAG_VENV_PYTHON = PROJECT_DIR.parent / ".venv" / "Scripts" / "python.exe"
+_RAG_EMBED_DIR = PROJECT_DIR.parent / "bge-small-model"
+# 注意：旧库 zenith_rag/chroma_db 的 HNSW 索引损坏（link_lists.bin 0 字节，2026-08-05 验证），
+# 已重建至 zenith_rag_new；旧目录因句柄占用暂保留（含 .bak 备份），勿改回。
+_RAG_WORK_DIR = PROJECT_DIR.parent / "zenith_rag_new"
+_RAG_API_KEY = "test-key"  # 与 backend/knowledge_service.py 默认一致
+
 DEFAULT_PORT = 8766
 
 
@@ -460,14 +470,72 @@ def _is_cmdline_running(keyword: str) -> bool:
         return False
 
 
+def _read_env_key(name: str) -> Optional[str]:
+    """从 zenith-v2/.env 读取单个键值（零依赖，与 backend/config.py 同款逻辑）。"""
+    env_file = PROJECT_DIR / ".env"
+    if not env_file.exists():
+        return None
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == name:
+                    return value.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
+
+
+def _build_aux_env() -> dict:
+    """构造 api_gateway / task_worker 的运行环境：
+    本地 embedding 模型、固定工作目录、网关鉴权、复用 zenith 的 LLM 凭据。"""
+    env = os.environ.copy()
+    env.setdefault("ZENITH_RAG_EMBED_MODEL", str(_RAG_EMBED_DIR))
+    env.setdefault("ZENITH_RAG_WORK_DIR", str(_RAG_WORK_DIR))
+    env.setdefault("ZENITH_API_KEY", _RAG_API_KEY)
+    llm_key = env.get("ZENITH_LLM_API_KEY") or _read_env_key("ZENITH_LLM_API_KEY")
+    if llm_key:
+        env.setdefault("LLM_API_KEY", llm_key)
+    env.setdefault("LLM_BASE_URL", "https://api.deepseek.com/v1")
+    env.setdefault("LLM_MODEL", "deepseek-v4-flash")
+    return env
+
+
+def _wait_for_gateway_health(timeout: float = 15.0) -> bool:
+    """等待知识库中台（api_gateway:8788）就绪，health 路径为 /health。"""
+    import urllib.request
+    url = f"http://127.0.0.1:{_GATEWAY_PORT}/health"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if data.get("status") == "ok":
+                        return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
 def _spawn_aux_services():
     """幂等拉起知识库中台（api_gateway:8788）与异步任务 worker。
 
     脚本缺失 / 端口被占用 / 进程已存在时自动跳过，失败只记日志不影响主服务。
     由 start.py 统一托管，保证 bat / launcher / 命令行各入口行为一致。
+    RAG 依赖（pypdfium2/chromadb/torch）在根工作区 .venv，优先用它作为 runner。
     """
     pythonw = PROJECT_DIR / ".venv" / "Scripts" / "pythonw.exe"
-    runner = str(pythonw) if (sys.platform == "win32" and pythonw.exists()) else sys.executable
+    if sys.platform == "win32" and _RAG_VENV_PYTHONW.exists():
+        runner = str(_RAG_VENV_PYTHONW)
+    elif sys.platform == "win32" and pythonw.exists():
+        runner = str(pythonw)
+    else:
+        runner = sys.executable
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     # 必须重定向子进程输出：否则子进程持有父进程 stdout/stderr 管道，
     # 在 bash/cmd 场景会导致父命令无法结束
@@ -478,9 +546,13 @@ def _spawn_aux_services():
             subprocess.Popen(
                 [runner, str(_GATEWAY_PATH)],
                 cwd=str(_GATEWAY_PATH.parent), creationflags=flags,
-                stdout=devnull, stderr=devnull,
+                stdout=devnull, stderr=devnull, env=_build_aux_env(),
             )
             logger.info("已启动知识库中台: %s (端口 %d)", _GATEWAY_PATH.name, _GATEWAY_PORT)
+            # 等待 8788 就绪（网关 health 路径为 /health，与主服务 /api/health 不同），
+            # 把隐形崩溃变成显式日志
+            if not _wait_for_gateway_health(timeout=15.0):
+                logger.warning("知识库中台 %d 在 15s 内未就绪（/health 失败）", _GATEWAY_PORT)
         except Exception as e:
             logger.warning("启动知识库中台失败: %s", e)
     else:
@@ -491,7 +563,7 @@ def _spawn_aux_services():
             subprocess.Popen(
                 [runner, str(_WORKER_PATH), "--poll", "2.0"],
                 cwd=str(_WORKER_PATH.parent), creationflags=flags,
-                stdout=devnull, stderr=devnull,
+                stdout=devnull, stderr=devnull, env=_build_aux_env(),
             )
             logger.info("已启动异步任务 worker: %s", _WORKER_PATH.name)
         except Exception as e:

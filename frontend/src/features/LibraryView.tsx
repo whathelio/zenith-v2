@@ -52,18 +52,18 @@ const SKILL_CONFIRMED_COLORS: Record<number, { bg: string; text: string; label: 
   1: { bg: '#1ae86522', text: '#1ae865', label: '已确认' },
 }
 
-type Tab = 'notes' | 'memories' | 'skills' | 'mcp'
+type Tab = 'notes' | 'memories' | 'skills' | 'mcp' | 'traces'
 
 export default function LibraryView() {
   const [searchParams, setSearchParams] = useSearchParams()
   const initialTab = (searchParams.get('tab') as Tab) || 'notes'
   const [activeTab, setActiveTab] = useState<Tab>(
-    ['notes', 'memories', 'skills', 'mcp'].includes(initialTab) ? initialTab : 'notes'
+    ['notes', 'memories', 'skills', 'mcp', 'traces'].includes(initialTab) ? initialTab : 'notes'
   )
 
   useEffect(() => {
     const tab = searchParams.get('tab') as Tab
-    if (tab && ['notes', 'memories', 'skills', 'mcp'].includes(tab)) {
+    if (tab && ['notes', 'memories', 'skills', 'mcp', 'traces'].includes(tab)) {
       setActiveTab(tab)
     }
   }, [searchParams])
@@ -101,6 +101,10 @@ export default function LibraryView() {
   const [memoryFilter, setMemoryFilter] = useState('')
   const [memorySearch, setMemorySearch] = useState('')
   const [expandedMemoryId, setExpandedMemoryId] = useState<number | null>(null)
+  // Memory 编辑
+  const [memoryEditingId, setMemoryEditingId] = useState<number | null>(null)
+  const [memoryEditForm, setMemoryEditForm] = useState<{ type: string; content: string; importance: number; keywords: string }>({ type: 'fact', content: '', importance: 3, keywords: '' })
+  const [memoryEditSaving, setMemoryEditSaving] = useState(false)
 
   // Skills state (from memories)
   const [skills, setSkills] = useState<ModuleSkill[]>([])
@@ -187,6 +191,23 @@ export default function LibraryView() {
     try { await api.deleteMemory(id); setMemories(prev => prev.filter(m => m.id !== id)) } catch {}
   }
 
+  const startMemoryEdit = (m: Memory) => {
+    setMemoryEditingId(m.id)
+    setMemoryEditForm({ type: m.type || 'fact', content: m.content || '', importance: m.importance || 3, keywords: m.keywords || '' })
+  }
+
+  const saveMemoryEdit = async () => {
+    if (memoryEditingId === null) return
+    if (!memoryEditForm.content.trim()) { showToast('内容不能为空'); return }
+    setMemoryEditSaving(true)
+    try {
+      const r = await api.updateMemory(memoryEditingId, memoryEditForm)
+      setMemories(prev => prev.map(m => m.id === memoryEditingId ? (r.memory || { ...m, ...memoryEditForm }) : m))
+      setMemoryEditingId(null)
+      showToast('记忆已更新 ✓')
+    } catch (e: any) { showToast(`更新失败: ${e?.message || e}`) } finally { setMemoryEditSaving(false) }
+  }
+
   const formatMemoryDate = (dateStr: string) => {
     const d = new Date(dateStr)
     return d.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
@@ -224,6 +245,38 @@ export default function LibraryView() {
       loadMcpServers()
       showToast(enabled ? '已禁用' : '已启用')
     } catch {}
+  }
+
+  // ===== 执行痕迹（工具调用历史查询）=====
+  const [traces, setTraces] = useState<any[]>([])
+  const [tracesLoading, setTracesLoading] = useState(false)
+  const [traceSearch, setTraceSearch] = useState('')
+  const [traceType, setTraceType] = useState('')
+  const [expandedTraceId, setExpandedTraceId] = useState<number | null>(null)
+
+  const loadTraces = useCallback(async () => {
+    setTracesLoading(true)
+    try {
+      const list = await api.getTraceHistory({
+        keyword: traceSearch.trim() || undefined,
+        trace_type: traceType || undefined,
+        limit: 100,
+      })
+      setTraces(list)
+    } catch {} finally { setTracesLoading(false) }
+  }, [traceSearch, traceType])
+
+  useEffect(() => { if (activeTab === 'traces') loadTraces() }, [activeTab, loadTraces])
+
+  const parseTraceData = (t: any): { name: string; args: any; result: string; duration?: number } => {
+    let d: any = {}
+    try { d = typeof t.data === 'string' ? JSON.parse(t.data) : (t.data || {}) } catch { d = {} }
+    return {
+      name: d.name || t.trace_type || 'unknown',
+      args: d.args || {},
+      result: d.result_summary || d.result || d.error || '',
+      duration: d.duration_ms,
+    }
   }
 
   // Skill 文件导入
@@ -279,6 +332,7 @@ export default function LibraryView() {
     { key: 'memories', label: '记忆', icon: '🧠' },
     { key: 'skills', label: '技能', icon: '⚡' },
     { key: 'mcp', label: 'MCP', icon: '🔌' },
+    { key: 'traces', label: '执行痕迹', icon: '🔧' },
   ]
 
   return (
@@ -419,6 +473,18 @@ export default function LibraryView() {
                         <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
                           <button
                             className="btn-icon"
+                            style={{ width: 24, height: 24, fontSize: 10, color: '#50fa7b' }}
+                            onClick={async () => {
+                              try {
+                                const r = await api.startLearning('note', n.id)
+                                showToast(`已创建学习对话 ✓`)
+                                setTimeout(() => { window.location.href = `/chat/${r.conversation_id}` }, 600)
+                              } catch (e: any) { showToast(`创建失败: ${e?.message || e}`) }
+                            }}
+                            title="创建学习对话"
+                          >📚</button>
+                          <button
+                            className="btn-icon"
                             style={{ width: 24, height: 24, fontSize: 10, color: '#ff6e40' }}
                             onClick={async () => {
                               try {
@@ -474,33 +540,72 @@ export default function LibraryView() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                 {memories.map(m => {
                   const isExpanded = expandedMemoryId === m.id
+                  const isEditing = memoryEditingId === m.id
                   const tc = MEMORY_TYPE_COLORS[m.type] || '#717e95'
                   return (
                     <div key={m.id} style={{
                       display: 'flex', alignItems: 'flex-start', gap: 10,
-                      padding: isExpanded ? '12px 14px' : '8px 14px',
+                      padding: isExpanded || isEditing ? '12px 14px' : '8px 14px',
                       background: 'var(--color-bg-panel)',
-                      border: `1px solid ${isExpanded ? tc : 'var(--color-border)'}`,
-                      borderRadius: 6, cursor: 'pointer', transition: 'all 0.2s',
-                    }} onClick={() => setExpandedMemoryId(isExpanded ? null : m.id)}>
+                      border: `1px solid ${isEditing ? '#50fa7b' : isExpanded ? tc : 'var(--color-border)'}`,
+                      borderRadius: 6, cursor: isEditing ? 'default' : 'pointer', transition: 'all 0.2s',
+                    }} onClick={() => { if (!isEditing) setExpandedMemoryId(isExpanded ? null : m.id) }}>
                       <span style={{ background: tc, color: '#fff', padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap' }}>
                         {MEMORY_TYPE_ICONS[m.type] || ''} {MEMORY_TYPE_NAMES[m.type] || m.type}
                       </span>
                       <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 12, lineHeight: 1.5, maxHeight: isExpanded ? 'none' : '3em', overflow: isExpanded ? 'visible' : 'hidden', textOverflow: 'ellipsis', color: 'var(--color-text-secondary)' }}>
-                          {m.content}
-                        </div>
-                        {isExpanded && (
-                          <div style={{ marginTop: 8 }}>
-                            {m.keywords && <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginBottom: 4 }}>关键词: {m.keywords}</div>}
-                            {m.importance && <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginBottom: 4 }}>重要性: {'⭐'.repeat(Math.min(m.importance, 5))}</div>}
-                            <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>创建: {formatMemoryDate(m.created_at)}</div>
+                        {isEditing ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} onClick={e => e.stopPropagation()}>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <select className="form-select" style={{ width: 130, fontSize: 12 }} value={memoryEditForm.type} onChange={e => setMemoryEditForm(f => ({ ...f, type: e.target.value }))}>
+                                {Object.entries(MEMORY_TYPE_NAMES).map(([k, v]) => <option key={k} value={k}>{MEMORY_TYPE_ICONS[k]} {v}</option>)}
+                              </select>
+                              <select className="form-select" style={{ width: 110, fontSize: 12 }} value={memoryEditForm.importance} onChange={e => setMemoryEditForm(f => ({ ...f, importance: Number(e.target.value) }))}>
+                                {[5, 4, 3, 2, 1].map(i => <option key={i} value={i}>{'⭐'.repeat(i)}{i === 3 ? ' (默认)' : ''}</option>)}
+                              </select>
+                            </div>
+                            <textarea className="form-input" rows={3} style={{ fontSize: 12, width: '100%' }} placeholder="记忆内容..." value={memoryEditForm.content} onChange={e => setMemoryEditForm(f => ({ ...f, content: e.target.value }))} />
+                            <input className="form-input" style={{ fontSize: 12, width: '100%' }} placeholder="关键词（逗号分隔，可选）" value={memoryEditForm.keywords} onChange={e => setMemoryEditForm(f => ({ ...f, keywords: e.target.value }))} />
+                            <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                              <button className="btn btn-sm" disabled={memoryEditSaving} onClick={() => setMemoryEditingId(null)}>取消</button>
+                              <button className="btn btn-sm" style={{ background: '#50fa7b', color: '#222', border: 'none' }} disabled={memoryEditSaving} onClick={saveMemoryEdit}>{memoryEditSaving ? '保存中...' : '保存'}</button>
+                            </div>
                           </div>
+                        ) : (
+                          <>
+                            <div style={{ fontSize: 12, lineHeight: 1.5, maxHeight: isExpanded ? 'none' : '3em', overflow: isExpanded ? 'visible' : 'hidden', textOverflow: 'ellipsis', color: 'var(--color-text-secondary)' }}>
+                              {m.content}
+                            </div>
+                            {isExpanded && (
+                              <div style={{ marginTop: 8 }}>
+                                {m.keywords && <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginBottom: 4 }}>关键词: {m.keywords}</div>}
+                                {m.importance && <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginBottom: 4 }}>重要性: {'⭐'.repeat(Math.min(m.importance, 5))}</div>}
+                                <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>创建: {formatMemoryDate(m.created_at)}</div>
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                       <div style={{ display: 'flex', gap: 3, flexShrink: 0, alignItems: 'center' }} onClick={e => e.stopPropagation()}>
-                        <TransformButton sourceType="memory" sourceId={m.id} onTransformed={() => loadMemories()} />
-                        <button className="btn-icon" style={{ width: 24, height: 24, fontSize: 12 }} onClick={() => handleDeleteMemory(m.id)} title="删除">×</button>
+                        {!isEditing && (
+                          <button className="btn-icon" style={{ width: 24, height: 24, fontSize: 12 }} onClick={() => startMemoryEdit(m)} title="编辑">✏️</button>
+                        )}
+                        {!isEditing && (
+                          <button
+                            className="btn-icon"
+                            style={{ width: 24, height: 24, fontSize: 10, color: '#50fa7b' }}
+                            onClick={async () => {
+                              try {
+                                const r = await api.startLearning('memory', m.id)
+                                showToast(`已创建学习对话 ✓`)
+                                setTimeout(() => { window.location.href = `/chat/${r.conversation_id}` }, 600)
+                              } catch (e: any) { showToast(`创建失败: ${e?.message || e}`) }
+                            }}
+                            title="创建学习对话"
+                          >📚</button>
+                        )}
+                        {!isEditing && <TransformButton sourceType="memory" sourceId={m.id} onTransformed={() => loadMemories()} />}
+                        <button className="btn-icon" style={{ width: 24, height: 24, fontSize: 12, opacity: isEditing ? 0.4 : 1 }} disabled={isEditing} onClick={() => handleDeleteMemory(m.id)} title="删除">×</button>
                       </div>
                     </div>
                   )
@@ -713,6 +818,86 @@ export default function LibraryView() {
                     </label>
                     <button onClick={() => handleDeleteMcp(s.name)} style={{ fontSize: 10, color: '#ff5555', background: 'none', border: 'none', cursor: 'pointer' }}>删除</button>
                   </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ===== 执行痕迹 Tab（工具调用历史查询）===== */}
+        {activeTab === 'traces' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                value={traceSearch}
+                onChange={e => setTraceSearch(e.target.value)}
+                placeholder="按工具名/关键词搜索（如 search_memory、execute_code）..."
+                style={{ flex: 1, minWidth: 160, fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
+              />
+              <select className="form-select" style={{ width: 140, fontSize: 12 }} value={traceType} onChange={e => setTraceType(e.target.value)}>
+                <option value="">全部类型</option>
+                <option value="tool_call">工具调用</option>
+                <option value="llm_call">LLM 调用</option>
+                <option value="error">错误</option>
+                <option value="validation">校验</option>
+              </select>
+              <button className="btn btn-sm" onClick={loadTraces}>🔍 查询</button>
+              <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>共 {traces.length} 条</span>
+            </div>
+
+            {tracesLoading ? (
+              <div className="empty-state"><p style={{ fontSize: 13 }}>加载中...</p></div>
+            ) : traces.length === 0 ? (
+              <div className="empty-state"><p style={{ fontSize: 13 }}>暂无执行痕迹（有工具调用后才会记录）</p></div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {traces.map(t => {
+                  const isExpanded = expandedTraceId === t.id
+                  const info = parseTraceData(t)
+                  const tType = t.trace_type || ''
+                  const tColor = tType === 'error' ? '#ff5555' : tType === 'validation' ? '#ffab40' : '#8be9fd'
+                  return (
+                    <div key={t.id} style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 10,
+                      padding: isExpanded ? '12px 14px' : '8px 14px',
+                      background: 'var(--color-bg-panel)',
+                      border: `1px solid ${isExpanded ? tColor : 'var(--color-border)'}`,
+                      borderRadius: 6, cursor: 'pointer', transition: 'all 0.2s',
+                    }} onClick={() => setExpandedTraceId(isExpanded ? null : t.id)}>
+                      <span style={{
+                        background: tColor, color: '#111', padding: '2px 6px', borderRadius: 4,
+                        fontSize: 10, fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap',
+                      }}>
+                        {tType === 'error' ? '✗' : '✓'} {tType || 'trace'}
+                      </span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                          {info.name}
+                          {info.duration !== undefined && <span style={{ fontSize: 10, color: 'var(--color-text-muted)', fontWeight: 400, marginLeft: 8 }}>{info.duration}ms</span>}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
+                          对话 {t.conv_id?.slice(0, 8) || '-'} · {new Date(t.created_at).toLocaleString('zh-CN')}
+                        </div>
+                        {isExpanded && (
+                          <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            {Object.keys(info.args).length > 0 && (
+                              <pre style={{ fontSize: 11, background: 'var(--color-bg-code, rgba(0,0,0,0.3))', padding: 8, borderRadius: 4, margin: 0, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: 'var(--color-text-secondary)' }}>
+                                <span style={{ color: '#f1fa8c', fontWeight: 600 }}>参数:</span>{'\n'}
+                                {Object.entries(info.args).map(([k, v]) => `${k}: ${typeof v === 'string' ? (v.length > 500 ? v.slice(0, 500) + '…' : v) : JSON.stringify(v)}`).join('\n')}
+                              </pre>
+                            )}
+                            {info.result && (
+                              <pre style={{ fontSize: 11, background: 'var(--color-bg-code, rgba(0,0,0,0.3))', padding: 8, borderRadius: 4, margin: 0, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: tType === 'error' ? '#ff5555' : 'var(--color-text-secondary)' }}>
+                                <span style={{ color: tType === 'error' ? '#ff5555' : '#50fa7b', fontWeight: 600 }}>{tType === 'error' ? '错误:' : '结果:'}</span>{'\n'}
+                                {info.result.length > 2000 ? info.result.slice(0, 2000) + '…' : info.result}
+                              </pre>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <span className={`trace-caret ${isExpanded ? 'open' : ''}`}>▾</span>
+                    </div>
                   )
                 })}
               </div>

@@ -93,6 +93,16 @@ DEFAULT_CONFIG = {
     "memory_extract_interval": 5,
     "auto_distill_enabled": True,
 
+    # 财经日历自动同步（默认关闭，需探测确认金十接口可用后手动开启）
+    "calendar_sync": {
+        "enabled": False,
+        "hour": 8,
+        "minute": 0,
+        "days": 7,
+        "min_star": 2,
+        "run_on_start": True,
+    },
+
     # Phase 2.1: 防幻觉 — 审计员 Skill
     "auditor_skill": {
         "enabled": True,

@@ -29,6 +29,8 @@ export default function ChatMessages({
   const bottomRef = useRef<HTMLDivElement>(null)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editText, setEditText] = useState('')
+  // 工具痕迹统一折叠控制：null=各自默认, true=全部展开, false=全部收起
+  const [traceExpand, setTraceExpand] = useState<boolean | null>(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -142,6 +144,12 @@ export default function ChatMessages({
                 </div>
               ) : (
                 <div className={`message-bubble ${isUser ? 'bubble-user' : 'bubble-ai'}`}>
+                  {!isUser && msg.thinking && (
+                    <ThinkingBlock
+                      content={msg.thinking}
+                      done={true}
+                    />
+                  )}
                   <Markdown content={textContent} />
                   {card && onSend && (
                     <ConfirmCard
@@ -187,9 +195,30 @@ export default function ChatMessages({
         <div className="message message-ai message-group">
           <div className="message-avatar" style={{ visibility: 'hidden' }}>Z</div>
           <div className="message-content">
+            {/* 折叠控制条 */}
+            <div className="trace-control-bar" style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                🔧 {toolCallBubbles.length} 次工具调用
+              </span>
+              <button
+                className="btn btn-sm"
+                style={{ fontSize: 10, padding: '2px 8px' }}
+                onClick={() => setTraceExpand(true)}
+              >⤵ 全部展开</button>
+              <button
+                className="btn btn-sm"
+                style={{ fontSize: 10, padding: '2px 8px' }}
+                onClick={() => setTraceExpand(false)}
+              >⤴ 全部收起</button>
+              <button
+                className="btn btn-sm"
+                style={{ fontSize: 10, padding: '2px 8px' }}
+                onClick={() => setTraceExpand(null)}
+              >↕ 默认</button>
+            </div>
             {toolCallBubbles.map(entry => (
               <div key={entry.id} className="trace-stack-item">
-                <TraceCard entry={entry} />
+                <TraceCard entry={entry} forceExpand={traceExpand} />
               </div>
             ))}
           </div>

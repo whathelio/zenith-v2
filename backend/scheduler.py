@@ -131,6 +131,47 @@ async def _weekly_distill_loop():
             logger.warning("每周蒸馏失败: %s", e)
 
 
+async def _calendar_sync_loop():
+    """每日自动同步外部财经日历（金十）到 schedule_events 缓存。
+
+    配置节 config.yaml:
+      calendar_sync: {enabled, hour, minute, days, min_star, run_on_start}
+    run_on_start=true 时启动立即同步一次；异常仅 log 不退出循环。
+    """
+    logger = logging.getLogger("zenith.calendar_sync")
+    from . import calendar_sync as cs
+
+    cfg = load_config().get("calendar_sync", {})
+    hour = int(cfg.get("hour", 8))
+    minute = int(cfg.get("minute", 0))
+    days = int(cfg.get("days", 7))
+    min_star = int(cfg.get("min_star", 2))
+    run_on_start = bool(cfg.get("run_on_start", True))
+
+    if run_on_start:
+        try:
+            logger.info("财经日历启动即同步: days=%d min_star=%d", days, min_star)
+            result = await cs.sync_calendar_events(days=days, min_star=min_star)
+            logger.info("财经日历启动同步完成: %s", result)
+        except Exception as e:
+            logger.warning("财经日历启动同步失败: %s", e)
+
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.info("财经日历同步: 等待 %d 秒至 %s", int(wait_seconds), target.isoformat())
+        await asyncio.sleep(wait_seconds)
+        try:
+            logger.info("财经日历同步开始: days=%d min_star=%d", days, min_star)
+            result = await cs.sync_calendar_events(days=days, min_star=min_star)
+            logger.info("财经日历同步完成: %s", result)
+        except Exception as e:
+            logger.warning("财经日历同步失败: %s", e)
+
+
 def start_all_background_tasks():
     """启动所有后台定时任务。在 lifespan 中调用。"""
     cfg = load_config()
@@ -143,3 +184,10 @@ def start_all_background_tasks():
         asyncio.create_task(_weekly_distill_loop())
     else:
         logging.getLogger("zenith").info("auto_distill_enabled=false, 跳过蒸馏定时任务")
+
+    cs_cfg = cfg.get("calendar_sync", {}) or {}
+    if cs_cfg.get("enabled", False):
+        asyncio.create_task(_calendar_sync_loop())
+        logging.getLogger("zenith").info("calendar_sync.enabled=true, 启动财经日历自动同步")
+    else:
+        logging.getLogger("zenith").info("calendar_sync.enabled=false, 跳过财经日历自动同步")

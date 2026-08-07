@@ -144,6 +144,7 @@ def _migrate_memories():
         new_cols = [
             ("recorded_at", "TEXT"),
             ("distilled_from", "INTEGER DEFAULT NULL"),
+            ("user_edited", "INTEGER DEFAULT 0"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
@@ -157,7 +158,7 @@ def _migrate_memories():
 
 
 def _migrate_conversations():
-    """迁移 conversations 表 — 新增 summary 列、persona_name 列。"""
+    """迁移 conversations 表 — 新增 summary、persona_name、background、background_image、source_type、source_id 列。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
     try:
@@ -169,6 +170,16 @@ def _migrate_conversations():
             c.execute("ALTER TABLE conversations ADD COLUMN summary TEXT DEFAULT ''")
         if "persona_name" not in cols:
             c.execute("ALTER TABLE conversations ADD COLUMN persona_name TEXT DEFAULT NULL")
+        if "background" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN background TEXT DEFAULT NULL")
+        if "background_image" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN background_image TEXT DEFAULT NULL")
+        if "source_type" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN source_type TEXT DEFAULT NULL")
+        if "source_id" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN source_id TEXT DEFAULT NULL")
+        if "learning_progress" not in cols:
+            c.execute("ALTER TABLE conversations ADD COLUMN learning_progress TEXT DEFAULT NULL")
             c.commit()
     finally:
         c.close()
@@ -237,6 +248,22 @@ def _migrate_goals():
         c.close()
 
 
+def _migrate_messages():
+    """迁移 messages 表 — 新增 thinking 列（存储 AI 思考过程，与 WorkBuddy 对齐）。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(messages)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        if "thinking" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN thinking TEXT")
+            c.commit()
+    finally:
+        c.close()
+
+
 def init_db():
     # 先迁移旧数据库的 CHECK 约束（新增 experience 类型）
     _migrate_memory_types()
@@ -246,6 +273,7 @@ def init_db():
     _migrate_notes()
     _migrate_memories()
     _migrate_goals()
+    _migrate_messages()
     with db() as c:
         c.executescript("""
 CREATE TABLE IF NOT EXISTS conversations (
@@ -261,6 +289,7 @@ CREATE TABLE IF NOT EXISTS messages (
     conversation_id TEXT NOT NULL,
     role TEXT CHECK(role IN ('user','assistant','system')),
     content TEXT,
+    thinking TEXT,
     created_at TEXT,
     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
@@ -459,15 +488,25 @@ CREATE INDEX IF NOT EXISTS idx_traces_conv ON conversation_traces(conv_id, creat
 # Conversations
 # ---------------------------------------------------------------------------
 
-def conv_create(title: str = "New Chat", persona_name: str = "") -> dict:
+def conv_create(title: str = "New Chat", persona_name: str = "", source_type: str = "", source_id: str = "") -> dict:
     cid = uuid.uuid4().hex[:8]
     now = _now()
     with db() as c:
         c.execute(
-            "INSERT INTO conversations (id, title, summary, persona_name, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (cid, title, "", persona_name if persona_name else None, now, now)
+            "INSERT INTO conversations (id, title, summary, persona_name, source_type, source_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (cid, title, "",
+             persona_name if persona_name else None,
+             source_type if source_type else None,
+             source_id if source_id else None,
+             now, now)
         )
-    return {"id": cid, "title": title, "summary": "", "persona_name": persona_name or None, "created_at": now, "updated_at": now}
+    return {
+        "id": cid, "title": title, "summary": "",
+        "persona_name": persona_name or None,
+        "source_type": source_type or None, "source_id": source_id or None,
+        "created_at": now, "updated_at": now,
+    }
 
 
 def conv_list() -> list:
@@ -506,7 +545,17 @@ def conv_list_by_date(date_from: str = "", date_to: str = "") -> list:
 def conv_get(cid: str) -> Optional[dict]:
     with db() as c:
         r = c.execute("SELECT * FROM conversations WHERE id = ?", (cid,)).fetchone()
-    return dict(r) if r else None
+    if not r:
+        return None
+    d = dict(r)
+    # learning_progress 以 JSON 字符串存储，读时解析为 dict
+    if d.get("learning_progress"):
+        try:
+            import json as _json
+            d["learning_progress"] = _json.loads(d["learning_progress"])
+        except (ValueError, TypeError):
+            pass
+    return d
 
 
 def conv_del(cid: str):
@@ -515,9 +564,9 @@ def conv_del(cid: str):
 
 
 def conv_update_title(cid: str, title: str):
-    now = _now()
+    """更新对话标题（不改 updated_at — 元数据操作不应影响按活动时间的排序）"""
     with db() as c:
-        c.execute("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?", (title, now, cid))
+        c.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, cid))
 
 
 def conv_update_summary(cid: str, summary: str):
@@ -534,16 +583,39 @@ def conv_update_persona(cid: str, persona_name: str | None):
         c.execute("UPDATE conversations SET persona_name = ?, updated_at = ? WHERE id = ?", (persona_name, now, cid))
 
 
+def conv_update_background(cid: str, background: str | None):
+    """更新对话的世界观背景（可为 None 清除）"""
+    now = _now()
+    with db() as c:
+        c.execute("UPDATE conversations SET background = ?, updated_at = ? WHERE id = ?", (background, now, cid))
+
+
+def conv_update_background_image(cid: str, image_file: str | None):
+    """更新对话的背景图片文件名（可为 None 清除）"""
+    now = _now()
+    with db() as c:
+        c.execute("UPDATE conversations SET background_image = ?, updated_at = ? WHERE id = ?", (image_file, now, cid))
+
+
+def conv_update_learning_progress(cid: str, progress: dict | None):
+    """更新对话的学习进度（JSON：{doc_id, chunk_index, total_chunks, title}）"""
+    import json as _json
+    now = _now()
+    data = _json.dumps(progress, ensure_ascii=False) if progress else None
+    with db() as c:
+        c.execute("UPDATE conversations SET learning_progress = ?, updated_at = ? WHERE id = ?", (data, now, cid))
+
+
 # ---------------------------------------------------------------------------
 # Messages
 # ---------------------------------------------------------------------------
 
-def msg_add(cid: str, role: str, content: str) -> int:
+def msg_add(cid: str, role: str, content: str, thinking: str = "") -> int:
     now = _now()
     with db() as c:
         cur = c.execute(
-            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?,?,?,?)",
-            (cid, role, content, now)
+            "INSERT INTO messages (conversation_id, role, content, thinking, created_at) VALUES (?,?,?,?,?)",
+            (cid, role, content, thinking or None, now)
         )
         c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, cid))
         return cur.lastrowid
@@ -609,6 +681,16 @@ def msg_del_from(msg_id: int) -> int:
         return cur.rowcount
 
 
+def msg_del_one(msg_id: int) -> int:
+    """删除单条消息（不影响前后消息），返回删除数量"""
+    with db() as c:
+        row = c.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
+        cur = c.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+        if row:
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), row["conversation_id"]))
+        return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Conversation Traces (执行追踪)
 # ---------------------------------------------------------------------------
@@ -616,12 +698,12 @@ def msg_del_from(msg_id: int) -> int:
 def trace_add(conv_id: str, trace_type: str, data: dict,
               message_id: int = None, round_num: int = 0) -> int:
     with db() as c:
-        c.execute(
+        cur = c.execute(
             "INSERT INTO conversation_traces (conv_id, message_id, trace_type, round_num, data, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (conv_id, message_id, trace_type, round_num, json.dumps(data, ensure_ascii=False), _now()),
         )
-        return c.lastrowid
+        return cur.lastrowid
 
 
 def trace_list(conv_id: str = "", trace_type: str = "", limit: int = 100) -> list:
@@ -635,6 +717,31 @@ def trace_list(conv_id: str = "", trace_type: str = "", limit: int = 100) -> lis
         ps.append(trace_type)
     q += " ORDER BY id DESC LIMIT ?"
     ps.append(limit)
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    return [dict(r) for r in rs]
+
+
+def trace_query(keyword: str = "", trace_type: str = "", conv_id: str = "",
+                limit: int = 50, offset: int = 0) -> list:
+    """跨对话查询执行痕迹，支持按工具名/关键词过滤（data JSON 内 name/args/result_summary）。
+
+    keyword 为空时按时间倒序返回；非空时做 LIKE 匹配（名称 + 内容片段）。
+    """
+    q = "SELECT * FROM conversation_traces WHERE 1=1"
+    ps = []
+    if conv_id:
+        q += " AND conv_id = ?"
+        ps.append(conv_id)
+    if trace_type:
+        q += " AND trace_type = ?"
+        ps.append(trace_type)
+    if keyword:
+        kw = f"%{keyword}%"
+        q += " AND (data LIKE ? OR trace_type LIKE ?)"
+        ps.extend([kw, kw])
+    q += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    ps.extend([limit, offset])
     with db() as c:
         rs = c.execute(q, ps).fetchall()
     return [dict(r) for r in rs]
@@ -685,7 +792,7 @@ def mem_add(type_: str, content: str, importance: int = 3,
             keywords: str = "", source_conv_id: str = "",
             recorded_at: str = "", distilled_from: Optional[int] = None) -> int:
     # 落库守卫：拒绝明文密钥写入记忆库（防蒸馏/对话把明文提进记忆）
-    from validators.sanitize_guard import guard_store
+    from .validators.sanitize_guard import guard_store
     risk = guard_store(content, field="memory")
     if risk:
         logging.getLogger("zenith.db").warning(
@@ -746,6 +853,49 @@ def mem_search(keyword: str = "", limit: int = 30) -> list:
             (f"%{kw}%", f"%{kw}%", limit)
         ).fetchall()
     return [dict(r) for r in rs]
+
+
+MEMORY_TYPES = ("personal_info", "preference", "event", "decision", "fact", "experience", "skill")
+
+
+def mem_update(mid: int, content: str = "", type_: str = "", importance: int = 0,
+               keywords: str = "") -> bool:
+    """更新记忆（内容/类型/重要性/关键词）。返回是否成功。
+
+    - 只更新传入的非空字段；全部为空时直接返回 True（无改动）
+    - 与 mem_add 一致走明文密钥守卫，命中则拒绝
+    - FTS 由 memories_au 触发器自动同步，无需手动维护
+    - 更新后置 user_edited = 1，标记人工修改
+    """
+    existing = mem_get(mid)
+    if not existing:
+        return False
+    new_content = content if content else existing.get("content", "")
+    if not new_content:
+        return False
+    from .validators.sanitize_guard import guard_store
+    risk = guard_store(new_content, field="memory")
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝更新记忆（含明文密钥）: mid=%s names=%s", mid, risk["names"]
+        )
+        return False
+    fields, params = [], []
+    if content:
+        fields.append("content = ?"); params.append(content)
+    if type_ and type_ in MEMORY_TYPES:
+        fields.append("type = ?"); params.append(type_)
+    if importance:
+        fields.append("importance = ?"); params.append(int(importance))
+    if keywords:
+        fields.append("keywords = ?"); params.append(keywords)
+    if not fields:
+        return True
+    fields.append("user_edited = 1")
+    params.append(mid)
+    with db() as c:
+        c.execute(f"UPDATE memories SET {', '.join(fields)} WHERE id = ?", params)
+    return True
 
 
 def mem_del(mid: int):

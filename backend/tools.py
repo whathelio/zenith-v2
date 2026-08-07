@@ -5,7 +5,7 @@ import re
 import json
 import asyncio
 import logging
-from .database import sch_add, sch_list, sch_update, note_add, note_list, note_update, note_get, mem_search, mem_add, mem_del, mem_list
+from .database import sch_add, sch_list, sch_update, note_add, note_list, note_update, note_get, mem_search, mem_add, mem_del, mem_get, mem_list, MEMORY_TYPES, msg_list, conv_update_learning_progress
 from . import knowledge_service
 from .config import is_code_execution_enabled
 
@@ -111,6 +111,38 @@ TOOLS_SCHEMA = [
                     "keyword": {"type": "string", "description": "搜索关键词"}
                 },
                 "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_memory",
+            "description": "修改单条记忆（内容/类型/重要性/关键词）。只更新提供的字段。生成待确认请求，用户确认后才会真正修改。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "要修改的记忆 ID（用 search_memory 先查到）"},
+                    "content": {"type": "string", "description": "新的记忆内容（可选）"},
+                    "type": {"type": "string", "description": "新的记忆类型（可选）: personal_info/preference/event/decision/fact/experience"},
+                    "importance": {"type": "integer", "description": "新的重要性 1-5（可选）"},
+                    "keywords": {"type": "string", "description": "新的关键词，逗号分隔（可选）"}
+                },
+                "required": ["memory_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "删除单条记忆。生成待确认请求，用户确认后才会真正删除。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "integer", "description": "要删除的记忆 ID（用 search_memory 先查到）"}
+                },
+                "required": ["memory_id"]
             }
         }
     },
@@ -560,10 +592,102 @@ TOOLS_SCHEMA = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_note",
+            "description": "删除一条笔记。不会立即执行——会生成待确认动作，用户确认后才真正删除。调用时传笔记 ID。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "integer", "description": "要删除的笔记 ID"}
+                },
+                "required": ["note_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_note",
+            "description": "修改一条笔记的内容/标题/标签。不会立即执行——会生成待确认动作，用户确认后才真正修改。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "integer", "description": "要修改的笔记 ID"},
+                    "title": {"type": "string", "description": "新标题（可选）"},
+                    "content": {"type": "string", "description": "新内容（可选）"},
+                    "tags": {"type": "string", "description": "新标签，逗号分隔（可选）"}
+                },
+                "required": ["note_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "编辑项目内的代码/配置文件。不会立即执行——会生成待确认动作，用户确认后才写入。仅限项目目录内文本文件（.py/.ts/.tsx/.js/.json/.yaml/.md/.css 等），自动备份原文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径（绝对或相对项目根）"},
+                    "content": {"type": "string", "description": "文件完整新内容"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_background",
+            "description": "更新当前对话的背景设定（世界观/情境）。当用户在对话中明确要求修改背景、追加设定、或你判断用户描述的新情境应持久化为背景时调用。不会立即生效——会生成待确认动作，用户确认后才更新。传空字符串表示清除背景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_background": {"type": "string", "description": "新的完整背景设定文本（Markdown），应包含用户本次提出的所有要求并保留原有相关设定。空字符串清除背景。"}
+                },
+                "required": ["new_background"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_message",
+            "description": "删除当前对话历史中的某条消息（用于清理对话中的隐私/敏感明文，如密钥、密码、助记词）。按内容片段匹配用户发过的消息，只删除匹配的那一条，不影响前后消息。不会立即执行——会生成待确认动作，用户确认后才真正删除。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content_fragment": {"type": "string", "description": "要删除的消息内容片段（从对话历史中复制，至少 8 个字符以精确匹配）"}
+                },
+                "required": ["content_fragment"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document_chunk",
+            "description": "逐段学习模式：读取已入库文档的第 N 段文本（chunk_index 从 1 开始）。调用后自动更新学习进度。教学时先讲当前段，用户掌握后再调用本工具读取下一段继续。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer", "description": "文档 ID（item_id）"},
+                    "chunk_index": {"type": "integer", "description": "段落序号，从 1 开始"}
+                },
+                "required": ["item_id", "chunk_index"]
+            }
+        }
+    },
 ]
 
 
 # ── 工具处理器注册表 ──
+# 当前执行对话 ID（由 execute_tool 设置，供 update_background 等工具使用）
+_current_conv_id: str = ""
+
 _TOOL_HANDLERS = {
     "add_schedule":       lambda a: _handle_add_schedule(a),
     "add_note":           lambda a: _handle_add_note(a),
@@ -597,15 +721,27 @@ _TOOL_HANDLERS = {
     "query_wiki":          lambda a: _handle_query_wiki(a),
     "kb_stats":            lambda a: _handle_kb_stats(a),
     "call_mcp":            lambda a: _handle_call_mcp(a),
+    "delete_note":         lambda a: _handle_delete_note(a),
+    "edit_note":           lambda a: _handle_edit_note(a),
+    "edit_memory":         lambda a: _handle_edit_memory(a),
+    "delete_memory":       lambda a: _handle_delete_memory(a),
+    "edit_file":           lambda a: _handle_edit_file(a),
+    "update_background":   lambda a: _handle_update_background(a),
+    "delete_message":      lambda a: _handle_delete_message(a),
+    "read_document_chunk": lambda a: _handle_read_document_chunk(a),
 }
 
 
-async def execute_tool(name: str, args: dict) -> dict:
+async def execute_tool(name: str, args: dict, conv_id: str = "") -> dict:
     """
     执行工具并返回统一格式 {success, result, ...}。
     通过注册表字典分发，替代长 if/elif 链。
     执行后自动附加 _verification 字段用于前端警告显示。
+    conv_id: 当前对话 ID，供需要对话上下文的工具使用（如 update_background）。
     """
+    global _current_conv_id
+    if conv_id:
+        _current_conv_id = conv_id
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         return {"success": False, "result": f"未知工具: {name}"}
@@ -785,7 +921,7 @@ def _handle_search_memory(args: dict) -> dict:
         return {"success": True, "result": "未找到相关记忆。"}
     lines = ["🧠 相关记忆："]
     for m in items:
-        lines.append(f"  [{m['type']}] {m['content']}")
+        lines.append(f"  [ID:{m['id']}][{m['type']}] {m['content']}")
     return {"success": True, "result": "\n".join(lines)}
 
 
@@ -1381,6 +1517,51 @@ def _find_duplicate_memory(
     return None
 
 
+def _find_duplicate_note(title: str = "", content: str = "", threshold: float = 0.85) -> int | None:
+    """检查笔记是否已存在高度相似的条目（标题或内容）。
+
+    用于 smart_classify 创建笔记前防重，避免同一主题产生碎片笔记堆积
+    （如 213-218 六条与主笔记重复的碎片）。标题完全一致即视为重复；
+    否则用内容相似度比对最近笔记。返回已存在笔记 ID，无重复返回 None。
+    """
+    if not (title or content):
+        return None
+    from difflib import SequenceMatcher
+    from .database import note_list as _note_list
+
+    title_norm = (title or "").strip().lower()
+    recent_notes = _note_list()[:50]  # 按 updated_at DESC 的最新 50 条
+
+    for n in recent_notes:
+        existing_title = (n.get("title") or "").strip().lower()
+        # 标题完全一致 → 重复
+        if title_norm and existing_title == title_norm:
+            return n["id"]
+        # 标题高度相似（忽略长度差异）→ 重复
+        if title_norm and existing_title:
+            tr = SequenceMatcher(None, title_norm, existing_title).ratio()
+            if tr >= threshold:
+                return n["id"]
+
+    # 内容相似度比对
+    content_norm = (content or "").strip().lower()
+    if content_norm and len(content_norm) >= 20:  # 内容太短无比对价值
+        best_id: int | None = None
+        best_ratio: float = 0.0
+        for n in recent_notes:
+            existing = (n.get("content") or "").strip().lower()
+            if not existing:
+                continue
+            ratio = SequenceMatcher(None, content_norm, existing).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_id = n["id"]
+        if best_ratio >= threshold and best_id is not None:
+            logger.debug("note dedup hit: ratio=%.3f, existing_id=%s", best_ratio, best_id)
+            return best_id
+    return None
+
+
 def _find_time_conflict(start_time: str, end_time: str = "", exclude_id: int | None = None, buffer_minutes: int = 5) -> dict | None:
     """检查给定时间段是否与已有日程冲突。
 
@@ -1822,17 +2003,25 @@ async def _handle_smart_classify(args: dict) -> dict:
     # 4. is_thought → 若 LLM 输出需要创建笔记则直接建 refined note
     if classification.get("is_thought") and not classification.get("is_plan"):
         if note_info and note_info.get("should_create"):
-            nid = note_add({
-                "title": note_info.get("title", summary or text[:30]),
-                "content": note_info.get("content", text),
-                "tags": ",".join(note_info.get("tags", [])) or keywords,
-                "source": "smart_classify",
-                "status": "proposed",
-                "stage": "refined",
-                "recorded_at": recorded_at,
-            })
-            actions.append(f"笔记 (ID:{nid})")
-            created_ids["note_id"] = nid
+            note_title = note_info.get("title", summary or text[:30])
+            note_content = note_info.get("content", text)
+            # 永久优化：创建前查重 — 防止与已有笔记（标题或内容）高度相似的碎片笔记堆积
+            dup_note = _find_duplicate_note(note_title, note_content, threshold=0.85)
+            if dup_note is not None:
+                actions.append(f"笔记已存在 (ID:{dup_note})，跳过创建")
+                created_ids["note_id"] = dup_note
+            else:
+                nid = note_add({
+                    "title": note_title,
+                    "content": note_content,
+                    "tags": ",".join(note_info.get("tags", [])) or keywords,
+                    "source": "smart_classify",
+                    "status": "proposed",
+                    "stage": "refined",
+                    "recorded_at": recorded_at,
+                })
+                actions.append(f"笔记 (ID:{nid})")
+                created_ids["note_id"] = nid
 
     # 构建返回结果
     result_lines = [
@@ -2017,7 +2206,14 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
     if type_:
         all_mems = [m for m in all_mems if m.get("type") == type_]
     if search:
-        all_mems = [m for m in all_mems if search in (m.get("content", "") + m.get("keywords", ""))]
+        # 分词 OR 模糊匹配：避免「集团ERP」只命中含精确字样的条目
+        # （如 1998/1999 未含该词而被 scope 过滤，导致重复漏检）
+        terms = [t.strip() for t in re.split(r"[,，;；\s]+", search) if t.strip()]
+        all_mems = [
+            m
+            for m in all_mems
+            if any(t in (m.get("content", "") + m.get("keywords", "")) for t in terms)
+        ]
 
     # 1. 自动相似度合并候选（>= 0.85 强相似）
     merge_groups = []
@@ -2269,6 +2465,269 @@ async def _handle_retrieve_docs(args: dict) -> dict:
         return {"success": True, "result": r.get("answer", "")}
     except Exception as e:
         return {"success": False, "result": f"知识库检索失败: {e}"}
+
+
+# ── 编辑类工具（需用户确认后执行）────────────────────
+from .confirm_flow import create_action
+
+
+def _handle_delete_note(args: dict) -> dict:
+    """删除笔记 — 生成待确认动作，不直接删除"""
+    note_id = args.get("note_id")
+    if not note_id:
+        return {"success": False, "result": "note_id 不能为空"}
+    note = note_get(note_id)
+    if not note:
+        return {"success": False, "result": f"笔记 ID:{note_id} 不存在"}
+    action = create_action(
+        action_type="delete_note",
+        title=f"删除笔记: {note.get('title', '')[:40]}",
+        payload={"note_id": note_id, "title": note.get("title", "")},
+    )
+    return {
+        "success": True,
+        "result": f"已生成删除笔记的待确认请求 (#{action['id']})。用户确认后才会真正删除：{note.get('title', '')}",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_edit_note(args: dict) -> dict:
+    """修改笔记 — 生成待确认动作，不直接修改"""
+    note_id = args.get("note_id")
+    if not note_id:
+        return {"success": False, "result": "note_id 不能为空"}
+    note = note_get(note_id)
+    if not note:
+        return {"success": False, "result": f"笔记 ID:{note_id} 不存在"}
+    changes = {k: args.get(k) for k in ("title", "content", "tags") if args.get(k) is not None}
+    if not changes:
+        return {"success": False, "result": "没有提供修改内容（title/content/tags 至少一个）"}
+    action = create_action(
+        action_type="edit_note",
+        title=f"修改笔记: {changes.get('title', note.get('title', ''))[:40]}",
+        payload={"note_id": note_id, **changes},
+    )
+    return {
+        "success": True,
+        "result": f"已生成修改笔记的待确认请求 (#{action['id']})。用户确认后才会真正修改。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_edit_memory(args: dict) -> dict:
+    """修改记忆 — 生成待确认动作，不直接修改"""
+    mid = args.get("memory_id")
+    if not mid:
+        return {"success": False, "result": "memory_id 不能为空"}
+    mem = mem_get(mid)
+    if not mem:
+        return {"success": False, "result": f"记忆 ID:{mid} 不存在"}
+    changes = {
+        k: args.get(k)
+        for k in ("content", "type", "importance", "keywords")
+        if args.get(k) is not None
+    }
+    # 允许把 importance 显式设为 0 之外的值；type 限定白名单
+    if "type" in changes and changes["type"] not in MEMORY_TYPES:
+        return {"success": False, "result": f"无效的记忆类型: {changes['type']}"}
+    if not changes:
+        return {"success": False, "result": "没有提供修改内容（content/type/importance/keywords 至少一个）"}
+    action = create_action(
+        action_type="edit_memory",
+        title=f"修改记忆 #{mid}: {mem.get('content', '')[:30]}",
+        payload={"memory_id": mid, **changes},
+    )
+    return {
+        "success": True,
+        "result": f"已生成修改记忆的待确认请求 (#{action['id']})。用户确认后才会真正修改。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_delete_memory(args: dict) -> dict:
+    """删除记忆 — 生成待确认动作，不直接删除"""
+    mid = args.get("memory_id")
+    if not mid:
+        return {"success": False, "result": "memory_id 不能为空"}
+    mem = mem_get(mid)
+    if not mem:
+        return {"success": False, "result": f"记忆 ID:{mid} 不存在"}
+    action = create_action(
+        action_type="delete_memory",
+        title=f"删除记忆 #{mid}: {mem.get('content', '')[:30]}",
+        payload={"memory_id": mid},
+    )
+    return {
+        "success": True,
+        "result": f"已生成删除记忆的待确认请求 (#{action['id']})。用户确认后才会真正删除。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_edit_file(args: dict) -> dict:
+    """编辑项目文件 — 生成待确认动作，不直接写入"""
+    path = (args.get("path") or "").strip()
+    content = args.get("content")
+    if not path or content is None:
+        return {"success": False, "result": "path 和 content 不能为空"}
+    action = create_action(
+        action_type="edit_file",
+        title=f"编辑文件: {path[:60]}",
+        payload={"path": path, "content": content},
+    )
+    return {
+        "success": True,
+        "result": f"已生成编辑文件的待确认请求 (#{action['id']})。用户确认后才会写入: {path}",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_update_background(args: dict) -> dict:
+    """更新对话背景 — 生成待确认动作，不直接更新。
+    需要对话 ID：从当前执行上下文获取（tools.py 全局 _current_conv_id）。
+    """
+    new_bg = (args.get("new_background") or "").strip()
+    conv_id = _current_conv_id
+    if not conv_id:
+        return {"success": False, "result": "无法获取当前对话 ID，无法更新背景"}
+    if not new_bg:
+        return {"success": False, "result": "new_background 不能为空（想清除背景请传空字符串？不，请明确说明清除意图）"}
+    # 保留前 60 字做标题
+    preview = new_bg[:60].replace("\n", " ")
+    action = create_action(
+        action_type="update_background",
+        title=f"更新对话背景: {preview}...",
+        payload={"conv_id": conv_id, "new_background": new_bg},
+    )
+    return {
+        "success": True,
+        "result": f"已生成更新对话背景的待确认请求 (#{action['id']})。用户确认后才会生效。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_delete_message(args: dict) -> dict:
+    """删除对话中的隐私消息 — 按内容片段匹配，生成待确认动作。
+    只匹配当前对话的用户消息，单条删除（不影响前后消息）。
+    """
+    fragment = (args.get("content_fragment") or "").strip()
+    conv_id = _current_conv_id
+    if not conv_id:
+        return {"success": False, "result": "无法获取当前对话 ID，无法删除消息"}
+    if len(fragment) < 8:
+        return {"success": False, "result": "content_fragment 至少 8 个字符，请提供更完整的内容片段以精确匹配"}
+
+    # 在当前对话的用户消息中 LIKE 匹配
+    try:
+        msgs = msg_list(conv_id)
+    except Exception:
+        msgs = []
+    candidates = [
+        m for m in msgs
+        if m.get("role") == "user" and fragment in (m.get("content") or "")
+    ]
+    if not candidates:
+        return {"success": False, "result": f"在当前对话中没有找到包含「{fragment[:30]}」的用户消息。请提供更精确的内容片段。"}
+
+    # 多条匹配：提示但只取最近一条（AI 可再精确）
+    target = candidates[-1]  # 最近的匹配
+    preview = (target.get("content") or "")[:40].replace("\n", " ")
+    action = create_action(
+        action_type="delete_message",
+        title=f"删除对话消息: {preview}...",
+        payload={"msg_id": target["id"], "fragment": fragment},
+    )
+    extra = f"（共匹配 {len(candidates)} 条，将删除最近一条）" if len(candidates) > 1 else ""
+    return {
+        "success": True,
+        "result": f"已生成删除对话消息的待确认请求 (#{action['id']})。用户确认后才会删除该条消息{extra}。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+async def _handle_read_document_chunk(args: dict) -> dict:
+    """逐段学习：读取已入库文档的第 N 段文本，并自动更新学习进度。
+    通过 knowledge_service 从 api_gateway 取段落（chunk_index 从 1 开始）。
+    """
+    item_id = args.get("item_id")
+    chunk_index = args.get("chunk_index")
+    conv_id = _current_conv_id
+    if not item_id:
+        return {"success": False, "result": "item_id 不能为空"}
+    try:
+        chunk_index = int(chunk_index)
+    except (TypeError, ValueError):
+        return {"success": False, "result": "chunk_index 必须是数字"}
+    if chunk_index < 1:
+        return {"success": False, "result": "chunk_index 从 1 开始"}
+
+    try:
+        data = await knowledge_service.get_doc_chunks(int(item_id))
+    except Exception as e:
+        return {"success": False, "result": f"读取段落失败（知识库服务不可用？）: {e}"}
+    if data.get("error") or not data.get("chunks"):
+        return {"success": False, "result": data.get("error", "文档不存在或未入库")}
+
+    chunks = data.get("chunks", [])
+    total = data.get("total", len(chunks))
+    if chunk_index > total:
+        return {
+            "success": False,
+            "result": f"第 {chunk_index} 段超出范围，该文档共 {total} 段。已全部学完。",
+            "finished": True,
+        }
+
+    target = chunks[chunk_index - 1]  # chunks 按 chunk_index 排序（0-based 数组）
+    text = target.get("text", "")
+    doc_title = target.get("title", f"文档 {item_id}")
+    if not text.strip():
+        return {"success": False, "result": f"第 {chunk_index} 段为空文本"}
+
+    # 自动更新学习进度
+    if conv_id:
+        try:
+            conv_update_learning_progress(conv_id, {
+                "doc_id": int(item_id),
+                "title": doc_title,
+                "chunk_index": chunk_index,
+                "total_chunks": total,
+            })
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "result": (
+            f"## 教材内容（{doc_title} · 第 {chunk_index}/{total} 段）\n\n"
+            f"{text}\n\n"
+            f"---\n[已读到第 {chunk_index}/{total} 段。讲解当前段，提一个问题确认理解，"
+            f"用户掌握后调用 read_document_chunk 进入下一段。]"
+        ),
+        "doc_title": doc_title,
+        "chunk_index": chunk_index,
+        "total_chunks": total,
+    }
 
 
 async def _handle_query_wiki(args: dict) -> dict:

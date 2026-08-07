@@ -34,6 +34,8 @@ export interface TraceEntry {
 
 interface TraceCardProps {
   entry: TraceEntry
+  /** 强制展开/折叠：true=全部展开, false=全部折叠, null/undefined=各自默认状态 */
+  forceExpand?: boolean | null
 }
 
 /* ── 工具分类 ── */
@@ -89,9 +91,12 @@ function ToolBadge({ name }: { name: string }) {
 
 /* ── 代码执行卡片 ── */
 
-function CodeTrace({ entry }: { entry: TraceEntry }) {
+function CodeTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
   const [showArgs, setShowArgs] = useState(false)
   const [showOutput, setShowOutput] = useState(true)
+  // 受控模式：forceExpand 覆盖局部状态（null 时不干预）
+  const effArgs = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showArgs
+  const effOutput = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showOutput
   const code = typeof entry.args?.code === 'string' ? entry.args.code : ''
   const isFail = entry.success === false
 
@@ -114,9 +119,9 @@ function CodeTrace({ entry }: { entry: TraceEntry }) {
       {code && (
         <div className="trace-section">
           <button className="trace-section-toggle" onClick={() => setShowArgs(!showArgs)}>
-            <span className={`trace-caret ${showArgs ? 'open' : ''}`}>▸</span> 代码
+            <span className={`trace-caret ${effArgs ? 'open' : ''}`}>▸</span> 代码
           </button>
-          {showArgs && (
+          {effArgs && (
             <pre className="trace-code-args">{code.split('\n').slice(0, 25).join('\n')}{code.split('\n').length > 25 ? '\n…' : ''}</pre>
           )}
         </div>
@@ -126,10 +131,10 @@ function CodeTrace({ entry }: { entry: TraceEntry }) {
       {(entry.stdout || entry.stderr || entry.resultSummary) && (
         <div className="trace-section">
           <button className="trace-section-toggle" onClick={() => setShowOutput(!showOutput)}>
-            <span className={`trace-caret ${showOutput ? 'open' : ''}`}>▸</span> 输出
+            <span className={`trace-caret ${effOutput ? 'open' : ''}`}>▸</span> 输出
             {entry.stdout?.length ? <span className="trace-count">{entry.stdout.length} 字符</span> : null}
           </button>
-          {showOutput && (
+          {effOutput && (
             <div className="trace-output">
               {entry.stdout ? <pre className="trace-stdout">{entry.stdout}</pre> : null}
               {entry.stderr ? <pre className="trace-stderr">{entry.stderr}</pre> : null}
@@ -146,8 +151,9 @@ function CodeTrace({ entry }: { entry: TraceEntry }) {
 
 /* ── 文件编辑卡片（预留，diff 视图）── */
 
-function FileEditTrace({ entry }: { entry: TraceEntry }) {
+function FileEditTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
   const [expanded, setExpanded] = useState(true)
+  const effExpanded = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : expanded
   return (
     <div className="trace-card trace-file">
       <div className="trace-header">
@@ -159,9 +165,9 @@ function FileEditTrace({ entry }: { entry: TraceEntry }) {
       </div>
       <div className="trace-section">
         <button className="trace-section-toggle" onClick={() => setExpanded(!expanded)}>
-          <span className={`trace-caret ${expanded ? 'open' : ''}`}>▸</span> 变更
+          <span className={`trace-caret ${effExpanded ? 'open' : ''}`}>▸</span> 变更
         </button>
-        {expanded && (entry.oldText || entry.newText) && (
+        {effExpanded && (entry.oldText || entry.newText) && (
           <div className="trace-diff">
             {entry.oldText?.split('\n').map((l, i) => (
               <div key={`-${i}`} className="trace-diff-line del"><span className="trace-diff-marker">-</span><span>{l || ' '}</span></div>
@@ -171,7 +177,7 @@ function FileEditTrace({ entry }: { entry: TraceEntry }) {
             ))}
           </div>
         )}
-        {expanded && !entry.oldText && !entry.newText && (
+        {effExpanded && !entry.oldText && !entry.newText && (
           <pre className="trace-argbox">{entry.resultSummary || entry.args?.file_path || ''}</pre>
         )}
       </div>
@@ -181,8 +187,9 @@ function FileEditTrace({ entry }: { entry: TraceEntry }) {
 
 /* ── 通用工具卡片 ── */
 
-function ToolTrace({ entry }: { entry: TraceEntry }) {
+function ToolTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
   const [expanded, setExpanded] = useState(false)
+  const effExpanded = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : expanded
   const meta = KIND_META[entry.kind] || KIND_META.tool
   const isPending = entry.status === 'pending'
   const isFail = !isPending && entry.success === false
@@ -211,12 +218,12 @@ function ToolTrace({ entry }: { entry: TraceEntry }) {
         ) : (
           <>
             <span className="trace-duration">{fmtDuration(entry.durationMs)}</span>
-            <span className={`trace-caret ${expanded ? 'open' : ''}`}>▾</span>
+            <span className={`trace-caret ${effExpanded ? 'open' : ''}`}>▾</span>
           </>
         )}
       </div>
 
-      {expanded && !isPending && (
+      {effExpanded && !isPending && (
         <div className="trace-detail">
           {entry.args && Object.keys(entry.args).length > 0 && (
             <div className="trace-block">
@@ -238,10 +245,10 @@ function ToolTrace({ entry }: { entry: TraceEntry }) {
 
 /* ── 主组件 ── */
 
-export default function TraceCard({ entry }: TraceCardProps) {
-  if (entry.kind === 'code') return <CodeTrace entry={entry} />
-  if (entry.kind === 'file_edit') return <FileEditTrace entry={entry} />
-  return <ToolTrace entry={entry} />
+export default function TraceCard({ entry, forceExpand }: TraceCardProps) {
+  if (entry.kind === 'code') return <CodeTrace entry={entry} forceExpand={forceExpand} />
+  if (entry.kind === 'file_edit') return <FileEditTrace entry={entry} forceExpand={forceExpand} />
+  return <ToolTrace entry={entry} forceExpand={forceExpand} />
 }
 
 /** 从旧版 ToolCallEntry 迁移辅助（ChatView 使用） */

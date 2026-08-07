@@ -43,10 +43,21 @@ function calcDailyGoalAmounts(g: Goal): Map<string, number> {
   const cv = g.current_value
   const rate = g.daily_target / 100
   if (rate <= 0 || cv <= 0 || !g.end_date) return map
+  const activeDays = (g.active_days || []).filter(Boolean).sort()
   const todayDate = formatDate(new Date())
+
+  if (activeDays.length > 0) {
+    // 只对选定的激活日生成金额，金额按激活日序号复利累进
+    activeDays.forEach((dateKey, i) => {
+      if (dateKey < todayDate) return // 过去的日期不再显示当日配额
+      const delta = cv * Math.pow(1 + rate, i) * rate
+      map.set(dateKey, delta)
+    })
+    return map
+  }
+
+  // 兼容：未设定激活日时回退为连续日期（今天 → end_date）
   const remainDays = Math.max(daysBetween(todayDate, g.end_date), 1)
-  // 第 i 天的「日化目标金额」= 当日应新增金额（复投）：cv × (1+rate)^i × rate
-  // 注意：这里算的是当日增量，不是累计余额——之前误用累计余额导致日历数字逐日暴涨、显示错乱
   for (let i = 0; i <= remainDays; i++) {
     const dateKey = addDaysStr(todayDate, i)
     const delta = cv * Math.pow(1 + rate, i) * rate

@@ -485,8 +485,8 @@ export default function CalendarView() {
                   displayEvents.map(ev => (
                     <div
                       key={ev.id}
-                      className={`cal-event-card ${ev.expired ? 'cal-expired' : ''}`}
-                      onClick={() => openEdit(ev)}
+                      className={`cal-event-card ${ev.expired ? 'cal-expired' : ''} ${ev.is_event ? 'cal-event-card-finance' : ''}`}
+                      onClick={() => { if (!ev.is_event) openEdit(ev) }}
                     >
                       <div className="cal-event-left">
                         <span className="cal-event-time">{ev.timeStr || '全天'}</span>
@@ -503,20 +503,35 @@ export default function CalendarView() {
                         <div className="cal-event-tags">
                           {ev.country && <span className="cal-tag">{ev.country}</span>}
                           <span className="cal-tag cal-tag-cat">{CATEGORY_LABELS[ev.category] || ev.category}</span>
+                          {ev.is_event && <span className="cal-tag cal-tag-src">金十</span>}
                         </div>
+                        {ev.finance && (
+                          <div className="cal-event-finance">
+                            <span className="cal-finance-item">预期 <b>{ev.finance.consensus || '—'}</b></span>
+                            <span className="cal-finance-item">前值 <b>{ev.finance.previous || '—'}</b></span>
+                            {ev.finance.actual ? <span className="cal-finance-item">实际 <b>{ev.finance.actual}</b></span> : null}
+                            {ev.finance.affect_txt && (
+                              <span className={`cal-finance-affect ${ev.finance.affect_txt.includes('利多') ? 'affect-bull' : ev.finance.affect_txt.includes('利空') ? 'affect-bear' : ''}`}>
+                                {ev.finance.affect_txt}
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
                       {ev.impact && (
                         <div className="cal-event-impact" style={{ background: IMPACT_COLORS[ev.impact] + '22', color: IMPACT_COLORS[ev.impact], border: `1px solid ${IMPACT_COLORS[ev.impact]}44` }}>
                           {IMPACT_LABELS[ev.impact] || ev.impact}
                         </div>
                       )}
-                      <button
-                        className="cal-delete-btn"
-                        onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(ev) }}
-                        title="删除"
-                      >
-                        ✕
-                      </button>
+                      {!ev.is_event && (
+                        <button
+                          className="cal-delete-btn"
+                          onClick={(e) => { e.stopPropagation(); setShowDeleteConfirm(ev) }}
+                          title="删除"
+                        >
+                          ✕
+                        </button>
+                      )}
                     </div>
                   ))
                 )}
@@ -606,6 +621,7 @@ export default function CalendarView() {
                         borderRight: selectedIds.has(s.id) ? '1px solid #50fa7b' : '1px solid var(--color-border)',
                         borderTop: selectedIds.has(s.id) ? '1px solid #50fa7b' : '1px solid var(--color-border)',
                         borderBottom: selectedIds.has(s.id) ? '1px solid #50fa7b' : '1px solid var(--color-border)',
+                        borderStyle: isProposed && !selectedIds.has(s.id) ? 'dashed' : 'solid',
                         borderRadius: 6, opacity: isCancelled ? 0.5 : 1,
                         display: 'flex', alignItems: 'flex-start', gap: 10,
                         transition: 'all 0.15s',

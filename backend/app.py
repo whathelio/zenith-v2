@@ -21,13 +21,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
-from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
-from .tools import TOOLS_SCHEMA, execute_tool, detect_consolidate_intent, generate_consolidate_plan, apply_consolidate_plan, _format_consolidate_plan
+from .tools import TOOLS_SCHEMA, execute_tool
 from .llm_client import chat_stream, plan_time, call_llm
 from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate, extract_memories_from_text
 from .confirm_flow import get_pending_proposals, confirm_proposal, reject_proposal, modify_proposal
+from .confirm_flow import get_pending_proposals_merged, confirm_action, reject_action
 from .confirm_flow import TutorialFlow, list_active_tutorials
 from .context_compressor import maybe_compress
 from .schedule_reminder import check_reminders, get_due_reminders, get_upcoming_schedules, REMINDER_PRESETS
@@ -304,6 +305,112 @@ async def create_conversation(data: dict = Body(default=None)):
     return db.conv_create(title, persona_name)
 
 
+# ═══════════════════════════════════════════════════════
+# API: 学习对话工厂 — 从笔记/记忆一键创建学习对话
+# ═══════════════════════════════════════════════════════
+_MAX_BG_LEN = 2000  # 背景截断上限（中文约 1.5k tokens）
+
+
+@app.post("/api/learning/start")
+async def start_learning(data: dict = Body(default=None)):
+    """从笔记/记忆/文档创建学习对话。
+    入参: {source_type: "note"|"memory"|"document", source_id: int}
+    流程: 读内容 → 截断 → 按类型生成苏格拉底引导背景 → 建对话 → 返回 conv_id
+    """
+    if not data:
+        raise HTTPException(400, "缺少参数")
+    source_type = data.get("source_type", "")
+    source_id = data.get("source_id")
+    if source_type not in ("note", "memory", "document"):
+        raise HTTPException(400, "source_type 仅支持 note/memory/document")
+    if not source_id:
+        raise HTTPException(400, "source_id 不能为空")
+
+    # 1. 读取内容
+    if source_type == "note":
+        item = db.note_get(int(source_id))
+        if not item:
+            raise HTTPException(404, f"笔记 #{source_id} 不存在")
+        title = item.get("title") or f"笔记 #{source_id}"
+        content = item.get("content") or ""
+        source_type_label = "笔记"
+    elif source_type == "memory":
+        item = db.mem_get(int(source_id))
+        if not item:
+            raise HTTPException(404, f"记忆 #{source_id} 不存在")
+        title = (item.get("content") or "")[:40] or f"记忆 #{source_id}"
+        content = item.get("content") or ""
+        source_type_label = "记忆"
+    else:  # document — 知识库文档（整本逐段学习）
+        try:
+            from .knowledge_service import get_doc_chunks
+            doc = await get_doc_chunks(int(source_id))
+        except Exception as e:
+            raise HTTPException(503, f"知识库服务不可用: {e}")
+        if doc.get("error") or not doc.get("chunks"):
+            raise HTTPException(404, doc.get("error", f"文档 #{source_id} 未入库或不存在"))
+        chunks = doc.get("chunks", [])
+        total = doc.get("total", len(chunks))
+        title = (chunks[0].get("title") or "")[:40] or f"文档 #{source_id}"
+        # 背景只放开头摘要 + 教学引导，正文由 read_document_chunk 逐段拉取
+        first_text = (chunks[0].get("text") or "")[:_MAX_BG_LEN]
+        content = first_text
+        source_type_label = "文档"
+
+    if not content.strip():
+        raise HTTPException(400, "内容为空，无法创建学习对话")
+
+    # 2. 苏格拉底引导分层（按 source_type / 内容类型）
+    content_preview = content.strip()
+    truncated = False
+    if len(content_preview) > _MAX_BG_LEN:
+        content_preview = content_preview[:_MAX_BG_LEN]
+        truncated = True
+
+    mem_type = item.get("type", "") if source_type == "memory" else ""
+    if source_type == "memory" and mem_type == "experience":
+        guide = (
+            "这是你的经验记忆。请用苏格拉底式追问（最多3个）引导我反思这段经历："
+            "当时发生了什么、为什么有效/无效、下次如何复用。"
+        )
+    elif source_type == "document":
+        guide = (
+            "【逐段学习模式】这份文档已整本入库并切成段落。教学规则：\n"
+            "1. 从第 1 段开始，先讲解当前段的要点（用自己的话，不要照抄）\n"
+            "2. 讲完提一个具体问题确认我理解（一次一个）\n"
+            "3. 我回答后：判断我是否掌握——掌握则调用 read_document_chunk 工具读取下一段继续；"
+            "没掌握则换个角度再讲，直到我掌握\n"
+            "4. 每段都这样推进，直到读完最后一段后总结全书"
+        )
+    else:
+        guide = (
+            "请你扮演苏格拉底式的学习伙伴，用提问引导我理解以下内容："
+            "每次只提一个核心问题，等我想清楚再进入下一个，逐步推导，不要一次性灌输。"
+            "内容来自我的{label}「{title}」。"
+        ).format(label=source_type_label, title=title)
+
+    bg = f"{content_preview}\n\n【学习模式】{guide}"
+    if truncated:
+        bg += "\n\n（内容较长已截断，完整内容请逐段学习或使用检索工具获取）"
+
+    # 3. 创建学习对话
+    conv = db.conv_create(
+        title=f"学习：{title[:30]}",
+        source_type=source_type,
+        source_id=str(source_id),
+    )
+    db.conv_update_background(conv["id"], bg)
+    # 文档学习：初始化进度
+    if source_type == "document":
+        db.conv_update_learning_progress(conv["id"], {
+            "doc_id": int(source_id),
+            "title": title,
+            "chunk_index": 0,
+            "total_chunks": total,
+        })
+    return {"success": True, "conversation_id": conv["id"], "title": conv["title"]}
+
+
 @app.get("/api/conversations")
 async def list_conversations():
     return db.conv_list()
@@ -327,7 +434,7 @@ async def delete_conversation(conv_id: str):
 
 @app.put("/api/conversations/{conv_id}")
 async def rename_conversation(conv_id: str, data: dict = Body(default=None)):
-    """重命名对话 / 更新 persona_name"""
+    """重命名对话 / 更新 persona_name / 更新 background"""
     title = data.get("title", "").strip()
     persona_name = data.get("persona_name", "")
     if not title:
@@ -335,7 +442,80 @@ async def rename_conversation(conv_id: str, data: dict = Body(default=None)):
     db.conv_update_title(conv_id, title)
     if "persona_name" in data:
         db.conv_update_persona(conv_id, persona_name if persona_name else None)
+    if "background" in data:
+        bg = data.get("background", "").strip()
+        db.conv_update_background(conv_id, bg if bg else None)
     return {"success": True, "title": title}
+
+
+# ═══════════════════════════════════════════════════════
+# API: 对话背景图片（仅本机，不影响对话内容）
+# ═══════════════════════════════════════════════════════
+BG_DIR = Path(__file__).parent.parent / "data" / "backgrounds"
+BG_ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+@app.post("/api/conversations/{conv_id}/background-image")
+async def upload_conversation_bg(conv_id: str, file: UploadFile = File(...)):
+    """上传对话背景图片 — 保存到 data/backgrounds/{conv_id}{ext}"""
+    conv = db.conv_get(conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    # 校验扩展名
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in BG_ALLOWED_EXT:
+        raise HTTPException(400, f"不支持的图片格式: {ext}，仅支持 png/jpg/jpeg/webp/gif")
+    BG_DIR.mkdir(parents=True, exist_ok=True)
+    # 清理旧的背景图
+    for old in BG_DIR.glob(f"{conv_id}.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    target = BG_DIR / f"{conv_id}{ext}"
+    content = await file.read()
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(400, "图片不能超过 15MB")
+    target.write_bytes(content)
+    db.conv_update_background_image(conv_id, f"{conv_id}{ext}")
+    return {"success": True, "image": f"/api/conversations/{conv_id}/background-image"}
+
+
+@app.get("/api/conversations/{conv_id}/background-image")
+async def get_conversation_bg(conv_id: str):
+    """返回对话背景图片（二进制）"""
+    conv = db.conv_get(conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    img = (conv or {}).get("background_image", "") or ""
+    if not img:
+        raise HTTPException(404, "未设置背景图片")
+    path = BG_DIR / img
+    if not path.exists():
+        raise HTTPException(404, "背景图片文件不存在")
+    media = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(path), media_type=media)
+
+
+@app.delete("/api/conversations/{conv_id}/background-image")
+async def clear_conversation_bg(conv_id: str):
+    """清除对话背景图片"""
+    conv = db.conv_get(conv_id)
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    img = (conv or {}).get("background_image", "") or ""
+    if img:
+        path = BG_DIR / img
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    db.conv_update_background_image(conv_id, None)
+    return {"success": True}
 
 
 @app.post("/api/conversations/{conv_id}/summarize")
@@ -549,10 +729,17 @@ async def api_distill_get_file(filename: str):
     """下载指定蒸馏 txt 文件"""
     from .unified_distill import _OUTPUT_DIR
     import os
-    filepath = os.path.join(_OUTPUT_DIR, filename)
-    if not os.path.exists(filepath):
+    from pathlib import Path as _P
+    # 路径穿越防护：仅允许 _OUTPUT_DIR 内的 .txt 文件
+    base = _P(_OUTPUT_DIR).resolve()
+    filepath = (base / filename).resolve()
+    if not str(filepath).startswith(str(base)):
+        raise HTTPException(400, "非法文件路径")
+    if filepath.suffix.lower() != ".txt":
+        raise HTTPException(400, "仅支持 .txt 文件")
+    if not filepath.exists():
         raise HTTPException(404, "文件不存在")
-    return FileResponse(filepath, media_type="text/plain", filename=filename)
+    return FileResponse(filepath, media_type="text/plain", filename=filepath.name)
 
 
 def _parse_json_response_single(content: str) -> dict:
@@ -589,97 +776,6 @@ def _parse_json_response_single(content: str) -> dict:
 # ═══════════════════════════════════════════════════════
 
 _active_streams: dict[str, asyncio.Task] = {}  # conv_id → 后台处理任务
-
-# 对话中的待确认记忆整理计划：conv_id → {plan, message, created_at}
-_pending_consolidate: dict[str, dict] = {}
-
-
-async def _handle_consolidate_chat(
-    conv_id: str,
-    user_message: str,
-    event_queue: asyncio.Queue,
-):
-    """处理记忆整理意图：返回计划或执行结果，不走普通 LLM 流程。"""
-    # 1. 先检查是否有待执行计划 + 用户确认
-    pending = _pending_consolidate.get(conv_id)
-    confirm_words = ["确认执行", "执行", "确认", "删除", "开始整理"]
-    skip_words = ["跳过", "取消", "不", "不要", "算了"]
-    is_confirm = any(w in user_message for w in confirm_words)
-    is_skip = any(w in user_message for w in skip_words)
-
-    if pending:
-        if is_confirm and not is_skip:
-            try:
-                result = await apply_consolidate_plan(pending["plan"])
-                _pending_consolidate.pop(conv_id, None)
-                reply = (
-                    f"🧹 记忆整理已执行。\n"
-                    f"共删除 {result['deleted_count']} 条记忆（重复/过时）。\n"
-                    f"失败 {len(result['failed'])} 条。"
-                )
-                if result["deleted_ids"]:
-                    reply += f"\n删除 ID: {', '.join(str(x) for x in result['deleted_ids'])}"
-                if result["failed"]:
-                    reply += f"\n失败项: {result['failed'][:3]}"
-            except Exception as e:
-                reply = f"❌ 记忆整理执行失败: {e}"
-        elif is_skip:
-            _pending_consolidate.pop(conv_id, None)
-            reply = "已取消记忆整理。"
-        else:
-            # 用户没给明确指令，再次展示计划
-            reply = (
-                "我还在等你确认上次的记忆整理计划。\n\n"
-                + _format_consolidate_plan(pending["plan"])
-            )
-        event_queue.put_nowait(json.dumps({'type': 'text', 'content': reply}, ensure_ascii=False))
-        event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': reply, 'conversation_id': conv_id}, ensure_ascii=False))
-        db.msg_add(conv_id, "assistant", reply)
-        event_queue.put_nowait(json.dumps({'type': 'done'}))
-        event_queue.put_nowait(None)
-        return
-
-    # 2. 检测新意图
-    intent = await detect_consolidate_intent(user_message)
-    if not intent.get("trigger"):
-        # 不是整理意图，走正常流程：返回 False 让调用方继续
-        event_queue.put_nowait(None)
-        return
-
-    # 3. 生成整理计划
-    scope = intent.get("scope", "all")
-    type_ = ""
-    search = ""
-    if scope in ("personal_info", "preference", "event", "decision", "fact", "experience"):
-        type_ = scope
-    elif scope and scope != "all":
-        search = scope
-
-    plan = await generate_consolidate_plan(type_=type_, search=search)
-    formatted = _format_consolidate_plan(plan)
-
-    # 4. 如果没有任何候选，直接提示
-    if not plan.get("merge_groups") and not plan.get("outdated"):
-        reply = "🧹 我检查了记忆库，没有发现明显的重复或过时记忆，无需整理。"
-        event_queue.put_nowait(json.dumps({'type': 'text', 'content': reply}, ensure_ascii=False))
-        event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': reply, 'conversation_id': conv_id}, ensure_ascii=False))
-        db.msg_add(conv_id, "assistant", reply)
-        event_queue.put_nowait(json.dumps({'type': 'done'}))
-        event_queue.put_nowait(None)
-        return
-
-    # 5. 保存待确认计划，并返回计划给用户
-    _pending_consolidate[conv_id] = {
-        "plan": plan,
-        "message": user_message,
-        "created_at": datetime.now().isoformat(),
-    }
-    event_queue.put_nowait(json.dumps({'type': 'text', 'content': formatted}, ensure_ascii=False))
-    event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': formatted, 'conversation_id': conv_id}, ensure_ascii=False))
-    db.msg_add(conv_id, "assistant", formatted)
-    event_queue.put_nowait(json.dumps({'type': 'done'}))
-    event_queue.put_nowait(None)
-
 
 # Chat API - migrated to routers/chat.py
 
@@ -730,7 +826,7 @@ async def get_calendar_templates():
 
 @app.get("/api/calendar/week")
 async def get_calendar_week(date: str = ""):
-    """返回指定日期所在周的所有日程（含重复展开）"""
+    """返回指定日期所在周的所有日程（含重复展开）+ 外部财经事件（只读）"""
     from datetime import datetime as _dt, timedelta as _td
     try:
         ref = _dt.strptime(date, "%Y-%m-%d") if date else _dt.now()
@@ -753,6 +849,51 @@ async def get_calendar_week(date: str = ""):
             expanded.extend(instances)
         else:
             expanded.append(s)
+    # 合并外部财经事件（schedule_events 缓存，只读，含前值/预期/实际三值）
+    # 注意：event_time 存 ISO 格式（如 2026-08-09T20:30:00+08:00），date_to 必须用 T 分隔，
+    # 不能用 sch_list 的空格格式（'2026-08-09 23:59:59'）——字符串比较会漏掉周日当天事件
+    try:
+        events = db.event_list(
+            date_from=monday,
+            date_to=f"{sunday[:10]}T23:59:59",
+            min_star=0,
+        )
+        for ev in events:
+            et = (ev.get("event_time") or "")[:10]
+            if not et or et < monday or et > sunday[:10]:
+                continue
+            expanded.append({
+                "id": f"evt_{ev.get('id', '')}",
+                "title": ev.get("name", ""),
+                "description": "",
+                "start_time": ev.get("event_time", ""),
+                "end_time": ev.get("event_time", ""),
+                "location": "",
+                "status": "",
+                "priority": "",
+                "importance": int(ev.get("star", 1) or 1),
+                "category": ev.get("category", "economic"),
+                "impact": ev.get("impact", "neutral"),
+                "country": ev.get("country", ""),
+                "remind_before": 0,
+                "goal_id": None,
+                "recurrence": "",
+                "parent_id": None,
+                "source": ev.get("source", "jin10"),
+                "confirmed_at": None,
+                "created_at": ev.get("created_at", ""),
+                "is_event": True,
+                "is_external": True,
+                "finance": {
+                    "previous": ev.get("previous", ""),
+                    "consensus": ev.get("consensus", ""),
+                    "actual": ev.get("actual", ""),
+                    "revised": ev.get("revised", ""),
+                    "affect_txt": ev.get("affect_txt", ""),
+                },
+            })
+    except Exception as e:
+        logger.warning("合并财经事件失败: %s", e)
     return {"monday": monday, "sunday": sunday, "events": expanded}
 
 
@@ -792,7 +933,7 @@ async def get_calendar_month(month: str = ""):
 
 @app.get("/api/proposals")
 async def proposals():
-    return get_pending_proposals()
+    return get_pending_proposals_merged()
 
 
 @app.post("/api/proposals/confirm")
@@ -801,6 +942,8 @@ async def proposal_confirm(data: dict = Body(default=None)):
     pid = data.get("id") or data.get("confirm_id")
     if not ptype or not pid:
         raise HTTPException(status_code=400, detail="缺少 type 和 id 字段")
+    if ptype == "action":
+        return confirm_action(int(pid))
     return confirm_proposal(ptype, pid)
 
 
@@ -810,6 +953,8 @@ async def proposal_reject(data: dict = Body(default=None)):
     pid = data.get("id") or data.get("confirm_id")
     if not ptype or not pid:
         raise HTTPException(status_code=400, detail="缺少 type 和 id 字段")
+    if ptype == "action":
+        return reject_action(int(pid))
     return reject_proposal(ptype, pid)
 
 
@@ -1385,6 +1530,7 @@ app.include_router(settings.router)
 app.include_router(chat.router)
 app.include_router(audit.router)
 app.include_router(modules.router)
+app.include_router(news.router)
 
 
 @app.get("/{full_path:path}")

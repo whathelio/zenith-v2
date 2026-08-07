@@ -39,6 +39,60 @@ SOCRATIC_INJECTION = """## 苏格拉底追问原则
 这些原则仅用于引导思维方式，不影响你调用工具和执行实际任务。"""
 
 
+def _auto_title(text: str, max_len: int = 24) -> str:
+    """从首条用户消息生成简洁对话标题（永久优化：替代 New Chat 占位）。
+
+    - 去除 URL、空白、控制字符
+    - 纯链接消息按域名归类（B站/YouTube/其他），避免退回「新对话」占位
+    - 截取前 max_len 个字符
+    - 空消息 → 兜底「新对话」
+    """
+    import re
+    if not text or not text.strip():
+        return "新对话"
+    urls = re.findall(r"https?://([^/\s]+)", text)
+    host = urls[0].lower() if urls else ""
+    is_bili = "bilibili" in host or "b23" in host
+    is_yt = "youtube" in host or "youtu.be" in host
+    t = re.sub(r"https?://\S+", "", text)
+    t = re.sub(r"\s+", "", t)
+    t = re.sub(r"[。！？!?；;，,]+$", "", t)
+    # 纯链接（无文字）→ 按域名归类
+    if not t:
+        if is_bili:
+            return "B站视频提取与总结"
+        if is_yt:
+            return "YouTube视频提取与总结"
+        if "zhihu" in host:
+            return "知乎文章"
+        return "链接内容提取"
+    # 文字过短且带视频链接 → 补全域名语义（如「提取与总结」→「B站视频提取与总结」）
+    if len(t) < 6:
+        if is_bili:
+            return f"B站视频{t}"
+        if is_yt:
+            return f"YouTube视频{t}"
+    return t[:max_len]
+
+
+def _maybe_auto_title(conv_id: str, user_message: str):
+    """若对话标题仍是 New Chat（首条消息），用首条消息生成简洁标题。
+    仅当消息数 == 1（刚刚写入第一条 user 消息）时触发，避免覆盖用户自定义标题。
+    """
+    try:
+        conv = db.conv_get(conv_id)
+        if not conv:
+            return
+        title = (conv.get("title") or "").strip()
+        if title not in ("", "New Chat"):
+            return  # 已有标题（含用户自定义），不覆盖
+        title = _auto_title(user_message)
+        if title != "新对话":
+            db.conv_update_title(conv_id, title)
+    except Exception:
+        pass
+
+
 def _build_skill_injection(current_query: str) -> str:
     """从记忆库检索 type='skill' 匹配当前查询，作为硬性指令注入 system prompt。
 
@@ -69,7 +123,7 @@ def _build_skill_injection(current_query: str) -> str:
         return ""
 
 
-async def _auto_distill_conv(conv_id: str):
+async def _auto_extract_memory(conv_id: str):
     """后台自动提取对话记忆（共用 _do_extract 内核，与 periodic 同路径）"""
     logger = logging.getLogger("zenith.distill")
     try:
@@ -97,6 +151,7 @@ async def _process_conv(
             event_queue.put_nowait(json.dumps({'type': 'reminder', 'content': reminder}, ensure_ascii=False))
 
         assistant_text = ""
+        assistant_thinking = ""  # 收集思考过程（与 WorkBuddy 对齐持久化）
         tool_results = []
         MAX_TOOL_ROUNDS = 6
 
@@ -111,6 +166,7 @@ async def _process_conv(
                     event_queue.put_nowait(json.dumps({'type': 'text', 'content': chunk["content"]}, ensure_ascii=False))
                 elif chunk["type"] == "thinking":
                     # 思考过程 — DeepSeek reasoning_content / Anthropic thinking
+                    assistant_thinking += chunk["content"]
                     event_queue.put_nowait(json.dumps({'type': 'thinking', 'content': chunk["content"]}, ensure_ascii=False))
                 elif chunk["type"] == "tool_call":
                     round_tool_calls.append(chunk)
@@ -156,7 +212,7 @@ async def _process_conv(
 
                 t_start = time.time()
                 try:
-                    result = await execute_tool(tool_name, tool_args)
+                    result = await execute_tool(tool_name, tool_args, conv_id=conv_id)
                     success = not result.get("error")
                 except Exception as exc:
                     result = {"error": str(exc), "result": f"工具执行异常: {exc}"}
@@ -249,7 +305,7 @@ async def _process_conv(
                 })
 
         if assistant_text:
-            db.msg_add(conv_id, "assistant", assistant_text)
+            db.msg_add(conv_id, "assistant", assistant_text, thinking=assistant_thinking)
             audit_cfg = cfg.get("audit", {})
             if audit_cfg.get("enabled", True):
                 log_event("conversation_complete", {
@@ -272,7 +328,7 @@ async def _process_conv(
         await maybe_extract_memories(combined, conv_id, interval=cfg.get("memory_extract_interval", 3))
 
         if cfg.get("auto_distill_enabled", True):
-            asyncio.create_task(_auto_distill_conv(conv_id))
+            asyncio.create_task(_auto_extract_memory(conv_id))
 
         # L3: 输出验证 — 绝对化表述/高风险领域/记忆矛盾检测
         if cfg.get("validators", {}).get("output", {}).get("enabled", True):
@@ -345,14 +401,49 @@ async def chat(request: Request):
         _active_streams.pop(conv_id, None)
 
     db.msg_add(conv_id, "user", user_message)
+    # 永久优化：首条消息后自动生成简洁标题（替代 New Chat 占位）
+    _maybe_auto_title(conv_id, user_message)
     await maybe_compress(conv_id)
 
     return _start_sse(conv_id, user_message, cfg, provider_name, persona_name, persist_user=False)
 
 
 def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_query: str = "") -> list:
-    """构建 system + 历史消息（Persona / 苏格拉底 / 审计 / 记忆 / 技能注入链）"""
+    """构建 system + 历史消息（背景 / 学习进度 / Persona / 苏格拉底 / 审计 / 记忆 / 技能注入链）"""
     system_parts = [cfg["system_prompt"]]
+
+    # 对话背景注入（world background）— 在 system_prompt 之后、Persona 之前
+    background = None
+    conv_data = None
+    try:
+        conv_data = db.conv_get(conv_id)
+        background = (conv_data or {}).get("background", "") or ""
+    except Exception:
+        pass
+    if background:
+        # 时间/情景自动感知：注入当前日期与时段，让 AI 的回答贴合当下情境
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        _hour = _now.hour
+        _period = "清晨" if _hour < 7 else ("上午" if _hour < 12 else ("下午" if _hour < 18 else ("晚上" if _hour < 23 else "深夜")))
+        _weekday = "星期" + "一二三四五六日"[_now.weekday()]
+        system_parts.append(
+            f"## 对话背景\n{background.strip()}\n\n"
+            f"【当前时间感知】今天是 {_now.strftime('%Y-%m-%d')} {_weekday}，现在{_period}"
+            f"（{_now.strftime('%H:%M')}）。回答时自然贴合当前时段（如早晨问候、晚间收尾、深夜简短）"
+        )
+
+    # 学习进度注入（逐段学习模式续学）— 告知 AI 当前学到第几段
+    if conv_data:
+        lp = conv_data.get("learning_progress")
+        if isinstance(lp, dict) and lp.get("doc_id"):
+            system_parts.append(
+                f"## 学习进度\n"
+                f"当前学习: {lp.get('title', '')}（共 {lp.get('total_chunks', 0)} 段）\n"
+                f"进度: 第 {lp.get('chunk_index', 0)}/{lp.get('total_chunks', 0)} 段（下一段是第 {lp.get('chunk_index', 0) + 1} 段）\n"
+                f"规则: 用户要求继续学习时，调用 read_document_chunk(item_id={lp.get('doc_id')}, "
+                f"chunk_index={lp.get('chunk_index', 0) + 1}) 读取下一段开始讲解。"
+            )
 
     # Persona 注入 — 在 system_prompt 之后、审计之前（per-conversation 绑定）
     if persona_name:
@@ -375,6 +466,20 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
     # 审计员 Skill — 从源头减少幻觉（可配置关闭）
     if cfg.get("auditor_skill", {}).get("enabled", True):
         system_parts.append(AUDITOR_SKILL_PROMPT)
+
+    # 编辑能力声明 — 告知 AI 具备删除/修改笔记、编辑文件的能力（需用户确认后执行）
+    system_parts.append(
+        "## 你的编辑能力\n"
+        "你具备修改 Zenith 内容的工具，可以执行以下操作（全部需要用户确认后才会真正执行）：\n"
+        "- delete_note(note_id): 删除一条笔记\n"
+        "- edit_note(note_id, title/content/tags): 修改一条笔记的内容/标题/标签\n"
+        "- edit_file(path, content): 编辑项目内的代码/配置文件（限项目目录，自动备份）\n"
+        "- update_background(new_background): 更新当前对话的背景设定（世界观/情境）\n"
+        "- delete_message(content_fragment): 删除当前对话历史中的某条消息（清理隐私明文，如密钥/密码/助记词）\n"
+        "- read_document_chunk(item_id, chunk_index): 逐段学习——读取已入库文档第 N 段文本（自动更新学习进度）\n"
+        "当用户要求删除/修改笔记、编辑代码、修改对话背景设定、清理对话中的隐私消息、或逐段学习文档时，调用对应工具，"
+        "不要声称你没有这些能力。修改类工具调用后前端会弹出确认卡片，用户点「执行」才会生效；read_document_chunk 是只读工具，直接返回段落内容。"
+    )
 
     memory_injection = build_memory_injection(current_query=current_query)
     if memory_injection:
@@ -513,9 +618,12 @@ async def edit_message(request: Request):
 
 
 @router.delete("/messages/{msg_id}")
-async def delete_message(msg_id: int):
-    """删除消息及其后所有消息"""
-    deleted = db.msg_del_from(msg_id)
+async def delete_message(msg_id: int, mode: str = "tail"):
+    """删除消息。mode=tail（默认）：删除该条及之后；mode=single：仅删除该条"""
+    if mode == "single":
+        deleted = db.msg_del_one(msg_id)
+    else:
+        deleted = db.msg_del_from(msg_id)
     if deleted == 0:
         return JSONResponse({"error": "消息不存在"}, status_code=404)
     return {"success": True, "deleted": deleted}

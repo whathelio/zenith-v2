@@ -68,3 +68,11 @@ zenith_rag/
 zenith_wiki/
 chroma_db/
 tasks.db
+
+# 临时探测脚本 / 本地快捷方式
+_probe*.py
+*.lnk
+
+# 数据库备份（含敏感数据，绝不上传）
+data/backup/
+data/*.bak*

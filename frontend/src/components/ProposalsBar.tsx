@@ -39,10 +39,12 @@ export default function ProposalsBar({ proposals, onConfirm, onReject, onModify 
       {proposals.map(p => {
         const key = `${p.type}-${p.id}`
         const isEditing = editingId === key
+        const isAction = p.type === 'action'
+        const actionIcon = p.id >= 1000 ? '✏️' : '📝'
         return (
           <div key={key} className="proposal-item">
             <span className="proposal-icon">
-              {p.type === 'schedule' ? '📅' : '📝'}
+              {isAction ? actionIcon : (p.type === 'schedule' ? '📅' : '📝')}
             </span>
             {isEditing ? (
               <div className="proposal-edit-form">
@@ -107,8 +109,8 @@ export default function ProposalsBar({ proposals, onConfirm, onReject, onModify 
                 </>
               ) : (
                 <>
-                  <button className="btn btn-sm btn-primary" onClick={() => onConfirm(p.type, p.id)}>确认</button>
-                  {onModify && <button className="btn btn-sm" onClick={() => startEdit(p)}>修改</button>}
+                  <button className="btn btn-sm btn-primary" onClick={() => onConfirm(p.type, p.id)}>{isAction ? '执行' : '确认'}</button>
+                  {onModify && !isAction && <button className="btn btn-sm" onClick={() => startEdit(p)}>修改</button>}
                   <button className="btn btn-sm" onClick={() => onReject(p.type, p.id)}>忽略</button>
                 </>
               )}

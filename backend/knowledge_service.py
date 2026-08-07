@@ -93,6 +93,24 @@ async def list_tasks(status: Optional[str] = None, limit: int = 20) -> dict:
         return r.json()
 
 
+async def list_docs() -> dict:
+    """列出已入库文档（逐段学习用）"""
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        r = await c.get(f"{KNOWLEDGE_API_BASE}/documents", headers=_headers())
+        if r.status_code >= 400:
+            return {"error": r.text, "code": f"HTTP_{r.status_code}", "docs": []}
+        return r.json()
+
+
+async def get_doc_chunks(item_id: int) -> dict:
+    """按 item_id 取该文档全部段落文本"""
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.get(f"{KNOWLEDGE_API_BASE}/documents/{item_id}/chunks", headers=_headers())
+        if r.status_code >= 400:
+            return {"error": r.text, "code": f"HTTP_{r.status_code}", "chunks": []}
+        return r.json()
+
+
 async def ingest_pdf(filename: str, content: bytes) -> dict:
     """转发 PDF 上传到 api_gateway /ingest。"""
     try:
