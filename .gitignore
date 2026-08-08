@@ -79,3 +79,6 @@ data/*.bak*
 
 # 启动调试日志
 _pw_debug*.txt
+
+# 前端调试测试产物
+frontend/_*.cjs

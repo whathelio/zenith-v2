@@ -40,13 +40,26 @@ interface ListItem {
 
 /* ─────────────────────────── 行内解析 ─────────────────────────── */
 
-const INLINE_RE = /(\*\*[^*]+\*\*|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\((https?:\/\/[^\s)]+)\)|https?:\/\/[^\s<)\]]+|`[^`\n]+`|\{\{SEC_\d{3}\}\})/
+// 链接单独匹配（严格紧邻约束，避免对孤立 [ 的灾难性回溯）
+// 必须 [文本](http...) 紧邻结构；文本内不允许再嵌套 [
+const LINK_RE = /\[([^\[\]]{1,200})\]\((https?:\/\/[^\s)]+)\)/
+// 基础行内标记（不含链接分支）
+// 单星号 em 用「前后边界」约束：仅当星号两侧是空白/标点边界时才视为强调，
+// 避免 Python 代码 `[2023]*4` 或 `per_1m*` 中的 * 触发灾难性回溯
+const INLINE_RE = /(\*\*[^*]+\*\*|~~[^~]+~~|(?:^|[^\w*])\*[^*\s][^*]*\*(?=$|[^\w*])|https?:\/\/[^\s<)\]]+|`[^`\n]+`|\{\{SEC_\d{3}\}\})/
 
 function parseInline(text: string): InlineToken[] {
   if (!text) return []
   const tokens: InlineToken[] = []
   let rest = text
   while (rest) {
+    // 先尝试链接（严格模式，失败不回溯）
+    const linkM = LINK_RE.exec(rest)
+    if (linkM && linkM.index === 0) {
+      tokens.push({ type: 'link', text: linkM[1], url: linkM[2] })
+      rest = rest.slice(linkM[0].length)
+      continue
+    }
     const m = INLINE_RE.exec(rest)
     if (!m) {
       if (rest) tokens.push({ type: 'text', text: rest })
@@ -58,10 +71,11 @@ function parseInline(text: string): InlineToken[] {
       tokens.push({ type: 'strong', children: parseInline(token.slice(2, -2)) })
     } else if (token.startsWith('~~') && token.endsWith('~~')) {
       tokens.push({ type: 'del', children: parseInline(token.slice(2, -2)) })
-    } else if (token.startsWith('*') && token.endsWith('*')) {
-      tokens.push({ type: 'em', children: parseInline(token.slice(1, -1)) })
-    } else if (token.startsWith('[')) {
-      tokens.push({ type: 'link', text: token.slice(1, token.indexOf(']')), url: m[2] || '' })
+    } else if (token.includes('*') && token.endsWith('*') && token.slice(1, -1).includes('*') === false) {
+      // 单星号 em：token 可能带前置边界字符，取第一个 * 到末尾 *
+      const firstStar = token.indexOf('*')
+      const inner = token.slice(firstStar + 1, -1)
+      tokens.push({ type: 'em', children: parseInline(inner) })
     } else if (token.startsWith('http')) {
       tokens.push({ type: 'url', url: token })
     } else if (token.startsWith('`')) {
@@ -194,6 +208,8 @@ function parseBlocks(text: string): Block[] {
         i = j
         continue
       }
+      // 兜底：parseListLines 返回空（理论不该发生）时必须前进，防止死循环
+      i++
     }
 
     // 普通段落 — 合并连续非空行
@@ -209,12 +225,14 @@ function parseBlocks(text: string): Block[] {
 }
 
 /** 递归解析列表行（按缩进构建嵌套） */
+// 注意：与 LIST_RE 保持一致，支持缩进前缀（^\s*），否则缩进列表会因正则不匹配
+// 返回空数组导致 parseBlocks 死循环（i 不前进）
 function parseListLines(rawLines: RawLine[]): ListItem[] {
   const items: ListItem[] = []
   let i = 0
   while (i < rawLines.length) {
     const line = rawLines[i]
-    const m = line.text.match(/^([-*+]|\d+\.)\s+(.*)$/)
+    const m = line.text.match(/^\s*([-*+]|\d+\.)\s+(.*)$/)
     if (!m) { i++; continue }
     const ordered = /\d/.test(m[1])
     const content = m[2]
