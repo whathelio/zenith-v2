@@ -111,6 +111,7 @@ export default function ChatView() {
     loadPersonas()
   }, [loadConversations])
 
+  // 加载指定对话 — 仅在 convId 变化时触发（不依赖 conversations，避免循环）
   useEffect(() => {
     if (convId) {
       loadConversation(convId)
@@ -119,15 +120,19 @@ export default function ChatView() {
         navigatedConvRef.current = convId
         navigate(`/chat/${convId}`, { replace: true })
       }
-    } else if (conversations.length > 0) {
-      const firstId = conversations[0].id
-      if (navigatedConvRef.current !== firstId) {
-        navigatedConvRef.current = firstId
-        navigate(`/chat/${firstId}`, { replace: true })
-      }
-      loadConversation(firstId)
     }
-  }, [convId, conversations])
+  }, [convId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 无 convId 时回退到最近对话（依赖 conversations，但只做一次导航，不加载对话内容）
+  useEffect(() => {
+    if (convId) return
+    if (conversations.length === 0) return
+    const firstId = conversations[0].id
+    if (navigatedConvRef.current !== firstId) {
+      navigatedConvRef.current = firstId
+      navigate(`/chat/${firstId}`, { replace: true })
+    }
+  }, [convId, conversations, navigate])
 
   // 从 Dashboard 底部快捷输入过来的待发送消息：会话就绪后自动发送
   useEffect(() => {

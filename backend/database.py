@@ -810,7 +810,7 @@ def mem_add(type_: str, content: str, importance: int = 3,
         return cur.lastrowid
 
 
-def mem_list(type_: str = "") -> list:
+def mem_list(type_: str = "", limit: int = 0) -> list:
     with db() as c:
         q = "SELECT * FROM memories"
         ps = []
@@ -818,6 +818,9 @@ def mem_list(type_: str = "") -> list:
             q += " WHERE type = ?"
             ps.append(type_)
         q += " ORDER BY importance DESC, created_at DESC"
+        if limit > 0:
+            q += " LIMIT ?"
+            ps.append(limit)
         rs = c.execute(q, ps).fetchall()
     return [dict(r) for r in rs]
 
