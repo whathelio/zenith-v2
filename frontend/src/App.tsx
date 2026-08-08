@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import AppLayout from './components/AppLayout'
+import ErrorBoundary from './components/ErrorBoundary'
 import DashboardView from './features/DashboardView'
 import ChatView from './features/ChatView'
 import SettingsView from './features/SettingsView'
@@ -9,7 +10,8 @@ import KnowledgeView from './features/KnowledgeView'
 
 export default function App() {
   return (
-    <Routes>
+    <ErrorBoundary>
+      <Routes>
       {/* 主页面组 — 共享左侧面板布局（含对话页） */}
       <Route element={<AppLayout />}>
         <Route path="/" element={<DashboardView />} />
@@ -28,6 +30,7 @@ export default function App() {
       <Route path="/settings" element={<SettingsView />} />
 
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+    </ErrorBoundary>
   )
 }

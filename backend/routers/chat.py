@@ -89,8 +89,8 @@ def _maybe_auto_title(conv_id: str, user_message: str):
         title = _auto_title(user_message)
         if title != "新对话":
             db.conv_update_title(conv_id, title)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("zenith.chat").warning("自动标题生成失败: %s", e)
 
 
 def _build_skill_injection(current_query: str) -> str:
@@ -370,6 +370,16 @@ async def chat(request: Request):
     if not conv_id:
         conv = db.conv_create()
         conv_id = conv["id"]
+    else:
+        # 兜底：conv_id 非空但对话不存在（如旧标签页/URL 残留）→ 自动创建新对话，
+        # 避免 msg_add 触发 FOREIGN KEY 约束崩溃（500）
+        try:
+            if db.conv_get(conv_id) is None:
+                conv = db.conv_create()
+                conv_id = conv["id"]
+        except Exception:
+            conv = db.conv_create()
+            conv_id = conv["id"]
 
     # 如果请求未指定 persona，从对话记录中读取
     if not persona_name and conv_id:
