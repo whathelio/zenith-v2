@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useParams, useNavigate, Link } from 'react-router-dom'
+import { useParams, useNavigate, useLocation, Link } from 'react-router-dom'
 import ChatConvPanel from '../components/ChatConvPanel'
 import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
@@ -13,6 +13,9 @@ let _msgIdCounter = 0
 export default function ChatView() {
   const { convId } = useParams<{ convId: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
+  // 记录已导航到的对话 ID，防止 useEffect 因 URL 规范化差异反复 navigate 造成渲染振荡
+  const navigatedConvRef = useRef<string | null>(null)
 
   const [conversations, setConversations] = useState<any[]>([])
   const [activeConv, setActiveConv] = useState<any>(null)
@@ -111,10 +114,17 @@ export default function ChatView() {
   useEffect(() => {
     if (convId) {
       loadConversation(convId)
-      navigate(`/chat/${convId}`, { replace: true })
+      // 仅在 URL 路径与目标不一致时才导航（replace 避免历史堆积 + 防振荡）
+      if (navigatedConvRef.current !== convId || location.pathname !== `/chat/${convId}`) {
+        navigatedConvRef.current = convId
+        navigate(`/chat/${convId}`, { replace: true })
+      }
     } else if (conversations.length > 0) {
       const firstId = conversations[0].id
-      navigate(`/chat/${firstId}`, { replace: true })
+      if (navigatedConvRef.current !== firstId) {
+        navigatedConvRef.current = firstId
+        navigate(`/chat/${firstId}`, { replace: true })
+      }
       loadConversation(firstId)
     }
   }, [convId, conversations])
