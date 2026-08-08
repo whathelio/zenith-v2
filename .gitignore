@@ -76,3 +76,6 @@ _probe*.py
 # 数据库备份（含敏感数据，绝不上传）
 data/backup/
 data/*.bak*
+
+# 启动调试日志
+_pw_debug*.txt

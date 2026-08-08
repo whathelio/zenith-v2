@@ -1018,8 +1018,12 @@ def _save_txt_plan(content: str, filename: str) -> str:
 
 
 # 外部归档根目录 — 每日/每周/行情蒸馏输出同步归档到此
-# 用户希望计划表/总结类内容统一放到 O:/计划书A1
-_ARCHIVE_BASE = "O:/计划书A1"
+# 默认落到项目 data/archive_external（不依赖旧盘符 O:/计划书A1）
+# 可用环境变量 ZENITH_ARCHIVE_BASE 覆盖为任意目录
+_ARCHIVE_BASE = os.environ.get(
+    "ZENITH_ARCHIVE_BASE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "archive_external"),
+).strip() or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "archive_external")
 
 
 def _archive_external(content: str, kind: str, date_str: str, filename: str) -> Optional[str]:
