@@ -13,6 +13,20 @@ sys.path.insert(0, str(PROJECT_DIR / "backend"))
 os.environ["ZENITH_TESTING"] = "1"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_test_db():
+    """会话结束后删除临时测试库（含 WAL/SHM 伴生文件），避免残留累积。"""
+    yield
+    try:
+        from backend.database import _test_tmp_path
+        for suffix in ("", "-wal", "-shm"):
+            p = _test_tmp_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
+
+
 @pytest.fixture(scope="function")
 def test_db():
     """每个测试函数独立的内存数据库 — 完全隔离，跑完即销毁"""

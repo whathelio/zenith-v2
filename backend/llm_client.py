@@ -9,8 +9,20 @@ from .config import (
     load_config, get_provider, get_provider_api_key,
     get_background_provider,
 )
+from .http_client import get_client
 
 logger = logging.getLogger("zenith.llm")
+
+
+def _http_error_detail(e: httpx.HTTPStatusError) -> str:
+    """从 HTTP 错误提取状态码 + 截断的响应体，便于排错。"""
+    try:
+        body = (e.response.text or "").strip()
+        if body:
+            return f"API 错误 ({e.response.status_code}): {body[:300]}"
+    except Exception:
+        pass
+    return f"API 错误 ({e.response.status_code})"
 
 
 async def chat_stream(
@@ -55,7 +67,7 @@ async def chat_stream(
         # openai 兼容（DeepSeek / SiliconFlow / Ollama 等）
         async for event in _chat_stream_openai(
             api_key, model, base_url, messages, tools,
-            temperature, max_tokens, cfg
+            temperature, max_tokens, cfg, provider_name
         ):
             yield event
 
@@ -64,7 +76,7 @@ async def _chat_stream_openai(
     api_key: str, model: str, base_url: str,
     messages: list[dict], tools: Optional[list[dict]],
     temperature: Optional[float], max_tokens: Optional[int],
-    cfg: dict,
+    cfg: dict, provider_name: str = "",
 ) -> AsyncGenerator[dict, None]:
     """OpenAI 兼容格式流式调用"""
     headers = {
@@ -85,67 +97,80 @@ async def _chat_stream_openai(
         payload["tool_choice"] = "auto"
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST", f"{base_url}/chat/completions",
-                headers=headers, json=payload
-            ) as resp:
-                resp.raise_for_status()
-                accumulated_tool = {}
+        client = get_client()
+        async with client.stream(
+            "POST", f"{base_url}/chat/completions",
+            headers=headers, json=payload, timeout=120.0
+        ) as resp:
+            resp.raise_for_status()
+            accumulated_tool = {}
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_str)
+                    # P2: 流式 usage 在最后一个非 [DONE] chunk 返回
+                    if data.get("usage"):
+                        try:
+                            from .database import cache_stat_add
+                            usage = data["usage"]
+                            cache_stat_add(
+                                provider=provider_name or model, model=model, kind="chat",
+                                prompt_tokens=usage.get("prompt_tokens") or 0,
+                                prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens") or 0,
+                                completion_tokens=usage.get("completion_tokens") or 0,
+                            )
+                        except Exception:
+                            pass  # 埋点失败不影响主流程
+                    delta = data.get("choices", [{}])[0].get("delta", {})
 
-                        content = delta.get("content", "")
-                        if content:
-                            yield {"type": "text", "content": content}
+                    content = delta.get("content", "")
+                    if content:
+                        yield {"type": "text", "content": content}
 
-                        # DeepSeek 等模型返回 reasoning_content — 思考过程
-                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                        if reasoning:
-                            yield {"type": "thinking", "content": reasoning}
+                    # DeepSeek 等模型返回 reasoning_content — 思考过程
+                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                    if reasoning:
+                        yield {"type": "thinking", "content": reasoning}
 
-                        tc = delta.get("tool_calls")
-                        if tc:
-                            for t in tc:
-                                idx = t.get("index", 0)
-                                if idx not in accumulated_tool:
-                                    accumulated_tool[idx] = {
-                                        "id": t.get("id", ""),
-                                        "name": "",
-                                        "args": ""
-                                    }
-                                fn = t.get("function", {})
-                                if fn.get("name"):
-                                    accumulated_tool[idx]["name"] = fn["name"]
-                                if fn.get("arguments"):
-                                    accumulated_tool[idx]["args"] += fn["arguments"]
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
+                    tc = delta.get("tool_calls")
+                    if tc:
+                        for t in tc:
+                            idx = t.get("index", 0)
+                            if idx not in accumulated_tool:
+                                accumulated_tool[idx] = {
+                                    "id": t.get("id", ""),
+                                    "name": "",
+                                    "args": ""
+                                }
+                            fn = t.get("function", {})
+                            if fn.get("name"):
+                                accumulated_tool[idx]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                accumulated_tool[idx]["args"] += fn["arguments"]
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
 
-                for tc in accumulated_tool.values():
-                    try:
-                        args = json.loads(tc["args"])
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    yield {
-                        "type": "tool_call",
-                        "name": tc["name"],
-                        "args": args,
-                        "id": tc["id"]
-                    }
+            for tc in accumulated_tool.values():
+                try:
+                    args = json.loads(tc["args"])
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                yield {
+                    "type": "tool_call",
+                    "name": tc["name"],
+                    "args": args,
+                    "id": tc["id"]
+                }
 
     except httpx.ConnectError:
         yield {"type": "text", "content": f"\n\n> ❌ 无法连接到 {base_url}"}
     except httpx.HTTPStatusError as e:
-        yield {"type": "text", "content": f"\n\n> ❌ API 错误 ({e.response.status_code})"}
+        yield {"type": "text", "content": f"\n\n> ❌ {_http_error_detail(e)}"}
     except Exception as e:
         yield {"type": "text", "content": f"\n\n> ❌ 连接错误: {e}"}
 
@@ -196,65 +221,65 @@ async def _chat_stream_anthropic(
         payload["tools"] = anthropic_tools
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST", f"{base_url}/messages",
-                headers=headers, json=payload
-            ) as resp:
-                resp.raise_for_status()
+        client = get_client()
+        async with client.stream(
+            "POST", f"{base_url}/messages",
+            headers=headers, json=payload, timeout=120.0
+        ) as resp:
+            resp.raise_for_status()
 
-                current_tool = {}
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    try:
-                        event = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+            current_tool = {}
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
 
-                    etype = event.get("type", "")
-                    if etype == "content_block_delta":
-                        delta = event.get("delta", {})
-                        d_type = delta.get("type", "")
-                        if d_type == "text_delta":
-                            yield {"type": "text", "content": delta.get("text", "")}
-                        elif d_type == "thinking_delta":
-                            # Anthropic extended thinking — 思考过程
-                            yield {"type": "thinking", "content": delta.get("thinking", "")}
-                        elif d_type == "input_json_delta":
-                            partial = delta.get("partial_json", "")
-                            if partial:
-                                current_tool.setdefault("args", "")
-                                current_tool["args"] += partial
-                    elif etype == "content_block_start":
-                        block = event.get("content_block", {})
-                        if block.get("type") == "tool_use":
-                            current_tool = {
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                                "args": "",
-                            }
-                    elif etype == "content_block_stop":
-                        if current_tool.get("name"):
-                            try:
-                                args = json.loads(current_tool["args"])
-                            except (json.JSONDecodeError, TypeError):
-                                args = {}
-                            yield {
-                                "type": "tool_call",
-                                "name": current_tool["name"],
-                                "args": args,
-                                "id": current_tool.get("id", ""),
-                            }
-                        current_tool = {}
-                    elif etype == "message_stop":
-                        break
+                etype = event.get("type", "")
+                if etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    d_type = delta.get("type", "")
+                    if d_type == "text_delta":
+                        yield {"type": "text", "content": delta.get("text", "")}
+                    elif d_type == "thinking_delta":
+                        # Anthropic extended thinking — 思考过程
+                        yield {"type": "thinking", "content": delta.get("thinking", "")}
+                    elif d_type == "input_json_delta":
+                        partial = delta.get("partial_json", "")
+                        if partial:
+                            current_tool.setdefault("args", "")
+                            current_tool["args"] += partial
+                elif etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        current_tool = {
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "args": "",
+                        }
+                elif etype == "content_block_stop":
+                    if current_tool.get("name"):
+                        try:
+                            args = json.loads(current_tool["args"])
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                        yield {
+                            "type": "tool_call",
+                            "name": current_tool["name"],
+                            "args": args,
+                            "id": current_tool.get("id", ""),
+                        }
+                    current_tool = {}
+                elif etype == "message_stop":
+                    break
 
     except httpx.ConnectError:
         yield {"type": "text", "content": f"\n\n> ❌ 无法连接到 {base_url}"}
     except httpx.HTTPStatusError as e:
-        yield {"type": "text", "content": f"\n\n> ❌ API 错误 ({e.response.status_code})"}
+        yield {"type": "text", "content": f"\n\n> ❌ {_http_error_detail(e)}"}
     except Exception as e:
         yield {"type": "text", "content": f"\n\n> ❌ 连接错误: {e}"}
 
@@ -309,14 +334,34 @@ async def call_llm(
         payload["response_format"] = response_format
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{base_url}/chat/completions",
-                headers=headers, json=payload
+        client = get_client()
+        r = await client.post(
+            f"{base_url}/chat/completions",
+            headers=headers, json=payload, timeout=60.0
+        )
+        r.raise_for_status()
+        data = r.json()
+        # C1: choices/content 判空防御 — 避免 data["choices"][0] 抛裸
+        # 'NoneType' object is not subscriptable 污染下游错误文本
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("provider 返回空 choices")
+        message = choices[0].get("message") or {}
+        if not (message.get("content") or "").strip():
+            raise ValueError("provider 返回空 content")
+        # P2: 缓存命中率埋点 — DeepSeek 返回 usage.prompt_cache_hit_tokens
+        try:
+            from .database import cache_stat_add
+            usage = data.get("usage") or {}
+            cache_stat_add(
+                provider=provider.get("name", ""), model=model, kind="background",
+                prompt_tokens=usage.get("prompt_tokens") or 0,
+                prompt_cache_hit_tokens=usage.get("prompt_cache_hit_tokens") or 0,
+                completion_tokens=usage.get("completion_tokens") or 0,
             )
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]
+        except Exception:
+            pass  # 埋点失败不影响主流程
+        return message
     except Exception as e:
         return {"role": "assistant", "content": f"Error: {e}"}
 
@@ -364,20 +409,20 @@ async def _call_llm_anthropic(
         payload["tools"] = anthropic_tools
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{base_url}/messages",
-                headers=headers, json=payload
-            )
-            r.raise_for_status()
-            data = r.json()
-            # Anthropic 响应转 OpenAI 格式
-            content_blocks = data.get("content", [])
-            text_parts = []
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    text_parts.append(block["text"])
-            return {"role": "assistant", "content": "\n".join(text_parts)}
+        client = get_client()
+        r = await client.post(
+            f"{base_url}/messages",
+            headers=headers, json=payload, timeout=60.0
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Anthropic 响应转 OpenAI 格式
+        content_blocks = data.get("content", [])
+        text_parts = []
+        for block in content_blocks:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+        return {"role": "assistant", "content": "\n".join(text_parts)}
     except Exception as e:
         return {"role": "assistant", "content": f"Error: {e}"}
 
@@ -386,10 +431,17 @@ async def _call_llm_anthropic(
 # Functional Helpers
 # ---------------------------------------------------------------------------
 
-async def extract_memories(conversation_text: str) -> list[dict]:
-    """从对话文本中提取结构化记忆"""
-    prompt = f"""从以下对话中提取值得记住的信息。返回 JSON 数组，每条格式：
-{{"type":"personal_info|preference|event|decision|fact|experience","content":"记忆内容","importance":1-5,"keywords":"逗号分隔关键词"}}
+async def extract_memories(conversation_text: str, existing_memories: Optional[list] = None) -> list[dict]:
+    """从对话文本中提取结构化记忆。
+
+    Args:
+        conversation_text: 对话文本
+        existing_memories: 已有记忆内容列表（供去重参考）。传入后 LLM 会跳过与
+            已有记忆表达同一事实/偏好的内容，或只输出更新后的完整内容，从根源
+            减少碎片记忆堆积。
+    """
+    prompt = """从以下对话中提取值得记住的信息。返回 JSON 数组，每条格式：
+{"type":"personal_info|preference|event|decision|fact|experience","content":"记忆内容","importance":1-5,"keywords":"逗号分隔关键词"}
 
 类型说明：
 - personal_info: 用户的个人信息（姓名、年龄、职业、所在地等）
@@ -397,8 +449,23 @@ async def extract_memories(conversation_text: str) -> list[dict]:
 - event: 发生过的事件（计划了什么、完成了什么等）
 - decision: 做过的决定（选了什么方案、定了什么方向等）
 - fact: 值得记住的事实（知识点、数据、背景信息等）
-- experience: 可复用的经验技巧（工作方法、踩坑教训、最佳实践等）
+- experience: 可复用的经验技巧（工作方法、踩坑教训、最佳实践等）"""
 
+    if existing_memories:
+        existing_text = "\n".join(f"- {m}" for m in existing_memories if m and str(m).strip())
+        if existing_text:
+            prompt += f"""
+
+【已有记忆 · 去重要求】记忆库中已存在以下记忆：
+{existing_text}
+
+提取时请遵守：
+1. 若对话中的新信息与上述某条已有记忆表达「同一事实/偏好/决定」，请跳过它（不要重复输出）。
+2. 若新信息是对已有记忆的「更新或补充」，请只输出更新后的完整内容，不要输出旧版本。
+3. 只有真正全新、且值得长期记住的信息才输出。
+
+"""
+    prompt += f"""
 对话内容：
 {conversation_text}
 
@@ -477,9 +544,11 @@ async def extract_datetime(user_text: str, reference_iso: Optional[str] = None) 
         # 如果 LLM 返回的是格式时间，尝试用 parse_time_to_iso 再解析
         return parse_time_to_iso(content, reference=now_tz())
 
+
+async def detect_note(user_text: str) -> list[dict]:
     """检测值得记录的想法/观点"""
-    prompt = f"""判断用户输入中是否有值得记录的思考/想法/观点。
-返回 JSON 数组：[{{"title":"标题","content":"内容","tags":"逗号分隔标签"}}]
+    prompt = """判断用户输入中是否有值得记录的思考/想法/观点。
+返回 JSON 数组：[{"title":"标题","content":"内容","tags":"逗号分隔标签"}]
 只是闲聊没有想法则返回 []。只返回 JSON。"""
 
     msg = await call_llm(

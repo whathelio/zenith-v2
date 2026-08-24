@@ -1,10 +1,8 @@
 """Zenith v2 确认流程 — AI 提议需用户确认/修改/忽略 + 分步教程模式"""
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime
-from .database import sch_update, note_update, sch_list, note_list, db
+from .database import sch_update, note_update, sch_list, db
 from .timezone import now_tz
 
 logger = logging.getLogger("zenith.confirm")
@@ -145,6 +143,9 @@ def _action_desc(action: dict) -> str:
     if t == "delete_note":
         nid = p.get("note_id")
         return f"删除笔记 #{nid}: {p.get('title', '')[:60]}"
+    if t == "merge_notes":
+        nids = p.get("note_ids", [])
+        return f"合并笔记 {'、'.join(f'#{i}' for i in nids)} → 「{p.get('new_title', '')[:40]}」" + ("" if p.get("keep_originals") else "（原稿将删除）")
     if t == "edit_note":
         nid = p.get("note_id")
         return f"修改笔记 #{nid}: {p.get('title', '')[:60]}"
@@ -156,6 +157,12 @@ def _action_desc(action: dict) -> str:
         return f"修改记忆 #{mid}: {p.get('content', '')[:60]}"
     if t == "edit_file":
         return f"编辑文件: {p.get('path', '')[:80]}"
+    if t == "rename_conversation":
+        return f"重命名对话: 「{p.get('old_title', '')[:40]}」 → 「{p.get('new_title', '')[:40]}」"
+    if t == "create_snapshot":
+        return f"创建代码快照: {p.get('label', '')[:40]}（git commit 全部改动）"
+    if t == "rollback_code":
+        return f"⚠️ 高风险：backend/ 回退到 {p.get('hash', '')[:12]}（该点后的 backend 改动将丢失，data/ 不受影响，需重启生效）"
     return t
 
 
@@ -188,6 +195,34 @@ def _execute_action(action: dict) -> str:
     t = action["type"]
     p = action.get("payload", {})
     from . import database as db
+
+    if t == "merge_notes":
+        nids = p.get("note_ids", [])
+        new_title = (p.get("new_title") or "合并笔记").strip()
+        merged_content = p.get("merged_content", "")
+        merged_tags = p.get("merged_tags", "")
+        keep_originals = bool(p.get("keep_originals", False))
+        if len(nids) < 2:
+            raise ValueError("merge_notes 需要至少 2 个笔记 ID")
+        # 校验全部存在（防并发删除导致部分缺失）
+        for nid in nids:
+            if not db.note_get(nid):
+                raise ValueError(f"笔记 #{nid} 不存在，合并中止")
+        # 创建合并笔记
+        new_id = db.note_add({
+            "title": new_title,
+            "content": merged_content,
+            "tags": merged_tags,
+            "source": "merge",
+            "status": "confirmed",
+        })
+        deleted = []
+        if not keep_originals:
+            for nid in nids:
+                db.note_del(nid)
+                deleted.append(nid)
+        suffix = f"；原稿已删除: {'、'.join(f'#{i}' for i in deleted)}" if deleted else "；原稿已保留"
+        return f"已合并 {len(nids)} 篇笔记为 #{new_id}「{new_title[:40]}」{suffix}"
 
     if t == "delete_note":
         nid = p.get("note_id")
@@ -243,25 +278,34 @@ def _execute_action(action: dict) -> str:
         content = p.get("content")
         if not path or content is None:
             raise ValueError("edit_file 需要 path 和 content")
-        import os as _os
         from pathlib import Path as _P
-        # 安全边界：只允许编辑项目目录内的文本文件，且限制扩展名
+        # 安全边界（2026-08-20 治理收窄）：仅 backend/ 下 .py 可编辑，frontend 只读
         project_root = _P(__file__).parent.parent
         target = _P(path).expanduser().resolve()
         project_root_resolved = project_root.resolve()
         if not str(target).startswith(str(project_root_resolved)):
             raise ValueError(f"路径越界，禁止编辑项目目录外的文件: {path}")
-        allowed_ext = {".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".yaml", ".yml", ".md", ".css", ".html", ".bat", ".txt"}
-        if target.suffix.lower() not in allowed_ext:
-            raise ValueError(f"不允许编辑该类型文件: {target.suffix}")
+        rel = target.relative_to(project_root_resolved)
+        if rel.parts[0] != "backend":
+            raise ValueError(f"仅允许编辑 backend/ 下的文件（治理约束，frontend 只读）: {path}")
+        if target.suffix.lower() != ".py":
+            raise ValueError(f"仅允许编辑 .py 文件（治理约束）: {target.suffix or '无扩展名'}")
         if not target.exists():
             raise ValueError(f"文件不存在: {path}")
+        # 改前自动 git 快照（失败降级不阻断，.bak 兜底）
+        try:
+            from .git_guard import ensure_git_clean_snapshot
+            snap = ensure_git_clean_snapshot(f"pre-edit {target.name}", paths=[str(target)])
+            if not snap.get("snapshot_created") and not snap.get("error", "").startswith("testing"):
+                logger.warning("edit_file 快照未创建: %s", snap.get("error", ""))
+        except Exception as e:
+            logger.warning("edit_file 自动快照异常: %s", e)
         # 备份
         backup_path = target.with_suffix(target.suffix + ".bak")
         if not backup_path.exists():
             backup_path.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
         target.write_text(content, encoding="utf-8")
-        return f"已编辑 {path}（备份: {backup_path.name}）"
+        return f"已编辑 {path}（备份: {backup_path.name}，重启后生效）"
 
     if t == "update_background":
         conv_id = p.get("conv_id")
@@ -270,6 +314,32 @@ def _execute_action(action: dict) -> str:
             raise ValueError("update_background 需要 conv_id 和 new_background")
         db.conv_update_background(conv_id, new_bg if new_bg.strip() else None)
         return f"已更新对话背景 ({new_bg[:50].replace(chr(10), ' ')}...)"
+
+    if t == "rename_conversation":
+        conv_id = p.get("conv_id")
+        new_title = (p.get("new_title") or "").strip()
+        if not conv_id or not new_title:
+            raise ValueError("rename_conversation 需要 conv_id 和 new_title")
+        old_title = (p.get("old_title") or "").strip()
+        db.conv_update_title(conv_id, new_title)
+        return f"已重命名对话: 「{old_title[:40]}」 → 「{new_title[:40]}」"
+
+    if t == "create_snapshot":
+        from .git_guard import ensure_git_clean_snapshot
+        label = (p.get("label") or "").strip() or "手动快照"
+        snap = ensure_git_clean_snapshot(f"snapshot: {label}")
+        if not snap.get("snapshot_created"):
+            raise ValueError(f"快照创建失败: {snap.get('error', 'unknown')}")
+        return f"已创建代码快照: {label}（git commit 完成）"
+
+    if t == "rollback_code":
+        from .git_guard import rollback_to_commit
+        r = rollback_to_commit(p.get("hash", ""))
+        if not r.get("success"):
+            raise ValueError(f"回退失败: {r.get('error', 'unknown')}")
+        reason = (p.get("reason") or "").strip()
+        suffix = f"（原因: {reason[:40]}）" if reason else ""
+        return f"已回退 backend/ 到 {r['hash'][:12]}{suffix}。重启后生效。"
 
     if t == "delete_message":
         msg_id = p.get("msg_id")

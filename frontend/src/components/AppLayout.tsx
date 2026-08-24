@@ -3,6 +3,7 @@ import { Outlet, Link, useNavigate } from 'react-router-dom'
 import { api, type CalendarData, type Goal, type GoalStats } from '../shared/api'
 import { formatDate, formatMoney, formatMoneyShort } from '../shared/utils'
 import { GOAL_COLORS, getGoalColor } from '../shared/constants'
+import GlobalBackground from './GlobalBackground'
 import {
   CalendarGoalContext,
   type GoalDisplayField,
@@ -125,6 +126,20 @@ export default function AppLayout() {
     timer = setInterval(fetchReminders, 60_000)
     return () => clearInterval(timer)
   }, [])
+
+  // 已读确认：投递成功后记录，避免 due 反复出现
+  const acknowledgeDue = async () => {
+    const ids = reminders.due.map((s: any) => s.id)
+    if (!ids.length) return
+    try {
+      const r = await fetch('/api/reminders/ack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ schedule_ids: ids }),
+      })
+      if (r.ok) setReminders(prev => ({ ...prev, due: [] }))
+    } catch { /* silent */ }
+  }
 
   // 周计算：以 selectedDate 为基准，显示其所在周（周一到周日）
   const refDate = selectedDate
@@ -319,6 +334,7 @@ export default function AppLayout() {
 
   return (
     <CalendarGoalContext.Provider value={contextValue}>
+      <GlobalBackground />
       <div className="app-layout">
         {/* Topbar */}
         <div className="topbar">
@@ -328,6 +344,7 @@ export default function AppLayout() {
             <Link to="/chat" className="btn btn-sm">💬 对话</Link>
             <Link to="/calendar" className="btn btn-sm">📋 日程</Link>
             <Link to="/library" className="btn btn-sm">📚 知识库</Link>
+            <Link to="/summary" className="btn btn-sm">📊 总结</Link>
             {kbAvailable && <Link to="/knowledge" className="btn btn-sm">🔗 外部知识</Link>}
             <Link to="/settings" className="btn btn-sm">⚙ 设置</Link>
           </div>
@@ -615,6 +632,17 @@ export default function AppLayout() {
                     ⏰ 即将开始: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
                   </div>
                 ))}
+                {reminders.due.length > 0 && (
+                  <button
+                    onClick={acknowledgeDue}
+                    style={{
+                      marginTop: 6, padding: '2px 10px', fontSize: 12, borderRadius: 4,
+                      background: 'transparent', border: '1px solid #f1fa8c', color: '#f1fa8c', cursor: 'pointer',
+                    }}
+                  >
+                    已读
+                  </button>
+                )}
               </div>
             )}
             <Outlet />

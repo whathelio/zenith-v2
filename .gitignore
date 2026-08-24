@@ -6,6 +6,7 @@ envs/
 
 # Python bytecode
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.egg-info/
@@ -40,8 +41,6 @@ tools/*.map.json
 # 临时/调试文件
 out.txt
 _aux*.py
-端口
-进程名*）*
 
 # IDE
 .vscode/
@@ -76,9 +75,14 @@ _probe*.py
 # 数据库备份（含敏感数据，绝不上传）
 data/backup/
 data/*.bak*
+data/*.testbak
+data/*.db.*
 
 # 启动调试日志
 _pw_debug*.txt
 
 # 前端调试测试产物
 frontend/_*.cjs
+
+# 通用备份文件
+*.bak

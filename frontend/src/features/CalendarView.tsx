@@ -56,7 +56,7 @@ export default function CalendarView() {
   const [formImportance, setFormImportance] = useState(3)
   const [formImpact, setFormImpact] = useState('')
   const [formCountry, setFormCountry] = useState('')
-  const [formRemind, setFormRemind] = useState(0)
+  const [formRemind, setFormRemind] = useState(30)
 
   const [formGoalId, setFormGoalId] = useState<number | null>(null)
   const [formRecurrence, setFormRecurrence] = useState('')
@@ -463,6 +463,7 @@ export default function CalendarView() {
                           end_time: `${selectedDate} 10:00`,
                           category: 'reminder',
                           importance: 3,
+                          remind_before: 30,
                           status: 'confirmed',
                         })
                         ;(e.target as HTMLInputElement).value = ''

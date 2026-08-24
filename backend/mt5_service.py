@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
 
 logger = logging.getLogger("zenith.mt5")
 
@@ -180,7 +179,6 @@ def get_rates(
         })
 
     # 计算简单统计
-    closes = [b["close"] for b in bars]
     stats = {
         "high": max(b["high"] for b in bars),
         "low": min(b["low"] for b in bars),

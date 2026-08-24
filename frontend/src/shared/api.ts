@@ -145,6 +145,17 @@ interface DistillFile {
   modified: string
 }
 
+interface PeriodicSummary {
+  id: number
+  period_type: string
+  period_key: string
+  headline: string
+  content: string
+  summary: string
+  created_at: string
+  updated_at: string
+}
+
 interface Goal {
   id: number
   title: string
@@ -217,6 +228,7 @@ interface Settings {
   background_provider: string
   personas: Persona[]
   socratic_mode: boolean
+  background_image: string
 }
 
 interface Provider {
@@ -472,6 +484,19 @@ export const api = {
   },
   clearBackgroundImage: (id: string) =>
     request<{ success: boolean }>(`/conversations/${id}/background-image`, { method: 'DELETE' }),
+
+  // 全局背景图片（设置页「外观」常用设置）
+  uploadGlobalBackgroundImage: async (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(BASE + '/settings/background-image', {
+      method: 'POST', body: fd,
+    })
+    if (!res.ok) throw new Error('上传失败: ' + res.status)
+    return res.json()
+  },
+  clearGlobalBackgroundImage: () =>
+    request<{ success: boolean }>('/settings/background-image', { method: 'DELETE' }),
   // 学习对话工厂 — 从笔记/记忆/文档一键创建学习对话
   startLearning: (sourceType: 'note' | 'memory' | 'document', sourceId: number) =>
     request<{ success: boolean; conversation_id: string; title: string }>('/learning/start', {
@@ -633,6 +658,14 @@ export const api = {
 
   distillWeekly: (weekStart: string, saveTxt = true) =>
     request<DistillResult>(`/distill/weekly/${weekStart}?save_txt=${saveTxt}`, { method: 'POST' }),
+
+  // Periodic Summaries (日/周/月/年总结)
+  listSummaries: (periodType = '') =>
+    request<PeriodicSummary[]>(`/summaries${periodType ? `?period_type=${periodType}` : ''}`),
+  getSummary: (periodType: string, periodKey: string) =>
+    request<PeriodicSummary>(`/summaries/${periodType}/${periodKey}`),
+  generateSummary: (periodType: string, periodKey: string) =>
+    request<PeriodicSummary>(`/summaries/${periodType}/${periodKey}/generate`, { method: 'POST' }),
 
   listDistillFiles: () =>
     request<{ files: DistillFile[]; count: number }>('/distill/files'),
@@ -815,4 +848,4 @@ export const api = {
   },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, Skill, SkillSuggestion, ModuleSkill, McpServer, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, PeriodicSummary, Skill, SkillSuggestion, ModuleSkill, McpServer, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats }

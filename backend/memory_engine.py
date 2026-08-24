@@ -4,10 +4,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import numpy as np
 from collections import defaultdict
 from datetime import datetime, timedelta
-from .database import mem_add, mem_for_inject, mem_search, mem_list, mem_del, db, _now
+from typing import TYPE_CHECKING
+
+from .database import mem_add, mem_for_inject, mem_search, mem_list, note_list, db, _now
+
+if TYPE_CHECKING:
+    import numpy as np  # 仅类型注解用（np.ndarray），运行时走函数内延迟导入
 
 logger = logging.getLogger("zenith.memory")
 
@@ -25,6 +29,12 @@ _STOPWORDS = frozenset(
     "can could should may might must to of in on at for with by from as it its"
     .split()
 )
+
+
+# 记忆整理/合并的相似度阈值。mem_consolidate（自动后台合并）与
+# generate_consolidate_plan（LLM 辅助整理计划）曾各用 0.7 / 0.85 不一致，
+# 统一为 0.85（更保守，宁少合不误删）。
+MERGE_SIM_THRESHOLD = 0.85
 
 
 def _extract_keywords(text: str, max_k: int = 8) -> list[str]:
@@ -48,43 +58,57 @@ def _extract_keywords(text: str, max_k: int = 8) -> list[str]:
     return [kw for kw, _ in ranked[:max_k]]
 
 
+def search_related_memories(keywords: list[str], limit: int = 15, min_keyword_results: int = 10) -> list[dict]:
+    """按关键词检索相关记忆（去重），不足时补充高重要度记忆。返回记忆对象列表。
+
+    收敛 build_memory_injection 与 _retrieve_related_memories 的重复检索逻辑
+    （此前两处各自实现「关键词→mem_search→去重→mem_for_inject 补充」）。
+    """
+    relevant: list[dict] = []
+    seen_ids: set[int] = set()
+    for kw in keywords[:4]:
+        for r in mem_search(kw, limit=10):
+            if r["id"] not in seen_ids:
+                seen_ids.add(r["id"])
+                relevant.append(r)
+        if len(relevant) >= limit:
+            break
+    # 关键词命中不足时，补充高重要度记忆
+    if len(relevant) < min_keyword_results:
+        for m in mem_for_inject(limit=limit):
+            if m["id"] not in seen_ids:
+                seen_ids.add(m["id"])
+                relevant.append(m)
+            if len(relevant) >= limit:
+                break
+    return relevant
+
+
 def build_memory_injection(current_query: str = "") -> str:
     """
-    构建注入到 system prompt 的记忆摘要。
-    如果提供了 current_query，优先注入相关性最高的记忆。
+    构建注入到 system prompt 的记忆摘要（记忆 + 笔记）。
+    若提供 current_query，走语义联想召回（字符 n-gram 重叠打分，不依赖精确关键词）；
+    否则按重要度取 top 记忆。
     """
-    keywords = _extract_keywords(current_query) if current_query else []
+    memories: list[dict] = []
+    notes: list[dict] = []
 
-    if keywords:
-        # 相关性模式：按关键词搜索，再合并重要记忆补充
-        relevant = []
-        seen_ids = set()
-        for kw in keywords[:4]:
-            results = mem_search(kw)
-            for r in results:
-                if r["id"] not in seen_ids:
-                    relevant.append(r)
-                    seen_ids.add(r["id"])
-            if len(relevant) >= 15:
-                break
-        # 补充高重要度记忆
-        if len(relevant) < 10:
-            for m in mem_for_inject(limit=20):
-                if m["id"] not in seen_ids:
-                    relevant.append(m)
-                    seen_ids.add(m["id"])
-                if len(relevant) >= 15:
-                    break
-        memories = relevant
+    if current_query:
+        memories, notes = search_related_items(current_query, limit=15, include_notes=True)
     else:
         # 默认模式：按重要度取 top 20
         memories = mem_for_inject(limit=20)
 
-    if not memories:
+    if not memories and not notes:
         return ""
 
+    lines = ["## 记忆库（关于用户）"]
+
+    # 分组（排除 skill：技能由 _build_skill_injection 单独注入，避免重复 + 超长 content 浪费 token）
     groups: dict[str, list] = {}
     for m in memories:
+        if m["type"] == "skill":
+            continue
         groups.setdefault(m["type"], []).append(m)
 
     type_names = {
@@ -95,13 +119,23 @@ def build_memory_injection(current_query: str = "") -> str:
         "fact": "知道的事实",
         "experience": "经验与技巧",
     }
-
-    lines = ["## 记忆库（关于用户）"]
     for tp, items in groups.items():
         name = type_names.get(tp, tp)
         lines.append(f"\n**{name}**：")
         for item in items[:5]:
             lines.append(f"  - {item['content']}")
+
+    if notes:
+        lines.append("\n## 相关笔记")
+        for nt in notes[:5]:
+            title = nt.get("title", "") or "未命名"
+            content = (nt.get("content", "") or "").strip().replace("\n", " ")
+            snippet = content[:120]
+            lines.append(f"  - 【{title}】{snippet}")
+
+    # 无有效记忆分组也无笔记时返回空
+    if not groups and not notes:
+        return ""
 
     return "\n".join(lines)
 
@@ -114,6 +148,53 @@ def reset_counter(conv_id: str = ""):
     else:
         _conv_counters.clear()
         _conv_text_buffer.clear()
+
+
+def flush_conversation_memories(conv_id: str):
+    """对话收尾（删除/关闭）时调用：把该对话 buffer 中尚未提取的残余文本提取完。
+
+    与 reset_counter 的区别：reset_counter 直接丢弃 buffer；flush 先消费残余再清理，
+    确保最后 1~2 轮（不足 interval 触发阈值）的内容不会丢失。
+    """
+    text = _conv_text_buffer.pop(conv_id, "")
+    _conv_counters.pop(conv_id, None)
+    if not text.strip():
+        return
+    task = asyncio.create_task(_do_extract(text, conv_id))
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+    logger.info("对话收尾记忆提取已启动 (conv=%s, text_len=%d)", conv_id, len(text))
+
+
+async def flush_all_pending_memories():
+    """优雅关闭时调用：遍历所有对话 buffer 并同步等待残余文本提取完成。
+
+    设计为 async，由调用方在独立 event loop 中 run_until_complete（本函数在
+    信号处理/finally 块中使用，uvicorn 已退出但进程尚存）。LLM 调用可能耗时数秒，
+    关闭时一次性等待完成，避免数据丢失。
+    """
+    conv_ids = list(_conv_text_buffer.keys())
+    flushed = 0
+    for cid in conv_ids:
+        text = _conv_text_buffer.pop(cid, "")
+        _conv_counters.pop(cid, None)
+        if not text.strip():
+            continue
+        try:
+            await _do_extract(text, cid)
+            flushed += 1
+        except Exception as e:
+            logger.warning("flush 对话 %s 失败: %s", cid, e)
+    # 等待已在跑的后台提取任务完成（_pending_tasks 由 done_callback 自动清理，
+    # 此处 gather 使之成为有意义的生命周期状态，而非仅防 GC 的幽灵集合）
+    pending = list(_pending_tasks)
+    if pending:
+        try:
+            await asyncio.gather(*pending, return_exceptions=True)
+        except Exception as e:
+            logger.warning("等待后台提取任务失败: %s", e)
+    logger.info("优雅关闭 flush 完成: 提取 %d 个对话残余, 等待 %d 个后台任务", flushed, len(pending))
+    return flushed
 
 
 async def maybe_extract_memories(
@@ -135,12 +216,24 @@ async def maybe_extract_memories(
         logger.info("记忆提取任务已启动 (conv=%s, text_len=%d)", conv_id, len(text))
 
 
+def _retrieve_related_memories(text: str, limit: int = 15) -> list[str]:
+    """检索与当前对话文本相关的已有记忆（content 列表），供 LLM 去重参考。
+
+    复用 search_related_memories（关键词 FTS 检索 + 高重要度补充）。
+    """
+    mems = search_related_memories(_extract_keywords(text, max_k=6), limit=limit)
+    return [m.get("content", "") for m in mems]
+
+
 async def _do_extract(text: str, conv_id: str):
     """后台执行记忆提取 + 去重。同时被 periodic 和 final 两种触发时机共用。"""
     try:
         from .llm_client import extract_memories
-        items = await extract_memories(text)
-        logger.info("记忆提取完成: %d 条 (conv=%s)", len(items), conv_id)
+        # 提取前惰性刷新 IDF 权重，让去重的 TF-IDF 余弦真正用上 IDF 加权
+        _maybe_refresh_idf()
+        existing = _retrieve_related_memories(text)
+        items = await extract_memories(text, existing_memories=existing)
+        logger.info("记忆提取完成: %d 条 (conv=%s, 已有参考%d条)", len(items), conv_id, len(existing))
 
         new_count = 0
         skip_count = 0
@@ -208,24 +301,39 @@ def _ngrams(text: str, n: int) -> set:
     return set(text[i:i+n] for i in range(len(text) - n + 1))
 
 
-def _text_vector(text: str, idf_weights: dict = None) -> np.ndarray:
-    """将文本转为稀疏加权向量（2-4 gram + IDF 加权）"""
-    grams = set()
-    # 2-4 字符级 n-gram（对中文特别有效）
-    for n in [2, 3, 4]:
-        grams |= _ngrams(text, n)
-    # 单词级（英文/数字）
-    words = set(re.findall(r'[a-zA-Z0-9]+', text.lower()))
-    all_features = list(grams | words)
-    if not all_features:
-        return np.zeros(0)
-    vec = np.zeros(len(all_features))
-    for i, f in enumerate(all_features):
-        tf = text.count(f) / max(len(text), 1)
+def _shared_text_vectors(a: str, b: str, idf_weights: dict = None) -> tuple[np.ndarray, np.ndarray]:
+    """两条文本映射到「同一共享词表」的加权向量（2-4 gram + 单词 + IDF）。
+
+    关键修复：旧 _text_vector 对每条文本各自提取词表，导致两条文本向量维度
+    不一致，_semantic_similarity 里 `len(va) != len(vb)` 恒成立、永远降级到
+    Jaccard——精心编写的 TF-IDF 余弦相似度实为死代码。这里用「IDF 词表 ∪ 两文本
+    各自特征」作为统一词表，使余弦相似度真正可用。
+    """
+    import numpy as np  # 延迟导入：本函数是唯一用 numpy 处，避免启动即吃导入开销
+
+    grams_a, grams_b = set(), set()
+    for n in (2, 3, 4):
+        grams_a |= _ngrams(a, n)
+        grams_b |= _ngrams(b, n)
+    words_a = set(re.findall(r'[a-zA-Z0-9]+', a.lower()))
+    words_b = set(re.findall(r'[a-zA-Z0-9]+', b.lower()))
+
+    vocab = set(idf_weights) if idf_weights else set()
+    vocab |= grams_a | grams_b | words_a | words_b
+    vocab = sorted(vocab)
+    if not vocab:
+        return np.zeros(0), np.zeros(0)
+
+    la, lb = a.lower(), b.lower()
+    va = np.zeros(len(vocab))
+    vb = np.zeros(len(vocab))
+    for i, f in enumerate(vocab):
         idf = idf_weights.get(f, 1.0) if idf_weights else 1.0
-        vec[i] = tf * idf
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
+        if f in grams_a or f in words_a:
+            va[i] = (la.count(f) / max(len(a), 1)) * idf
+        if f in grams_b or f in words_b:
+            vb[i] = (lb.count(f) / max(len(b), 1)) * idf
+    return va, vb
 
 
 # 全局 IDF 权重缓存
@@ -236,6 +344,7 @@ _idf_doc_count: int = 0
 def _update_idf_weights():
     """从所有记忆中更新 IDF 权重"""
     global _idf_cache, _idf_doc_count
+    import numpy as np  # 延迟导入：与其他 np 使用点一致，避免启动开销
     try:
         all_mems = mem_list()
         _idf_doc_count = len(all_mems)
@@ -257,11 +366,34 @@ def _update_idf_weights():
         logger.warning("更新 IDF 权重失败: %s", e)
 
 
+# IDF 上次刷新时的记忆总数（惰性刷新基准）
+_idf_last_count: int = 0
+
+
+def _maybe_refresh_idf():
+    """惰性刷新 IDF 权重（在记忆提取前调用，避免相似度热路径全表扫描）。
+
+    记忆数相对上次刷新变化超过 20% 或 20 条时重建；否则跳过。
+    """
+    global _idf_last_count
+    try:
+        with db() as c:
+            count = c.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    except Exception:
+        return
+    if _idf_cache and abs(count - _idf_last_count) < max(20, int(count * 0.2)):
+        return  # 变化不大，跳过
+    _update_idf_weights()
+    _idf_last_count = count
+
+
 def _semantic_similarity(a: str, b: str) -> float:
     """
-    增强版文本相似度 — n-gram TF-IDF + 余弦相似度。
+    增强版文本相似度 — 共享词表 TF-IDF 余弦 + 字符级 Jaccard 混合。
     对中文文本区分度远超 Jaccard bigram。
     """
+    import numpy as np  # 延迟导入：与 _shared_text_vectors 一致，避免启动即导入
+
     if not a or not b:
         return 0.0
     if a == b:
@@ -272,16 +404,19 @@ def _semantic_similarity(a: str, b: str) -> float:
         if a in b or b in a:
             return 0.9
 
-    va = _text_vector(a, _idf_cache if _idf_cache else None)
-    vb = _text_vector(b, _idf_cache if _idf_cache else None)
-    if len(va) == 0 or len(vb) == 0:
-        return 0.0
-
-    # 确保向量维度一致（取交集）
-    if len(va) != len(vb):
+    va, vb = _shared_text_vectors(a, b, _idf_cache if _idf_cache else None)
+    if va.size == 0 or vb.size == 0:
         return _legacy_jaccard(a, b)
 
-    return float(np.dot(va, vb))
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    if na == 0.0 or nb == 0.0:
+        return _legacy_jaccard(a, b)
+
+    cos = float(np.dot(va, vb) / (na * nb))
+    jac = _legacy_jaccard(a, b)
+    # 混合：取余弦与（Jaccard×0.9）的较大者，兼顾语义区分度与字符重叠召回
+    return max(cos, jac * 0.9)
 
 
 def _legacy_jaccard(a: str, b: str) -> float:
@@ -303,12 +438,121 @@ def _similarity(a: str, b: str) -> float:
         return _legacy_jaccard(a, b)
 
 
+# ---------------------------------------------------------------------------
+# 语义联想召回（对话读侧）：字符 n-gram 重叠打分，不依赖精确关键词
+# ---------------------------------------------------------------------------
+
+_gram_cache: list[dict] = []      # [{mem: dict, grams: set}]
+_note_gram_cache: list[dict] = [] # [{note: dict, grams: set}]
+_gram_cache_count: int = 0
+
+
+def _score_query_overlap(q_grams: set, m_grams: set) -> float:
+    """query 与记忆的字符 n-gram 重叠打分（IDF 加权：稀有 gram 权重高、常见 gram 权重低）。"""
+    overlap = q_grams & m_grams
+    if not overlap:
+        return 0.0
+    if _idf_cache:
+        return sum(_idf_cache.get(g, 1.0) for g in overlap)
+    return float(len(overlap))
+
+
+def _build_gram_cache():
+    """惰性构建全量记忆 + 笔记的字符 n-gram 索引（供联想召回打分）"""
+    global _gram_cache, _note_gram_cache, _gram_cache_count
+    try:
+        all_mems = mem_list()
+        cache = []
+        for m in all_mems:
+            if m.get("type") == "skill":
+                continue  # 技能由 _build_skill_injection 单独注入，不参与记忆联想
+            grams: set = set()
+            content = m.get("content", "") or ""
+            for n in (2, 3, 4):
+                grams |= _ngrams(content, n)
+            cache.append({"mem": m, "grams": grams})
+        _gram_cache = cache
+        _gram_cache_count = len(all_mems)
+
+        notes_cache = []
+        for nt in note_list():
+            text = f"{nt.get('title', '')} {nt.get('content', '')}"
+            grams = set()
+            for n in (2, 3, 4):
+                grams |= _ngrams(text, n)
+            notes_cache.append({"note": nt, "grams": grams})
+        _note_gram_cache = notes_cache
+    except Exception as e:
+        logger.warning("构建 gram 索引失败: %s", e)
+
+
+def _maybe_refresh_gram_cache():
+    """记忆数量变化时重建 gram 索引（用 COUNT 避免全量 SELECT）"""
+    global _gram_cache_count
+    try:
+        with db() as c:
+            count = c.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    except Exception:
+        return
+    if _gram_cache and count == _gram_cache_count:
+        return
+    _build_gram_cache()
+
+
+def search_related_items(query: str, limit: int = 15, include_notes: bool = True):
+    """语义联想召回：记忆（全量字符 n-gram 重叠打分）+ 笔记（TF-IDF 余弦）。
+
+    返回 (memories: list[dict], notes: list[dict])，均已按相关性降序。
+    记忆召回覆盖「字符重叠/子序列相关」（如「跑步」↔「每周跑步三次」），
+    比 mem_search 的精确子串 LIKE 更宽，实现「联想」；笔记用 _semantic_similarity 打分。
+    """
+    _maybe_refresh_idf()
+    _maybe_refresh_gram_cache()
+
+    q_grams: set = set()
+    for n in (2, 3, 4):
+        q_grams |= _ngrams(query, n)
+
+    memories: list[dict] = []
+    scored = []
+    if q_grams:
+        for item in _gram_cache:
+            s = _score_query_overlap(q_grams, item["grams"])
+            if s > 0:
+                scored.append((s, item["mem"]))
+        scored.sort(key=lambda x: -x[0])
+        memories = [m for _, m in scored[:limit]]
+
+    # 联想无强命中（top 分数 < 1.0，即不足一个默认 IDF 权重的 gram 重叠）时，按重要度兜底
+    if not memories or (scored and scored[0][0] < 1.0):
+        memories = mem_for_inject(limit=limit)
+
+    notes: list[dict] = []
+    if include_notes and q_grams:
+        try:
+            scored_notes = []
+            for item in _note_gram_cache:
+                s = _score_query_overlap(q_grams, item["grams"])
+                if s > 0:
+                    scored_notes.append((s, item["note"]))
+            scored_notes.sort(key=lambda x: -x[0])
+            notes = [nt for _, nt in scored_notes[:5]]
+        except Exception as e:
+            logger.warning("笔记联想召回失败: %s", e)
+
+    return memories, notes
+
+
 def mem_touch(memory_id: int):
-    """记忆被引用时调用 — 提升重要度 + 更新访问时间"""
+    """记忆被引用时调用 — 提升重要度 + 更新访问时间（last_touched_at）。
+
+    供 search_memory 命中时调用，使「引用提升重要度」机制真正生效，
+    并作为 mem_consolidate 衰减判断的时间基准（而非 created_at）。
+    """
     with db() as c:
         c.execute(
-            "UPDATE memories SET importance = MIN(importance + 1, 5) WHERE id = ?",
-            (memory_id,)
+            "UPDATE memories SET importance = MIN(importance + 1, 5), last_touched_at = ? WHERE id = ?",
+            (_now(), memory_id)
         )
 
 
@@ -353,7 +597,7 @@ def mem_consolidate():
             if not other_content:
                 continue
             sim = _similarity(content, other_content)
-            if sim >= 0.7:
+            if sim >= MERGE_SIM_THRESHOLD:
                 keeper = m if m["importance"] >= other["importance"] else other
                 to_del = other if m["importance"] >= other["importance"] else m
 
@@ -365,8 +609,8 @@ def mem_consolidate():
 
                 with db() as c:
                     c.execute(
-                        "UPDATE memories SET keywords = ? WHERE id = ?",
-                        (",".join(merged_kw), keeper["id"])
+                        "UPDATE memories SET keywords = ?, distilled_from = ? WHERE id = ?",
+                        (",".join(merged_kw), to_del["id"], keeper["id"])
                     )
                     c.execute("DELETE FROM memories WHERE id = ?", (to_del["id"],))
 
@@ -374,16 +618,20 @@ def mem_consolidate():
                 merged += 1
                 logger.info("合并记忆 #%d → #%d (sim=%.2f)", to_del["id"], keeper["id"], sim)
 
-    # 衰减：30天以上未被引用的记忆，重要度 -1
+    # 衰减：30天以上未被引用的记忆，重要度 -1。
+    # 时间基准用 last_touched_at（无则退回 recorded_at，再退回 created_at），
+    # 人工编辑过的记忆（user_edited=1）不自动衰减。
     cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     with db() as c:
         rows = c.execute(
-            "SELECT id, importance FROM memories "
-            "WHERE created_at < ? AND importance > 1",
+            "SELECT id, importance, user_edited FROM memories "
+            "WHERE importance > 1 AND COALESCE(last_touched_at, recorded_at, created_at) < ?",
             (cutoff,)
         ).fetchall()
         decayed = 0
         for r in rows:
+            if r["user_edited"]:
+                continue
             c.execute(
                 "UPDATE memories SET importance = importance - 1 WHERE id = ?",
                 (r["id"],)

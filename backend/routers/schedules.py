@@ -1,7 +1,6 @@
 """Schedules API — 日程 CRUD + 日历 + 提醒"""
 from fastapi import APIRouter, HTTPException, Body, Request
 from .. import database as db
-from ..schedule_reminder import get_due_reminders
 from ..validators.sanitize_guard import guard_store
 
 router = APIRouter(tags=["schedules"])
@@ -80,7 +79,6 @@ async def update_schedule(sid: int, data: dict = Body(default=None)):
             if g:
                 strategy = g.get("strategy", "compound")
                 current = float(g.get("current_value", 0))
-                target = float(g.get("target_value", 1))
                 daily = float(g.get("daily_target", 5))
                 if strategy == "linear":
                     # daily_target 统一按百分比理解：线性策略的每日固定增量 = 起始值 × 日化率
@@ -116,17 +114,19 @@ async def schedule_ai_plan(data: dict = Body(default=None)):
     return result
 
 
-@router.get("/api/reminders")
-async def get_reminders():
-    from ..schedule_reminder import get_due_reminders
-    text = get_due_reminders()
-    return {"text": text, "items": []}
-
-
 @router.get("/api/reminders/presets")
 async def get_reminder_presets():
     from ..schedule_reminder import REMINDER_PRESETS
     return REMINDER_PRESETS
+
+
+@router.post("/api/reminders/ack")
+async def ack_reminders(data: dict = Body(default=None)):
+    from ..schedule_reminder import ack_reminders as _ack
+    ids = (data or {}).get("schedule_ids", [])
+    if not isinstance(ids, list):
+        raise HTTPException(400, "schedule_ids 必须为数组")
+    return {"success": True, "acked": _ack(ids)}
 
 
 @router.get("/api/calendar/templates")

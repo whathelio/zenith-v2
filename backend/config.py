@@ -1,11 +1,11 @@
 """Zenith v2 配置管理 — YAML + .env 双格式支持"""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import yaml
 from pathlib import Path
-from typing import Optional
 
 PROJECT_DIR = Path(__file__).parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -55,6 +55,7 @@ SYSTEM_PROMPT = (
     "6. 上下文压缩 — 长对话自动生成摘要\n"
     "7. 网页访问 — 读取网页内容或主动联网搜索最新信息\n"
     "8. 内容总结 — 分析任意链接（文章/B站/GitHub/视频），生成结构化摘要\n"
+    "9. 学术检索 — 按关键词/日期/期刊检索论文（OpenAlex/Crossref），结果存入本地学术库\n"
     "\n"
     "## 行为准则\n"
     "1. 发现日程安排 → 调用 add_schedule 记录\n"
@@ -69,6 +70,7 @@ SYSTEM_PROMPT = (
     "10. 需要查已编译的专题/Wiki → 调用 query_wiki\n"
     "11. 用户问知识库状态 → 调用 kb_stats\n"
     "12. 需要记录日程/笔记/记忆/技能 → 调用 smart_classify（不要用 retrieve_docs 记录信息）\n"
+    "13. 用户要查论文/文献/最新研究/高影响力文章 → 调用 academic_search；用户给出 DOI 或论文链接 → 调用 paper_lookup\n"
     "\n"
     "## 确认卡片（Confirm Card）\n"
     "当需要用户确认不可逆操作（删除、合并、归档等）或提供多个互斥决策时，"
@@ -85,17 +87,25 @@ DEFAULT_CONFIG = {
     "max_tokens": 4096,
     "system_prompt": SYSTEM_PROMPT,
     "code_exec_timeout": 30,
-    "max_code_output": 10000,
+    "max_code_output": 10000,  # 代码输出截断上限（code_runner._max_output_len 读取，非死配置）
     # 代码执行开关（默认关闭。开源仓库面向未知部署者，需显式开启。
     # 本地单用户可在 config.yaml 设为 true。多用户部署必须先用 Docker 隔离，见 SECURITY.md）
     "code_execution_enabled": False,
     "context_compress_threshold": 20,
+    "context_token_budget": 32000,
+    "chat_history_max_tokens": 12000,  # 历史注入的 token 上限（E 项：从新到旧保留）
+    "tool_result_prune": {
+        "enabled": True,
+        "threshold_chars": 8192,
+        "head_chars": 4096,
+        "tail_chars": 1024,
+    },
     "memory_extract_interval": 5,
     "auto_distill_enabled": True,
 
-    # 财经日历自动同步（默认关闭，需探测确认金十接口可用后手动开启）
+    # 财经日历自动同步（已开启，每日 8:00 拉取，run_on_start 启动时也同步一次）
     "calendar_sync": {
-        "enabled": False,
+        "enabled": True,
         "hour": 8,
         "minute": 0,
         "days": 7,
@@ -168,6 +178,9 @@ DEFAULT_CONFIG = {
     # Persona 配置
     "personas": [],
     "socratic_mode": True,
+
+    # 全局背景图片（设置页「外观」常用设置，存于 data/backgrounds/global{ext}）
+    "background_image": "",
 }
 
 
@@ -176,7 +189,25 @@ def ensure_dirs():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> dict:
+_config_cache: dict | None = None
+_config_cache_sig: tuple | None = None
+
+
+def _config_file_signature() -> tuple | None:
+    """返回配置文件签名（存在时），用于判断是否需要重新加载。"""
+    try:
+        st = CONFIG_YAML.stat()
+        return ("yaml", st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    try:
+        st = CONFIG_JSON.stat()
+        return ("json", st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _load_config_uncached() -> dict:
     """加载配置，优先级：YAML > JSON > 默认值"""
     ensure_dirs()
 
@@ -197,11 +228,30 @@ def load_config() -> dict:
     return dict(DEFAULT_CONFIG)
 
 
+
+def load_config() -> dict:
+    """加载配置（带缓存），优先级：YAML > JSON > 默认值。
+
+    配置写入后 mtime/size 会变化，签名不匹配即自动重载，避免每次调用都解析 YAML。
+    """
+    global _config_cache, _config_cache_sig
+    ensure_dirs()
+    sig = _config_file_signature()
+    if _config_cache is not None and sig == _config_cache_sig:
+        return copy.deepcopy(_config_cache)
+    _config_cache = _load_config_uncached()
+    _config_cache_sig = _config_file_signature()
+    return copy.deepcopy(_config_cache)
+
+
 def save_config(cfg: dict):
-    """保存配置到 YAML"""
+    """保存配置到 YAML（写后更新配置缓存）"""
+    global _config_cache, _config_cache_sig
     ensure_dirs()
     with open(CONFIG_YAML, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    _config_cache = copy.deepcopy(cfg)
+    _config_cache_sig = _config_file_signature()
 
 
 def get_api_base() -> str:

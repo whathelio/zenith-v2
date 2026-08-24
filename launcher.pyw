@@ -13,6 +13,7 @@ import os
 import time
 import urllib.request
 import json
+import webbrowser
 import ctypes
 from pathlib import Path
 
@@ -77,11 +78,41 @@ def wait_for_health(timeout: float = 30.0) -> bool:
     return False
 
 
+BROWSER_TS = PROJECT_DIR / ".zenith.browser"
+BROWSER_COOLDOWN_SECONDS = 5
+
+
+def _browser_recently_opened() -> bool:
+    """与 start.py 共用浏览器冷却时间戳文件，避免重复打开。"""
+    try:
+        return (time.time() - BROWSER_TS.stat().st_mtime) < BROWSER_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _write_browser_ts():
+    try:
+        BROWSER_TS.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main():
     log("Launcher starting")
 
     if not check_prerequisites():
         sys.exit(1)
+
+    # 已在运行则短路：不重复 spawn，仅按冷却期决定是否打开浏览器
+    if wait_for_health(timeout=1.0):
+        if _browser_recently_opened():
+            log("already healthy, browser cooldown, skip")
+        else:
+            _write_browser_ts()
+            webbrowser.open(f"http://127.0.0.1:{PORT}/")
+            log("already healthy, opened browser")
+        log("already running, launcher done")
+        sys.exit(0)
 
     # 启动主服务（start.py 负责单实例锁 / 健康检查 / 浏览器冷却 / 知识库中台托管）
     env = os.environ.copy()

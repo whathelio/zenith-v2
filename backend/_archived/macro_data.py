@@ -4,7 +4,6 @@
 数据链路保留在代码中，供未来恢复时参考。"""
 from __future__ import annotations
 
-import json
 import logging
 import asyncio
 from datetime import datetime, timedelta

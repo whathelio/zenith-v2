@@ -7,6 +7,7 @@ import SettingsView from './features/SettingsView'
 import CalendarView from './features/CalendarView'
 import LibraryView from './features/LibraryView'
 import KnowledgeView from './features/KnowledgeView'
+import SummaryView from './features/SummaryView'
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
         <Route path="/schedules" element={<Navigate to="/calendar" replace />} />
         <Route path="/library" element={<LibraryView />} />
         <Route path="/knowledge" element={<KnowledgeView />} />
+        <Route path="/summary" element={<SummaryView />} />
         <Route path="/notes" element={<Navigate to="/library?tab=notes" replace />} />
         <Route path="/memories" element={<Navigate to="/library?tab=memories" replace />} />
         <Route path="/skills" element={<Navigate to="/library?tab=skills" replace />} />

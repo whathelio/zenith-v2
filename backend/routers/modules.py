@@ -1,7 +1,6 @@
 """Modules API — Skills (from memories) + MCP configurations (WorkBuddy 风格)"""
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException, Query
 from .. import database as db

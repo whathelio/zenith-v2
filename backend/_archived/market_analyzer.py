@@ -29,10 +29,9 @@ from .macro_data import get_macro_service
 from .llm_client import call_llm
 from .config import load_config
 from .database import (
-    market_report_add, market_report_get_latest, market_report_list,
-    prediction_add, prediction_batch_add, prediction_get_pending,
-    prediction_verify, prediction_list, prediction_get_hit_rate,
-    macro_indicator_get_by_name,
+    market_report_add, market_report_list,
+    prediction_add, prediction_get_pending,
+    prediction_verify, macro_indicator_get_by_name,
     conv_list_by_date, msg_list, mem_list_by_date, mem_search,
 )
 
@@ -314,7 +313,7 @@ class MarketAnalyzer:
         parts = []
         if gold_focus.get('disagg_managed_money'):
             mm = gold_focus['disagg_managed_money']
-            parts.append(f"### Managed Money (Disagg)")
+            parts.append("### Managed Money (Disagg)")
             parts.append(f"- 净持仓: {mm.get('net', 'N/A')} | z-score: {mm.get('net_z', 'N/A')}")
             parts.append(f"- 多头: {mm.get('long', 'N/A')} | 空头: {mm.get('short', 'N/A')}")
             parts.append(f"- Flow State: {mm.get('flow_state', 'N/A')} | 拥挤度: {mm.get('crowding', 'N/A')}")
@@ -322,11 +321,11 @@ class MarketAnalyzer:
             parts.append(f"- 背离检测: {mm.get('divergence', False)}")
         if gold_focus.get('tff_leveraged_funds'):
             lf = gold_focus['tff_leveraged_funds']
-            parts.append(f"### Leveraged Funds (TFF)")
+            parts.append("### Leveraged Funds (TFF)")
             parts.append(f"- 净持仓: {lf.get('net', 'N/A')} | z-score: {lf.get('net_z', 'N/A')}")
         if gold_focus.get('history_extremes'):
             ext = gold_focus['history_extremes']
-            parts.append(f"### 历史极值")
+            parts.append("### 历史极值")
             parts.append(f"- 净持仓最高: {ext.get('net_max', 'N/A')} | 最低: {ext.get('net_min', 'N/A')}")
             parts.append(f"- 当前距离极值: {ext.get('pct_from_max', 'N/A')}% / {ext.get('pct_from_min', 'N/A')}%")
         if gold_focus.get('trend_4w'):
@@ -395,7 +394,6 @@ class MarketAnalyzer:
 
     async def _gather_workflow_experience(self) -> dict:
         """收集过往工作流经验：近期对话、相关记忆、近期市场报告"""
-        from .database import mem_list
         today = datetime.now()
         week_ago = (today - timedelta(days=7)).strftime('%Y-%m-%d')
         three_days_ago = (today - timedelta(days=3)).strftime('%Y-%m-%d')
@@ -553,7 +551,7 @@ class MarketAnalyzer:
         parts = []
 
         # 标题
-        parts.append(f"# 现货黄金综合分析报告")
+        parts.append("# 现货黄金综合分析报告")
         parts.append(f"## {today} | 黄金现货 {gold_price}")
         parts.append("")
         parts.append("---")

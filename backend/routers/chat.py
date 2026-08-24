@@ -3,7 +3,7 @@ import json
 import asyncio
 import time
 import logging
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from .. import database as db
@@ -12,9 +12,8 @@ from ..tools import TOOLS_SCHEMA, execute_tool
 from ..llm_client import chat_stream
 from ..memory_engine import (
     maybe_extract_memories, build_memory_injection,
-    extract_memories_from_text,
 )
-from ..context_compressor import maybe_compress
+from ..context_compressor import maybe_compress, prune_tool_result, estimate_tokens
 from ..schedule_reminder import check_reminders
 from ..confirm_flow import get_pending_proposals
 from ..validators.auditor_skill import AUDITOR_SKILL_PROMPT
@@ -22,6 +21,15 @@ from ..validators.output_validator import validate_output
 from ..validators.input_validator import validate_input
 from ..validators.execution_validator import validate_tool_result
 from ..audit.audit_log import log_event
+
+
+def _safe_int(value, default: int) -> int:
+    """安全转 int：坏值/None/空串回退默认，避免配置脏值炸掉整轮对话。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -93,6 +101,22 @@ def _maybe_auto_title(conv_id: str, user_message: str):
         logging.getLogger("zenith.chat").warning("自动标题生成失败: %s", e)
 
 
+def _split_query(q: str) -> list:
+    """查询切词：英文按空格/连字符分词，中文按 2-3 字滑窗，用于触发词子串匹配。"""
+    import re as _re
+    out = []
+    # 英文词
+    for w in _re.findall(r"[a-z][a-z0-9\-]*", q):
+        if len(w) >= 3:
+            out.append(w)
+    # 中文 2-gram / 3-gram 滑窗（跳过纯标点）
+    cn = _re.sub(r"[^\u4e00-\u9fff]", "", q)
+    if cn:
+        for n in (2, 3):
+            out.extend(cn[i:i+n] for i in range(len(cn) - n + 1))
+    return list(dict.fromkeys(out))
+
+
 def _build_skill_injection(current_query: str) -> str:
     """从记忆库检索 type='skill' 匹配当前查询，作为硬性指令注入 system prompt。
 
@@ -103,16 +127,37 @@ def _build_skill_injection(current_query: str) -> str:
     if not current_query or len(current_query.strip()) < 2:
         return ""
     try:
-        results = db.mem_search(current_query.strip()[:30], limit=5)
-        skill_mems = [m for m in results if m.get("type") == "skill"]
-        if not skill_mems:
+        q = current_query.strip()[:60]
+        # 全量加载 skill 记忆（量小 43 条），用「触发词子串匹配」而非 FTS：
+        # FTS/LIKE 对整句中文字符串命中率低，触发词匹配最可靠
+        all_skills = [m for m in db.mem_list(type_="skill") if (m.get("content") or "").startswith("技能：")]
+        hit_skills = []
+        for m in all_skills:
+            content = m.get("content", "")
+            trigger = ""
+            for line in content.splitlines():
+                if line.startswith("触发："):
+                    trigger = line[3:]
+                    break
+            # 触发段 + 技能名 + keywords 作为匹配面
+            match_text = (trigger + " " + (m.get("keywords") or "") + " " + content[:80]).lower()
+            ql = q.lower()
+            if any(tok in match_text for tok in (ql,)) or \
+               any(tok in match_text for tok in _split_query(ql)):
+                hit_skills.append(m)
+        # 按触发词覆盖度排序：命中的关键词越多越相关
+        hit_skills.sort(key=lambda m: sum(
+            1 for tok in _split_query(q.lower()) if tok in
+            ((m.get("content") or "").lower() + " " + (m.get("keywords") or "").lower())),
+            reverse=True)
+        if not hit_skills:
             return ""
         parts = [
             "【已启用技能 · 必须遵循】",
             "以下技能与本次请求相关。若用户请求适用其中某个技能，你必须严格按其定义的「触发」与「步骤」执行，"
             "不要跳过步骤，也不要仅作为参考。技能内容：",
         ]
-        for m in skill_mems[:3]:
+        for m in hit_skills[:3]:
             c = m.get("content", "").strip()
             if not c:
                 continue
@@ -121,22 +166,6 @@ def _build_skill_injection(current_query: str) -> str:
         return "\n".join(parts).strip()
     except Exception:
         return ""
-
-
-async def _auto_extract_memory(conv_id: str):
-    """后台自动提取对话记忆（共用 _do_extract 内核，与 periodic 同路径）"""
-    logger = logging.getLogger("zenith.distill")
-    try:
-        msgs = db.msg_list(conv_id)
-        text = "\n".join(m.get("content", "") for m in msgs if m.get("role") in ("user", "assistant"))
-        if not text.strip():
-            return
-        result = await extract_memories_from_text(text, conv_id)
-        new_count = result.get("new", 0)
-        if new_count > 0:
-            logger.info("对话结束记忆提取: conv=%s, 新增%d条", conv_id, new_count)
-    except Exception as e:
-        logging.getLogger("zenith.distill").warning("对话结束记忆提取失败: %s", e)
 
 
 async def _process_conv(
@@ -298,10 +327,19 @@ async def _process_conv(
                         assistant_text += tool_info
                         event_queue.put_nowait(json.dumps({'type': 'text', 'content': tool_info}, ensure_ascii=False))
 
+                tool_content = str(result.get("result", ""))
+                prune_cfg = cfg.get("tool_result_prune", {}) or {}
+                if prune_cfg.get("enabled", True):
+                    tool_content = prune_tool_result(
+                        tool_content,
+                        threshold_chars=_safe_int(prune_cfg.get("threshold_chars"), 8192),
+                        head_chars=_safe_int(prune_cfg.get("head_chars"), 4096),
+                        tail_chars=_safe_int(prune_cfg.get("tail_chars"), 1024),
+                    )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_id,
-                    "content": str(result.get("result", "")),
+                    "content": tool_content,
                 })
 
         if assistant_text:
@@ -326,9 +364,6 @@ async def _process_conv(
 
         combined = user_message + "\n" + assistant_text
         await maybe_extract_memories(combined, conv_id, interval=cfg.get("memory_extract_interval", 3))
-
-        if cfg.get("auto_distill_enabled", True):
-            asyncio.create_task(_auto_extract_memory(conv_id))
 
         # L3: 输出验证 — 绝对化表述/高风险领域/记忆矛盾检测
         if cfg.get("validators", {}).get("output", {}).get("enabled", True):
@@ -413,7 +448,11 @@ async def chat(request: Request):
     db.msg_add(conv_id, "user", user_message)
     # 永久优化：首条消息后自动生成简洁标题（替代 New Chat 占位）
     _maybe_auto_title(conv_id, user_message)
-    await maybe_compress(conv_id)
+    # P3.2: 压缩加超时 — LLM 慢/失败时 30s 兜底，不阻塞对话请求
+    try:
+        await asyncio.wait_for(maybe_compress(conv_id), timeout=30)
+    except (asyncio.TimeoutError, Exception):
+        logging.getLogger("zenith.chat").warning("maybe_compress 超时或失败，跳过压缩（不阻塞对话）")
 
     return _start_sse(conv_id, user_message, cfg, provider_name, persona_name, persist_user=False)
 
@@ -491,6 +530,17 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
         "不要声称你没有这些能力。修改类工具调用后前端会弹出确认卡片，用户点「执行」才会生效；read_document_chunk 是只读工具，直接返回段落内容。"
     )
 
+    # 学术检索能力声明 — 告知 AI 具备论文检索与 DOI 题录查询工具
+    system_parts.append(
+        "## 你的学术检索能力\n"
+        "你具备检索学术论文的工具：\n"
+        "- academic_search(query, from_date, to_date, venue, limit): 检索论文（OpenAlex/Crossref），"
+        "支持 Nature/Science 等期刊过滤，结果自动写入本地学术缓存\n"
+        "- paper_lookup(doi): 按 DOI 查询单篇论文题录与摘要\n"
+        "当用户要求查论文/文献/最新研究/高影响力文章，或给出 DOI/论文链接时，调用对应工具。"
+    )
+
+
     memory_injection = build_memory_injection(current_query=current_query)
     if memory_injection:
         system_parts.append(memory_injection)
@@ -498,10 +548,44 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
     if skill_injection:
         system_parts.append(skill_injection)
 
+    # D-A: 历史摘要注入 — 压缩产物此前因 role=system 被过滤而从未进入上下文（孤儿摘要），
+    # 这里提取 [历史摘要] 消息并入 system_parts，修复「压缩=丢上下文」问题
+    all_msgs = db.msg_list(conv_id)
+    for m in all_msgs:
+        if m["role"] == "system" and (m.get("content") or "").startswith("[历史摘要]"):
+            system_parts.append(m["content"])
+            break
+
     messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
-    for m in db.msg_list(conv_id):
-        if m["role"] != "system":
-            messages.append({"role": m["role"], "content": m["content"]})
+    # P3.3: 历史截断 — 按 token 上限从新到旧保留（E 项），条数硬上限兜底。
+    # [历史摘要] 已在上方注入 system_parts
+    history = [m for m in all_msgs if m["role"] != "system"]
+
+    # 1) 条数硬上限兜底（防单条极端超长/历史无限堆积）
+    hist_cap = int(cfg.get("chat_history_cap", 30))
+    if hist_cap > 0 and len(history) > hist_cap:
+        history = history[-hist_cap:]
+
+    # 2) token 上限截断（从新到旧累加，保留不超过上限的最近消息）
+    max_tokens = int(cfg.get("chat_history_max_tokens", 12000))
+    if max_tokens > 0:
+        kept = []
+        total = 0
+        for m in reversed(history):
+            t = estimate_tokens(m.get("content") or "")
+            if kept and total + t > max_tokens:
+                break
+            kept.append(m)
+            total += t
+        kept.reverse()
+        if len(kept) < len(history):
+            logging.getLogger("zenith.chat").info(
+                "对话 %s 历史 token 截断: %d → %d 条 (~%d tokens)",
+                conv_id, len(history), len(kept), total)
+        history = kept
+
+    for m in history:
+        messages.append({"role": m["role"], "content": m["content"]})
     return messages
 
 
@@ -572,7 +656,8 @@ async def regenerate(request: Request):
     if not conv_id:
         return JSONResponse({"error": "缺少 conversation_id"}, status_code=400)
 
-    msgs = db.msg_list(conv_id)
+    # D-B: 过滤 system（含 [历史摘要]）后判断最后一条 assistant，修复压缩后 regenerate 误判
+    msgs = [m for m in db.msg_list(conv_id) if m["role"] != "system"]
     if not msgs:
         return JSONResponse({"error": "对话为空，无法重新生成"}, status_code=400)
     if msgs[-1]["role"] != "assistant":

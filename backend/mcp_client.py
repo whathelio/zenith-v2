@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import subprocess
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -315,11 +314,6 @@ class MCPClient:
                 raise MCPClientError(f"stdio MCP '{self.name}' 初始化失败: {e}")
             if result:
                 break
-            # 若服务器建议了协议版本，重试
-            suggested = None
-            if attempt == 0:
-                # 某些服务器在错误里带 latestProtocolVersion
-                pass
         await self._stdio_send("notifications/initialized", {}, expect_response=False)
 
     async def _stdio_request(self, method: str, params: dict) -> dict:

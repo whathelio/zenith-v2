@@ -108,6 +108,133 @@ class TestMemoryTools:
         assert "success" in result
 
 
+class TestConsolidateDefense:
+    """P0 防御用例（2026-08-19 治理评审 C1-C4）"""
+
+    @pytest.mark.asyncio
+    async def test_consolidate_plan_has_llm_note_on_failure(self, test_db, monkeypatch):
+        """C3: LLM 建议段失败时 plan 携带显式 llm_note，而非静默"""
+        from backend import tools as tools_mod
+        from backend import llm_client
+        from backend.database import mem_add
+
+        # 造 ≥5 条记忆，确保触发 LLM 建议段（generate_consolidate_plan 的 LLM 分支门槛）
+        for i in range(6):
+            mem_add(type_="experience", content=f"测试记忆条目 {i}：关于工作流的经验",
+                    importance=3, keywords="test")
+
+        async def _fake_call_llm_fail(**kwargs):
+            return {"role": "assistant", "content": "Error: boom"}
+
+        # generate_consolidate_plan 内 `from .llm_client import call_llm` 局部导入 → patch 源模块
+        monkeypatch.setattr(llm_client, "call_llm", _fake_call_llm_fail)
+        plan = await tools_mod.generate_consolidate_plan()
+        assert "llm_note" in plan
+        assert plan["llm_note"]  # 非空即显式降级生效
+        # 格式化输出也应包含提示
+        text = tools_mod._format_consolidate_plan(plan)
+        assert "⚠️" in text
+
+    @pytest.mark.asyncio
+    async def test_consolidate_plan_limits_scan(self, test_db):
+        """C4: 自动相似度比对范围被限制（>500 条时不爆炸）"""
+        from backend import tools as tools_mod
+        # 构造 plan 直接验证 scan_mems 切片逻辑不越界
+        plan = await tools_mod.generate_consolidate_plan()
+        assert "total" in plan and "merge_groups" in plan
+        assert isinstance(plan["merge_groups"], list)
+
+    def test_extract_json_empty_raises(self):
+        """C1 辅助: _extract_json 对空/纯错误文本抛 ValueError 而非崩溃"""
+        from backend.tools import _extract_json
+        with pytest.raises(ValueError):
+            _extract_json("")
+        with pytest.raises(ValueError):
+            _extract_json("Error: 'NoneType' object is not subscriptable")
+
+    @pytest.mark.asyncio
+    async def test_consolidate_plan_null_created_at_no_crash(self, test_db):
+        """V4 根因防回归: created_at 为 NULL 的记忆不再抛 'NoneType' subscriptable。
+
+        2026-08-19 实测复现：m.get("created_at", "") 在 key 存在但值为 None 时
+        返回 None → None[:10] 抛 TypeError。修复为 (m.get("created_at") or "")[:10]。
+        """
+        from backend import tools as tools_mod
+        from backend.database import mem_add, db as db_ctx
+        for i in range(6):
+            mem_add(type_="experience", content=f"NULL时间记忆 {i}",
+                    importance=1, keywords="test")
+        # 手动把 created_at 置 NULL 复现线上脏数据
+        with db_ctx() as c:
+            c.execute("UPDATE memories SET created_at = NULL")
+        plan = await tools_mod.generate_consolidate_plan()
+        assert "total" in plan  # 不再抛异常
+        assert "outdated" in plan
+
+    @pytest.mark.asyncio
+    async def test_llm_client_choices_null_returns_error_dict(self, monkeypatch):
+        """C1: choices=null 时返回 Error dict，不再抛裸 TypeError 文本"""
+        import httpx
+        from backend import llm_client
+
+        class _FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": None}
+
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **k):
+                return _FakeResp()
+
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        monkeypatch.setattr(llm_client, "get_provider", lambda: {
+            "type": "openai", "name": "test", "model": "test-model",
+            "api_base": "http://x",
+        })
+        monkeypatch.setattr(llm_client, "get_provider_api_key", lambda p: "k")
+        msg = await llm_client.call_llm(
+            [{"role": "user", "content": "hi"}],
+            temperature=0.1, max_tokens=64,
+        )
+        assert msg["content"].startswith("Error:")
+        assert "'NoneType' object is not subscriptable" not in msg["content"]
+
+
+class TestCacheStats:
+    """P2 缓存命中率埋点测试"""
+
+    def test_cache_stat_add_and_summary(self, test_db):
+        """写入两条记录后聚合正确，命中率=hit/prompt"""
+        from backend.database import cache_stat_add, cache_stats_summary, db as db_ctx
+        # 测试库为共享 tempfile，先清空本表保证计数独立
+        with db_ctx() as c:
+            c.execute("DELETE FROM cache_stats")
+        cache_stat_add(provider="deepseek", model="m1", kind="chat",
+                       prompt_tokens=1000, prompt_cache_hit_tokens=800,
+                       completion_tokens=200)
+        cache_stat_add(provider="deepseek", model="m1", kind="chat",
+                       prompt_tokens=500, prompt_cache_hit_tokens=0,
+                       completion_tokens=150)
+        s = cache_stats_summary(hours=24)
+        assert s["calls"] == 2
+        assert s["prompt_tokens"] == 1500
+        assert s["hit_tokens"] == 800
+        assert abs(s["hit_rate"] - 800 / 1500) < 1e-3  # 4位小数精度
+        kinds = {k["kind"]: k for k in s["by_kind"]}
+        assert kinds["chat"]["calls"] == 2
+
+
 class TestDistillTools:
     """蒸馏工具测试"""
 

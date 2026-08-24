@@ -92,6 +92,16 @@ def _build_wrapper(code: str) -> str:
     return "\n".join(wrapper_lines)
 
 
+def _max_output_len() -> int:
+    """代码输出截断上限：读取 config.max_code_output（消除死配置双轨）。
+    config 读取失败时回退 MAX_OUTPUT_LEN。"""
+    try:
+        from .config import load_config
+        return int(load_config().get("max_code_output", 0) or 0) or MAX_OUTPUT_LEN
+    except Exception:
+        return MAX_OUTPUT_LEN
+
+
 def _parse_output(stdout_text: str, stderr_text: str = "") -> dict:
     """解析带 __STDOUT__/__STDERR__ 分隔符的输出。返回结构化结果：
     {"success", "output", "stdout", "stderr", "exit_code", "lang"}
@@ -115,8 +125,9 @@ def _parse_output(stdout_text: str, stderr_text: str = "") -> dict:
     if err:
         final += f"\n\n[stderr]\n{err}"
 
-    if len(final) > MAX_OUTPUT_LEN:
-        final = final[:MAX_OUTPUT_LEN] + "\n\n... (输出被截断)"
+    limit = _max_output_len()
+    if len(final) > limit:
+        final = final[:limit] + "\n\n... (输出被截断)"
 
     return {
         "success": True,
@@ -157,15 +168,7 @@ async def _run_in_docker(code: str, timeout: int = 30) -> dict:
     script = TEMP / f"exec_{int(time.time() * 1000)}.py"
     script.write_text(_build_wrapper(code), encoding="utf-8")
 
-    # Windows 路径需要转换为 Docker 接受的格式
     script_path_host = str(script)
-    if sys.platform == "win32":
-        # O:\foo\bar.py -> /o/foo/bar.py
-        drive = script_path_host[0].lower()
-        rest = script_path_host[2:].replace("\\", "/")
-        script_path_container = f"/{drive}{rest}"
-    else:
-        script_path_container = script_path_host
 
     docker_cmd = [
         "docker", "run", "--rm",

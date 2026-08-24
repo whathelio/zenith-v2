@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { api, type Settings } from '../shared/api'
+import GlobalBackground from '../components/GlobalBackground'
 
 const defaultSettings: Settings = {
   api_base: 'https://open.bigmodel.cn/api/paas/v4',
@@ -16,6 +17,7 @@ const defaultSettings: Settings = {
   background_provider: '',
   personas: [],
   socratic_mode: true,
+  background_image: '',
 }
 
 const PRESETS = [
@@ -54,6 +56,8 @@ export default function SettingsView() {
   const [loading, setLoading] = useState(true)
   const [activePreset, setActivePreset] = useState('glm')
   const [apiKeyInput, setApiKeyInput] = useState('')  // 独立管理 key 输入
+  const [bgPreview, setBgPreview] = useState('')        // 全局背景预览 URL
+  const bgInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { loadSettings() }, [])
 
@@ -62,6 +66,8 @@ export default function SettingsView() {
       const s = await api.getSettings()
       const merged = { ...defaultSettings, ...s }
       setSettings(merged)
+      // 全局背景预览
+      setBgPreview((s as any).background_image ? `/api/settings/background-image?t=${Date.now()}` : '')
       // key 输入框初始为空（后端返回掩码），让用户自己填
       setApiKeyInput('')
       // 按 api_base 匹配预设（不要求 model 完全一致）
@@ -86,6 +92,8 @@ export default function SettingsView() {
     setSaved(false)
     try {
       const toSave = { ...settings }
+      // 全局背景图由上传/清除即时持久化，不在这条路径覆盖真实文件名
+      delete (toSave as any).background_image
       // 如果用户填了新的 key，用新的；否则留空（后端保留旧的）
       if (apiKeyInput.trim()) {
         toSave.api_key = apiKeyInput.trim()
@@ -104,6 +112,35 @@ export default function SettingsView() {
     if (key === 'api_base' || key === 'model') setActivePreset('custom')
   }
 
+  // ── 全局背景图片（外观常用设置）──
+  const applyGlobalBg = (url: string) => {
+    setBgPreview(url)
+    setSettings(prev => ({ ...prev, background_image: url ? 'global' : '' }))
+    window.dispatchEvent(new CustomEvent('zenith:global-bg-change', { detail: url ? '1' : '' }))
+  }
+
+  const handleBgSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      await api.uploadGlobalBackgroundImage(file)
+      applyGlobalBg(`/api/settings/background-image?t=${Date.now()}`)
+    } catch (err: any) {
+      setError('背景图上传失败：' + (err?.message || err))
+    } finally {
+      if (bgInputRef.current) bgInputRef.current.value = ''
+    }
+  }
+
+  const handleBgClear = async () => {
+    try {
+      await api.clearGlobalBackgroundImage()
+      applyGlobalBg('')
+    } catch (err: any) {
+      setError('清除背景图失败：' + (err?.message || err))
+    }
+  }
+
   if (loading) {
     return (
       <div className="app-shell">
@@ -118,6 +155,7 @@ export default function SettingsView() {
 
   return (
     <div className="app-shell">
+      <GlobalBackground />
       <div className="main-content">
         <div className="topbar">
           <span className="topbar-title">⚙ 设置</span>
@@ -143,6 +181,51 @@ export default function SettingsView() {
                 ✓ 设置已保存，立即生效
               </div>
             )}
+
+            {/* 0. 外观（常用设置，始终存在） */}
+            <div className="settings-section">
+              <h3>外观</h3>
+              <div className="form-hint" style={{ marginBottom: 12 }}>
+                设置全局背景图片，所有页面共享（固定全屏显示，带暗色遮罩保证可读性）。
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <div
+                  onClick={() => bgInputRef.current?.click()}
+                  style={{
+                    width: 120, height: 72, borderRadius: 8, cursor: 'pointer',
+                    border: '1px dashed var(--color-border)',
+                    background: bgPreview
+                      ? `center/cover no-repeat url("${bgPreview}")`
+                      : 'var(--color-bg-input)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    color: 'var(--color-text-muted)', fontSize: 12, textAlign: 'center',
+                    overflow: 'hidden',
+                  }}
+                  title="点击上传 / 更换背景图片"
+                >
+                  {!bgPreview && '点击上传背景图'}
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <button className="btn btn-sm" onClick={() => bgInputRef.current?.click()}>
+                    {bgPreview ? '🖼 更换背景图' : '🖼 上传背景图'}
+                  </button>
+                  {bgPreview && (
+                    <button className="btn btn-sm" style={{ color: 'var(--color-accent-danger)' }}
+                      onClick={handleBgClear}>
+                      🗑 清除背景图
+                    </button>
+                  )}
+                  <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>支持 png/jpg/webp/gif，≤15MB</span>
+                </div>
+                <input
+                  ref={bgInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  style={{ display: 'none' }}
+                  onChange={handleBgSelect}
+                />
+              </div>
+            </div>
 
             {/* 1. 模型方案选择 */}
             <div className="settings-section">

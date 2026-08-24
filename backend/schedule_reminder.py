@@ -22,7 +22,7 @@ def _parse_time(time_str: str) -> datetime | None:
         return None
     formats = [
         "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S+%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M",
         "%Y-%m-%d %H:%M",
@@ -67,6 +67,20 @@ def _record_reminder(sid: int):
             "INSERT INTO schedule_reminders (schedule_id, reminded_at) VALUES (?, ?)",
             (sid, now_tz().isoformat())
         )
+
+
+def ack_reminders(schedule_ids: list) -> int:
+    """真正投递后记录（幂等：当天重复 ack 仅记一条）。返回记录条数。"""
+    n = 0
+    for sid in schedule_ids:
+        try:
+            sid = int(sid)
+        except (TypeError, ValueError):
+            continue
+        if not _already_reminded(sid):
+            _record_reminder(sid)
+            n += 1
+    return n
 
 
 def get_due_reminders() -> dict:
@@ -124,9 +138,8 @@ def check_reminders() -> str:
         ))
 
     if due:
-        # 记录提醒，避免重复
-        for s in due:
-            _record_reminder(s["id"])
+        # 仅生成文本，不在此记录；记录动作由投递确认（ack_reminders）完成，
+        # 避免后台扫描抢先记录导致前端轮询永远拿不到 due。
         parts.append("🟡 **即将开始：**\n" + "\n".join(
             f"  ⏰ {s['title']} @ {s.get('start_time', '待定')}"
             for s in due

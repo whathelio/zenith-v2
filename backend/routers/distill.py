@@ -1,6 +1,5 @@
 """Distill API — 蒸馏 + 文件管理"""
-from fastapi import APIRouter, HTTPException, Body
-from pathlib import Path
+from fastapi import APIRouter, HTTPException
 from ..unified_distill import (
     distill_conversation, distill_schedules, distill_memories,
     distill_all, distill_daily, distill_weekly, _OUTPUT_DIR as DISTILL_OUTPUT

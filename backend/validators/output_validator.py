@@ -70,9 +70,6 @@ def _check_memory_contradiction(text: str, warnings: list[dict]):
     if not key_sentences:
         return
 
-    # 搜索近期记忆
-    recent_mems = db.mem_list(limit=30)
-
     for sentence in key_sentences[:2]:  # 只检查前2句
         # 用关键词搜索相关记忆
         kw = sentence[:20]

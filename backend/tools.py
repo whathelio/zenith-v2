@@ -5,7 +5,7 @@ import re
 import json
 import asyncio
 import logging
-from .database import sch_add, sch_list, sch_update, note_add, note_list, note_update, note_get, mem_search, mem_add, mem_del, mem_get, mem_list, MEMORY_TYPES, msg_list, conv_update_learning_progress
+from .database import sch_add, sch_list, sch_update, note_add, note_list, note_get, mem_search, mem_add, mem_del, mem_get, mem_list, MEMORY_TYPES, msg_list, conv_update_learning_progress
 from . import knowledge_service
 from .config import is_code_execution_enabled
 
@@ -143,6 +143,62 @@ TOOLS_SCHEMA = [
                     "memory_id": {"type": "integer", "description": "要删除的记忆 ID（用 search_memory 先查到）"}
                 },
                 "required": ["memory_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_conversation",
+            "description": "重命名当前对话标题。生成待确认请求，用户确认后才会真正修改（改标题是元数据操作，不影响对话排序）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_title": {"type": "string", "description": "新的对话标题（简洁中文，≤40 字）"}
+                },
+                "required": ["new_title"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_snapshot",
+            "description": "手动创建代码快照（git commit）。备份当前 zenith 代码状态，便于日后回退。生成待确认请求，用户确认后才会执行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "快照说明（如：优化前备份 / 大改前存档），≤60 字"}
+                },
+                "required": ["label"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rollback_code",
+            "description": "⚠️ 高危：将 backend/ 代码回退到指定快照（git commit hash）。回退点之后的 backend 改动将丢失（data/ 数据不受影响），需重启生效。生成待确认请求，用户确认后才会执行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "snapshot_hash": {"type": "string", "description": "要回退到的 commit hash（7-40 位十六进制，用 list_snapshots 查看）"},
+                    "reason": {"type": "string", "description": "回退原因说明（可选）"}
+                },
+                "required": ["snapshot_hash"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_snapshots",
+            "description": "列出最近代码快照（git commit 历史，含 hash 与摘要），供 create_snapshot/rollback_code 参考。只读，无需确认。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "number", "description": "最多返回几条（默认 20，最大 100）"}
+                }
             }
         }
     },
@@ -463,6 +519,36 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "distill_monthly",
+            "description": "月度蒸馏：聚合指定月份的所有日/周总结，生成月总结报告（月度全貌、重大事件、趋势、成就、教训、下月规划）。用户要求月总结/回顾本月/月度蒸馏时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {"type": "string", "description": "月份，格式YYYY-MM，默认本月"},
+                    "save_txt": {"type": "boolean", "description": "是否保存为txt文件，默认true"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "distill_yearly",
+            "description": "年度蒸馏：聚合指定年份的所有月度总结，生成年度总结报告（年度全貌、里程碑、成长、教训、来年方向）。用户要求年总结/年度回顾/年度蒸馏时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {"type": "string", "description": "年份，格式YYYY，默认今年"},
+                    "save_txt": {"type": "boolean", "description": "是否保存为txt文件，默认true"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "consolidate_memories",
             "description": "整理/合并/去重记忆库：分析记忆库中的重复或相似条目，生成待执行的合并/删除建议清单。需要先经过用户确认，不会自动删除。当用户提到'合并记忆'、'去重记忆'、'整理记忆库'等意图时调用。",
             "parameters": {
@@ -595,6 +681,22 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "merge_notes",
+            "description": "合并多篇笔记为一篇。不会立即执行——会生成待确认动作，用户确认后才真正合并（创建新笔记并默认删除原稿）。传笔记 ID 数组（至少 2 篇）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_ids": {"type": "array", "items": {"type": "integer"}, "description": "要合并的笔记 ID 数组，至少 2 个"},
+                    "new_title": {"type": "string", "description": "合并后笔记的标题（可选，默认自动生成）"},
+                    "keep_originals": {"type": "boolean", "description": "是否保留原稿不删除（可选，默认 false=合并后删除原稿）"}
+                },
+                "required": ["note_ids"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delete_note",
             "description": "删除一条笔记。不会立即执行——会生成待确认动作，用户确认后才真正删除。调用时传笔记 ID。",
             "parameters": {
@@ -681,6 +783,39 @@ TOOLS_SCHEMA = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "academic_search",
+            "description": "检索学术论文（OpenAlex + Crossref），结果自动写入本地 SQLite 学术缓存。支持 Nature/Science 等高影响力期刊过滤。用户要求查论文/文献/最新研究/高影响力文章时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索词，如 large language model reasoning"},
+                    "from_date": {"type": "string", "description": "起始日期 YYYY-MM-DD，可选"},
+                    "to_date": {"type": "string", "description": "结束日期 YYYY-MM-DD，可选"},
+                    "venue": {"type": "string", "description": "期刊/会议过滤，如 Nature、Science、NeurIPS；空表示不过滤"},
+                    "limit": {"type": "integer", "description": "返回条数，默认10，最大20"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "paper_lookup",
+            "description": "按 DOI 查询单篇论文题录与摘要（OpenAlex/Crossref），并写入本地学术缓存。用户给出 DOI 或论文链接时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doi": {"type": "string", "description": "论文 DOI，如 10.1038/s41586-024-07421-0"}
+                },
+                "required": ["doi"]
+            }
+        }
+    },
+
 ]
 
 
@@ -713,6 +848,8 @@ _TOOL_HANDLERS = {
     "distill_all":         lambda a: _handle_distill_all(a),
     "distill_daily":       lambda a: _handle_distill_daily(a),
     "distill_weekly":      lambda a: _handle_distill_weekly(a),
+    "distill_monthly":     lambda a: _handle_distill_monthly(a),
+    "distill_yearly":      lambda a: _handle_distill_yearly(a),
     "consolidate_memories": lambda a: _handle_consolidate_memories(a),
     "sync_calendar":       lambda a: _handle_sync_calendar(a),
     "smart_classify":      lambda a: _handle_smart_classify(a),
@@ -722,6 +859,7 @@ _TOOL_HANDLERS = {
     "kb_stats":            lambda a: _handle_kb_stats(a),
     "call_mcp":            lambda a: _handle_call_mcp(a),
     "delete_note":         lambda a: _handle_delete_note(a),
+    "merge_notes":         lambda a: _handle_merge_notes(a),
     "edit_note":           lambda a: _handle_edit_note(a),
     "edit_memory":         lambda a: _handle_edit_memory(a),
     "delete_memory":       lambda a: _handle_delete_memory(a),
@@ -729,6 +867,13 @@ _TOOL_HANDLERS = {
     "update_background":   lambda a: _handle_update_background(a),
     "delete_message":      lambda a: _handle_delete_message(a),
     "read_document_chunk": lambda a: _handle_read_document_chunk(a),
+    "rename_conversation": lambda a: _handle_rename_conversation(a),
+    "create_snapshot":     lambda a: _handle_create_snapshot(a),
+    "rollback_code":       lambda a: _handle_rollback_code(a),
+    "list_snapshots":      lambda a: _handle_list_snapshots(a),
+    "academic_search":    lambda a: _handle_academic_search(a),
+    "paper_lookup":       lambda a: _handle_paper_lookup(a),
+
 }
 
 
@@ -919,6 +1064,13 @@ def _handle_search_memory(args: dict) -> dict:
     items = mem_search(keyword=args.get("keyword", ""))
     if not items:
         return {"success": True, "result": "未找到相关记忆。"}
+    # 命中即提升重要度 + 刷新 last_touched_at（引用提升机制，限前 10 条避免过度膨胀）
+    try:
+        from .memory_engine import mem_touch
+        for m in items[:10]:
+            mem_touch(m["id"])
+    except Exception:
+        pass
     lines = ["🧠 相关记忆："]
     for m in items:
         lines.append(f"  [ID:{m['id']}][{m['type']}] {m['content']}")
@@ -1043,7 +1195,7 @@ def _handle_create_tutorial(args: dict) -> dict:
         f"共 {current['total_steps']} 步，当前第 {current['step_index']} 步",
         f"\n步骤 {current['step_index']}: {current['action']}",
         f"验证: {current['verify']}",
-        f"\n完成后请回复「确认」进入下一步，或回复「失败」+原因",
+        "\n完成后请回复「确认」进入下一步，或回复「失败」+原因",
     ]
     return {
         "success": True,
@@ -1169,7 +1321,7 @@ def _handle_mt5_volume_profile(args: dict) -> dict:
         f"  价值区域下沿: {result['value_area_low']}",
         f"  总成交量: {result['total_volume']}",
         f"  分箱大小: {result['bin_size']}",
-        f"\n  POC是主力成本最密集的区域，通常作为关键支撑/阻力位",
+        "\n  POC是主力成本最密集的区域，通常作为关键支撑/阻力位",
     ]
 
     # 显示前5个最大成交量的箱
@@ -1663,7 +1815,7 @@ async def _distill_raw_note(
     memory_context = []
     for i, m in enumerate(filtered_mems[:20], 1):
         t = m.get("type", "")
-        c = m.get("content", "")[:200]
+        c = (m.get("content") or "")[:200]
         mid = m.get("id")
         memory_context.append(f"{i}. [ID:{mid}][{t}] {c}")
     memory_text = "\n".join(memory_context) if memory_context else "（暂无相关偏好或方法记忆）"
@@ -2120,6 +2272,58 @@ async def _handle_distill_weekly(args: dict) -> dict:
     return {"success": True, "result": "\n".join(lines), "txt_content": txt, "txt_path": txt_path, **result}
 
 
+async def _handle_distill_monthly(args: dict) -> dict:
+    """处理月度蒸馏工具调用"""
+    from .unified_distill import distill_monthly
+
+    month = args.get("month", "").strip()
+    if not month:
+        from datetime import datetime
+        month = datetime.now().strftime("%Y-%m")
+
+    save_txt = args.get("save_txt", True)
+    result = await distill_monthly(month=month, save_txt=save_txt)
+
+    if result.get("skipped"):
+        return {"success": True, "result": f"月度总结跳过（{month}）：{result.get('reason', '无日/周总结可聚合')}"}
+
+    txt_path = result.get("txt_path", "")
+    lines = [
+        f"月度总结完成（{month}）！",
+        f"  标题: {result.get('headline', '')}",
+    ]
+    if txt_path:
+        lines.append(f"  txt文件: {txt_path}")
+
+    return {"success": True, "result": "\n".join(lines), "md_content": result.get("md_content", ""), "txt_path": txt_path, **result}
+
+
+async def _handle_distill_yearly(args: dict) -> dict:
+    """处理年度蒸馏工具调用"""
+    from .unified_distill import distill_yearly
+
+    year = args.get("year", "").strip()
+    if not year:
+        from datetime import datetime
+        year = datetime.now().strftime("%Y")
+
+    save_txt = args.get("save_txt", True)
+    result = await distill_yearly(year=year, save_txt=save_txt)
+
+    if result.get("skipped"):
+        return {"success": True, "result": f"年度总结跳过（{year}）：{result.get('reason', '无月度总结可聚合')}"}
+
+    txt_path = result.get("txt_path", "")
+    lines = [
+        f"年度总结完成（{year}）！",
+        f"  标题: {result.get('headline', '')}",
+    ]
+    if txt_path:
+        lines.append(f"  txt文件: {txt_path}")
+
+    return {"success": True, "result": "\n".join(lines), "md_content": result.get("md_content", ""), "txt_path": txt_path, **result}
+
+
 # ═══════════════════════════════════════════════════════
 # 记忆整理 / 合并 / 去重（用户确认后执行）
 # ═══════════════════════════════════════════════════════
@@ -2198,7 +2402,7 @@ async def detect_consolidate_intent(user_message: str) -> dict:
 
 async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
     """生成记忆整理计划（真实 ID）。结合自动相似度 + LLM 建议。"""
-    from .memory_engine import _similarity
+    from .memory_engine import _similarity, MERGE_SIM_THRESHOLD
     from datetime import datetime, timedelta
     from .llm_client import call_llm
 
@@ -2216,20 +2420,22 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
         ]
 
     # 1. 自动相似度合并候选（>= 0.85 强相似）
+    # C4: 比对范围限前 500 条 — 全量 O(n²) 在记忆量大时耗时分钟级，先设上限止血
     merge_groups = []
     seen_ids = set()
-    for i, m in enumerate(all_mems):
+    scan_mems = all_mems[:500]
+    for i, m in enumerate(scan_mems):
         if m["id"] in seen_ids:
             continue
         group_delete = []
-        for j in range(i + 1, len(all_mems)):
-            other = all_mems[j]
+        for j in range(i + 1, len(scan_mems)):
+            other = scan_mems[j]
             if other["id"] in seen_ids:
                 continue
             if other.get("type") != m.get("type"):
                 continue
             sim = _similarity(m.get("content", ""), other.get("content", ""))
-            if sim >= 0.85:
+            if sim >= MERGE_SIM_THRESHOLD:
                 group_delete.append(other)
                 seen_ids.add(other["id"])
         if group_delete:
@@ -2250,7 +2456,7 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
     outdated_candidates = [
         {"id": m["id"], "reason": "长期未引用且重要度最低，建议清理"}
         for m in all_mems
-        if m.get("importance", 3) == 1 and m.get("created_at", "")[:10] < cutoff and m["id"] not in seen_ids
+        if m.get("importance", 3) == 1 and (m.get("created_at") or "")[:10] < cutoff and m["id"] not in seen_ids
     ]
 
     # 3. LLM 辅助建议（补充可能漏掉的相似项）
@@ -2261,6 +2467,7 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
 
     llm_merge = []
     llm_outdated = []
+    llm_note = ""
     if all_mems and len(all_mems) >= 5:
         try:
             prompt = _CONSOLIDATE_PLAN_PROMPT.replace("{memory_text}", memory_text)
@@ -2275,7 +2482,9 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
             llm_merge = parsed.get("merge_groups", [])
             llm_outdated = parsed.get("outdated", [])
         except Exception as e:
+            # C3: 显式降级 — 不再静默吞掉，plan 携带 llm_note 让调用方/用户可见
             logger.warning("LLM consolidate plan failed: %s", e)
+            llm_note = f"LLM 建议不可用（{e}），仅自动相似度结果"
 
     # 4. 合并自动结果和 LLM 结果（去重，以真实存在的 ID 为准）
     existing_ids = {m["id"] for m in all_mems}
@@ -2324,6 +2533,7 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
         "merge_groups": merged_groups,
         "outdated": final_outdated,
         "scope": type_ or search or "all",
+        "llm_note": llm_note,
     }
 
 
@@ -2370,6 +2580,10 @@ def _format_consolidate_plan(plan: dict) -> str:
         f"整理后预计: {plan.get('total_after', 0)}",
         "",
     ]
+    note = plan.get("llm_note", "")
+    if note:
+        lines.append(f"⚠️ {note}")
+        lines.append("")
     merge_groups = plan.get("merge_groups", [])
     if merge_groups:
         lines.append(f"合并去重（{len(merge_groups)} 组）：")
@@ -2469,6 +2683,69 @@ async def _handle_retrieve_docs(args: dict) -> dict:
 
 # ── 编辑类工具（需用户确认后执行）────────────────────
 from .confirm_flow import create_action
+
+
+def _handle_merge_notes(args: dict) -> dict:
+    """合并多篇笔记 — 生成待确认动作，不直接合并"""
+    note_ids = args.get("note_ids") or []
+    if not isinstance(note_ids, list) or len(note_ids) < 2:
+        return {"success": False, "result": "note_ids 必须是至少 2 个笔记 ID 的数组"}
+    # 去重且保持顺序
+    seen, ids = set(), []
+    for i in note_ids:
+        if isinstance(i, int) and i not in seen:
+            seen.add(i)
+            ids.append(i)
+    if len(ids) < 2:
+        return {"success": False, "result": "有效的笔记 ID 不足 2 个（已去重）"}
+    notes = []
+    for nid in ids:
+        note = note_get(nid)
+        if not note:
+            return {"success": False, "result": f"笔记 ID:{nid} 不存在"}
+        notes.append(note)
+    new_title = (args.get("new_title") or "").strip()
+    if not new_title:
+        parts = [n.get("title", f"#{n['id']}") for n in notes[:3]]
+        suffix = "、".join(str(t)[:12] for t in parts)
+        if len(notes) > 3:
+            suffix += f" 等 {len(notes)} 篇"
+        new_title = f"合并：{suffix}"
+    keep_originals = bool(args.get("keep_originals", False))
+    # 生成合并稿（零外部依赖：结构化拼接 + 来源标注）
+    sections = []
+    for n in notes:
+        body = (n.get("content") or "").strip()
+        sections.append(f"## 来自笔记 #{n['id']}：{n.get('title', '')}\n\n{body if body else '(无内容)'}")
+    sources = ", ".join(f"#{n['id']}" for n in notes)
+    merged_content = f"> 合并自 {len(notes)} 篇笔记（{sources}）\n\n" + "\n\n---\n\n".join(sections)
+    tags_set = set()
+    for n in notes:
+        for tg in str(n.get("tags") or "").split(","):
+            tg = tg.strip()
+            if tg:
+                tags_set.add(tg)
+    merged_tags = ",".join(sorted(tags_set))
+    action = create_action(
+        action_type="merge_notes",
+        title=f"合并笔记: {new_title[:40]}",
+        payload={
+            "note_ids": ids,
+            "new_title": new_title,
+            "merged_content": merged_content,
+            "merged_tags": merged_tags,
+            "keep_originals": keep_originals,
+        },
+    )
+    return {
+        "success": True,
+        "result": f"已生成合并 {len(ids)} 篇笔记的待确认请求 (#{action['id']})。用户确认后创建「{new_title}」"
+                  + ("" if keep_originals else "并删除原稿"),
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
 
 
 def _handle_delete_note(args: dict) -> dict:
@@ -2624,6 +2901,105 @@ def _handle_update_background(args: dict) -> dict:
     }
 
 
+def _handle_rename_conversation(args: dict) -> dict:
+    """重命名当前对话标题 — 生成待确认动作，用户确认后才真正改名。
+    改标题是元数据操作（conv_update_title 不改 updated_at），不影响对话排序。
+    """
+    new_title = (args.get("new_title") or "").strip()
+    conv_id = _current_conv_id
+    if not conv_id:
+        return {"success": False, "result": "无法获取当前对话 ID，无法重命名"}
+    if not new_title:
+        return {"success": False, "result": "new_title 不能为空"}
+    if len(new_title) > 60:
+        return {"success": False, "result": f"标题过长（{len(new_title)}字），请压缩到 60 字以内"}
+    old_title = ""
+    try:
+        from .database import conv_get
+        conv = conv_get(conv_id)
+        old_title = (conv or {}).get("title", "") or ""
+    except Exception:
+        pass
+    action = create_action(
+        action_type="rename_conversation",
+        title=f"重命名对话: {new_title[:40]}",
+        payload={"conv_id": conv_id, "new_title": new_title, "old_title": old_title},
+    )
+    return {
+        "success": True,
+        "result": f"已生成重命名对话的待确认请求 (#{action['id']})：\n「{old_title[:40]}」→「{new_title[:40]}」\n用户确认后才会真正改名。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_create_snapshot(args: dict) -> dict:
+    """手动创建代码快照（git commit）— 生成待确认动作。"""
+    from .git_guard import _is_git_repo
+    label = (args.get("label") or "").strip() or "手动快照"
+    if len(label) > 60:
+        return {"success": False, "result": f"label 过长（{len(label)}字），请压缩到 60 字以内"}
+    if not _is_git_repo():
+        return {"success": False, "result": "zenith-v2 不是 git 仓库，无法创建快照"}
+    action = create_action(
+        action_type="create_snapshot",
+        title=f"创建代码快照: {label[:40]}",
+        payload={"label": label},
+    )
+    return {
+        "success": True,
+        "result": f"已生成创建代码快照的待确认请求 (#{action['id']})：{label}。确认后将 git commit 当前全部改动。",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_rollback_code(args: dict) -> dict:
+    """回退 backend/ 到指定快照 — 生成待确认动作（高危）。"""
+    from .git_guard import _is_git_repo, _HASH_RE
+    snapshot_hash = (args.get("snapshot_hash") or "").strip()
+    reason = (args.get("reason") or "").strip()
+    if not snapshot_hash:
+        return {"success": False, "result": "snapshot_hash 不能为空（用 list_snapshots 查看可用快照）"}
+    if not _HASH_RE.match(snapshot_hash):
+        return {"success": False, "result": f"非法 commit hash: {snapshot_hash}（应为 7-40 位十六进制）"}
+    if not _is_git_repo():
+        return {"success": False, "result": "zenith-v2 不是 git 仓库，无法回退"}
+    action = create_action(
+        action_type="rollback_code",
+        title=f"⚠️ 回退代码到 {snapshot_hash[:12]}",
+        payload={"hash": snapshot_hash, "reason": reason},
+    )
+    return {
+        "success": True,
+        "result": f"已生成回退代码的待确认请求 (#{action['id']})。\n"
+                  f"⚠️ 高风险：将 backend/ 回退到 {snapshot_hash[:12]}，该点之后的 backend 改动将丢失（data/ 数据不受影响），需重启生效。\n"
+                  f"{'原因: ' + reason if reason else ''}",
+        "confirm": True,
+        "confirm_type": "action",
+        "confirm_id": action["id"],
+        "action": action,
+    }
+
+
+def _handle_list_snapshots(args: dict) -> dict:
+    """列出最近代码快照 — 只读，无需确认。"""
+    from .git_guard import list_snapshots
+    limit = int(args.get("limit") or 20)
+    snaps = list_snapshots(limit=limit)
+    if not snaps:
+        return {"success": False, "result": "无法获取快照列表（非 git 仓库或 git 不可用）"}
+    lines = ["📸 最近代码快照（git commit 历史）："]
+    for s in snaps:
+        lines.append(f"  {s['hash']}  {s['summary'][:70]}")
+    lines.append("\n需要回退时用 rollback_code(snapshot_hash=...) 并等待确认。")
+    return {"success": True, "result": "\n".join(lines)}
+
+
 def _handle_delete_message(args: dict) -> dict:
     """删除对话中的隐私消息 — 按内容片段匹配，生成待确认动作。
     只匹配当前对话的用户消息，单条删除（不影响前后消息）。
@@ -2751,6 +3127,60 @@ async def _handle_kb_stats(args: dict) -> dict:
         return {"success": True, "result": f"知识库状态: {h.get('status', '未知')}。详细统计请运行 zotero_parse_rag_core.py --stats"}
     except Exception as e:
         return {"success": False, "result": f"知识库离线: {e}"}
+
+
+async def _handle_academic_search(args: dict) -> dict:
+    """工具入口：学术论文检索，结果本地 SQLite 嵌入缓存。"""
+    from . import academic_service
+
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"success": False, "result": "query 不能为空"}
+    venue = (args.get("venue") or "").strip()
+    limit = min(max(int(args.get("limit") or 10), 1), 20)
+    from_date = (args.get("from_date") or "").strip()
+    to_date = (args.get("to_date") or "").strip()
+
+    r = await academic_service.search_papers(
+        query=query, from_date=from_date, to_date=to_date,
+        venue=venue, limit=limit, store=True,
+    )
+    if not r.get("success"):
+        return {"success": False, "result": r.get("error", "学术检索失败")}
+
+    papers = r.get("papers", [])
+    result_text = academic_service.format_papers(papers, top=limit)
+    if venue:
+        result_text = f"（已过滤期刊/会议: {venue}）\n" + result_text
+    return {
+        "success": True,
+        "result": result_text,
+        "papers": papers,
+        "count": len(papers),
+        "cached_in_db": True,
+        "errors": r.get("errors", []),
+    }
+
+
+async def _handle_paper_lookup(args: dict) -> dict:
+    """工具入口：DOI 题录查询 + 本地缓存。"""
+    from . import academic_service
+
+    doi = (args.get("doi") or "").strip()
+    r = await academic_service.lookup_doi(doi, store=True)
+    if not r.get("success"):
+        return {"success": False, "result": r.get("error", "DOI 查询失败")}
+
+    paper = r.get("paper") or {}
+    result_text = academic_service.format_papers([paper], top=1)
+    return {
+        "success": True,
+        "result": result_text,
+        "paper": paper,
+        "cached": r.get("cached", False),
+        "cached_in_db": True,
+    }
+
 
 
 # ═══════════════════════════════════════════════════════

@@ -10,7 +10,7 @@ from .config import load_config
 from .schedule_reminder import check_reminders
 from .memory_engine import mem_consolidate
 from .llm_client import call_llm
-from .unified_distill import distill_daily, distill_weekly
+from .unified_distill import distill_daily, distill_weekly, distill_monthly, distill_yearly
 
 # ===== 日程完成 → 经验记忆 =====
 
@@ -104,7 +104,7 @@ async def _daily_distill_loop():
         try:
             date_str = datetime.now().strftime("%Y-%m-%d")
             logger.info("每日蒸馏开始: %s", date_str)
-            result = await distill_daily(date=date_str, save_txt=True)
+            await distill_daily(date=date_str, save_txt=True)
             logger.info("每日蒸馏完成: %s", date_str)
         except Exception as e:
             logger.warning("每日蒸馏失败: %s", e)
@@ -123,12 +123,50 @@ async def _weekly_distill_loop():
         logger.info("每周蒸馏: 等待 %d 秒至 %s", int(wait_seconds), target.isoformat())
         await asyncio.sleep(wait_seconds)
         try:
-            week_start = datetime.now().strftime("%Y-%m-%d")
-            logger.info("每周蒸馏开始: %s", week_start)
-            result = await distill_weekly(week_start=week_start, save_txt=True)
-            logger.info("每周蒸馏完成: %s", week_start)
+            # 不传 week_start，让 distill_weekly 自己算本周周一（周日触发时=刚结束这周的周一）。
+            # 旧代码传 datetime.now()（周日当天）会把 week_start 误当周一，聚合出「周日~下周六」的错误范围。
+            logger.info("每周蒸馏开始")
+            await distill_weekly(save_txt=True)
+            logger.info("每周蒸馏完成")
         except Exception as e:
             logger.warning("每周蒸馏失败: %s", e)
+
+
+async def _monthly_distill_loop():
+    """每月 1 日 00:30 总结刚结束的月份"""
+    logger = logging.getLogger("zenith.distill")
+    while True:
+        now = datetime.now()
+        if now.month == 12:
+            nxt = datetime(now.year + 1, 1, 1, 0, 30, 0)
+        else:
+            nxt = datetime(now.year, now.month + 1, 1, 0, 30, 0)
+        wait_seconds = (nxt - now).total_seconds()
+        logger.info("月度总结: 等待 %d 秒至 %s", int(wait_seconds), nxt.isoformat())
+        await asyncio.sleep(wait_seconds)
+        last_month = (nxt - timedelta(days=1)).strftime("%Y-%m")
+        try:
+            await distill_monthly(month=last_month, save_txt=True)
+            logger.info("月度总结完成: %s", last_month)
+        except Exception as e:
+            logger.warning("月度总结失败: %s", e)
+
+
+async def _yearly_distill_loop():
+    """每年 1 月 1 日 00:45 总结刚结束的年份"""
+    logger = logging.getLogger("zenith.distill")
+    while True:
+        now = datetime.now()
+        nxt = datetime(now.year + 1, 1, 1, 0, 45, 0)
+        wait_seconds = (nxt - now).total_seconds()
+        logger.info("年度总结: 等待 %d 秒至 %s", int(wait_seconds), nxt.isoformat())
+        await asyncio.sleep(wait_seconds)
+        last_year = str(nxt.year - 1)
+        try:
+            await distill_yearly(year=last_year, save_txt=True)
+            logger.info("年度总结完成: %s", last_year)
+        except Exception as e:
+            logger.warning("年度总结失败: %s", e)
 
 
 async def _calendar_sync_loop():
@@ -172,22 +210,40 @@ async def _calendar_sync_loop():
             logger.warning("财经日历同步失败: %s", e)
 
 
+_background_tasks: list = []
+
+
 def start_all_background_tasks():
     """启动所有后台定时任务。在 lifespan 中调用。"""
     cfg = load_config()
 
-    asyncio.create_task(_memory_maintenance_loop())
-    asyncio.create_task(_reminder_loop())
+    _background_tasks.append(asyncio.create_task(_memory_maintenance_loop()))
+    _background_tasks.append(asyncio.create_task(_reminder_loop()))
 
     if cfg.get("auto_distill_enabled", True):
-        asyncio.create_task(_daily_distill_loop())
-        asyncio.create_task(_weekly_distill_loop())
+        _background_tasks.append(asyncio.create_task(_daily_distill_loop()))
+        _background_tasks.append(asyncio.create_task(_weekly_distill_loop()))
+        _background_tasks.append(asyncio.create_task(_monthly_distill_loop()))
+        _background_tasks.append(asyncio.create_task(_yearly_distill_loop()))
     else:
         logging.getLogger("zenith").info("auto_distill_enabled=false, 跳过蒸馏定时任务")
 
     cs_cfg = cfg.get("calendar_sync", {}) or {}
     if cs_cfg.get("enabled", False):
-        asyncio.create_task(_calendar_sync_loop())
+        _background_tasks.append(asyncio.create_task(_calendar_sync_loop()))
         logging.getLogger("zenith").info("calendar_sync.enabled=true, 启动财经日历自动同步")
     else:
         logging.getLogger("zenith").info("calendar_sync.enabled=false, 跳过财经日历自动同步")
+
+
+async def stop_all_background_tasks():
+    """优雅停止所有后台定时任务。在 lifespan shutdown 调用。"""
+    for t in _background_tasks:
+        if not t.done():
+            t.cancel()
+    for t in _background_tasks:
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+    _background_tasks.clear()

@@ -8,10 +8,10 @@ from datetime import datetime
 from typing import Optional
 
 from .database import (
-    conv_get, msg_list, sch_list, mem_list, mem_search, mem_add, mem_for_inject,
-    conv_update_summary, conv_update_title,
+    conv_get, msg_list, sch_list, mem_list, mem_search, mem_add, conv_update_summary, conv_update_title,
     conv_list_by_date, mem_list_by_date, note_list_by_date,
     analysis_list_by_date, market_report_get_by_date, goal_list,
+    psum_upsert, psum_list,
 )
 from .llm_client import call_llm, _parse_json_response
 from .memory_engine import _is_duplicate
@@ -449,6 +449,52 @@ _PROMPT_WEEKLY = """请对以下「本周全部内容」进行综合蒸馏总结
 
 本周新增记忆：
 {memory_text}
+
+只返回 JSON，不要其他内容。"""
+
+
+_PROMPT_MONTHLY = """请对以下「{month} 当月的日/周总结」进行综合蒸馏，生成一份月度总结报告。
+聚合要点：合并去重日/周总结中的关键事件，提炼月度级的趋势、规律、成就与经验，并规划下月重点。
+
+返回 JSON 格式：
+{
+  "month": "{month}",
+  "headline": "本月一句话概要（≤30字）",
+  "monthly_summary": "5-8句话的月度全貌描述",
+  "major_events": ["本月最重要的事1", "事2"],
+  "trends": ["月度趋势/变化1", "2"],
+  "achievements": ["月度成就1", "2"],
+  "lessons": ["经验教训1", "2"],
+  "next_month_plan": ["下月重点1", "2"],
+  "tags": ["标签1", "标签2"]
+}
+
+日总结：
+{daily_text}
+
+周总结：
+{weekly_text}
+
+只返回 JSON，不要其他内容。"""
+
+
+_PROMPT_YEARLY = """请对以下「{year} 全年的月度总结」进行综合蒸馏，生成一份年度总结报告。
+聚合要点：提炼年度级的主线、里程碑、成长轨迹与来年方向。
+
+返回 JSON 格式：
+{
+  "year": "{year}",
+  "headline": "年度一句话概要（≤40字）",
+  "yearly_summary": "8-10句话的年度全貌描述",
+  "milestones": ["年度里程碑1", "2"],
+  "growth": ["成长/变化1", "2"],
+  "lessons": ["年度经验教训1", "2"],
+  "next_year_plan": ["来年方向1", "2"],
+  "tags": ["标签1", "标签2"]
+}
+
+月度总结：
+{monthly_text}
 
 只返回 JSON，不要其他内容。"""
 
@@ -1091,6 +1137,10 @@ async def distill_daily(date: str = "", save_txt: bool = True, save_md: bool = T
     total = daily_data["conv_count"] + daily_data["sch_count"] + daily_data["note_count"] + daily_data["mem_count"]
     if total == 0:
         logger.info(f"每日蒸馏跳过: {date} 无内容")
+        try:
+            psum_upsert("daily", date, f"{date} 无活动记录", "", "")
+        except Exception as e:
+            logger.warning("每日总结(空)落库失败: %s", e)
         return {
             "date": date,
             "headline": f"{date} 无活动记录",
@@ -1147,6 +1197,12 @@ async def distill_daily(date: str = "", save_txt: bool = True, save_md: bool = T
         result["md_path"] = _save_txt_plan(md_content, f"daily_{date}.md")
         _archive_external(md_content, kind="daily", date_str=date, filename=f"daily_{date}.md")
 
+    # 6. 落库（可查可回溯）
+    try:
+        psum_upsert("daily", date, result.get("headline", ""), md_content, json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("每日总结落库失败: %s", e)
+
     logger.info(f"每日蒸馏完成: {date}, 已保存{saved_count}条记忆")
     return result
 
@@ -1178,6 +1234,10 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True, save_md: b
     total = weekly_data["conv_count"] + weekly_data["sch_count"] + weekly_data["note_count"] + weekly_data["mem_count"]
     if total == 0:
         logger.info(f"每周蒸馏跳过: {week_start} 无内容")
+        try:
+            psum_upsert("weekly", week_start, "本周无活动记录", "", "")
+        except Exception as e:
+            logger.warning("每周总结(空)落库失败: %s", e)
         return {
             "week_range": f"{week_start} ~ {weekly_data.get('week_end', week_start)}",
             "headline": "本周无活动记录",
@@ -1243,8 +1303,182 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True, save_md: b
         result["md_path"] = _save_txt_plan(md_content, f"weekly_{week_start}.md")
         _archive_external(md_content, kind="weekly", date_str=week_start, filename=f"weekly_{week_start}.md")
 
+    # 6. 落库（可查可回溯）
+    try:
+        psum_upsert("weekly", week_start, result.get("headline", ""), md_content, json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("每周总结落库失败: %s", e)
+
     logger.info(f"每周蒸馏完成: {week_start}, 已保存{saved_count}条记忆")
     return result
+
+
+# ---------------------------------------------------------------------------
+# 月度 / 年度蒸馏
+# ---------------------------------------------------------------------------
+
+def _gather_monthly(month: str) -> dict:
+    """聚合当月日/周总结（层级 map-reduce，避免直接聚合原始对话导致 prompt 爆炸）"""
+    dailies = [s for s in psum_list("daily") if s["period_key"].startswith(month)]
+    weeklies = [s for s in psum_list("weekly") if s["period_key"][:7] == month]
+    daily_text = "\n\n".join(f"## 日 {s['period_key']}\n{s['content']}" for s in dailies)
+    weekly_text = "\n\n".join(f"## 周 {s['period_key']}\n{s['content']}" for s in weeklies)
+    return {
+        "month": month,
+        "daily_text": daily_text or "（当月无日总结）",
+        "weekly_text": weekly_text or "（当月无周总结）",
+        "daily_count": len(dailies),
+        "weekly_count": len(weeklies),
+    }
+
+
+def _gather_yearly(year: str) -> dict:
+    """聚合全年月度总结"""
+    monthlies = [s for s in psum_list("monthly") if s["period_key"].startswith(year)]
+    monthly_text = "\n\n".join(f"## 月 {s['period_key']}\n{s['content']}" for s in monthlies)
+    return {
+        "year": year,
+        "monthly_text": monthly_text or "（当年无月总结）",
+        "monthly_count": len(monthlies),
+    }
+
+
+async def distill_monthly(month: str = "", save_txt: bool = True, save_md: bool = True) -> dict:
+    """月度综合蒸馏（聚合当月日/周总结）"""
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    logger.info(f"开始月度总结: {month}")
+    data = _gather_monthly(month)
+
+    if data["daily_count"] == 0 and data["weekly_count"] == 0:
+        logger.info(f"月度总结跳过: {month} 无日/周总结可聚合")
+        try:
+            psum_upsert("monthly", month, f"{month} 无活动记录", "", "")
+        except Exception as e:
+            logger.warning("月度总结(空)落库失败: %s", e)
+        return {"month": month, "skipped": True, "reason": "无日/周总结可聚合"}
+
+    result = await _call_distill_llm(
+        _PROMPT_MONTHLY,
+        month=month,
+        daily_text=data["daily_text"],
+        weekly_text=data["weekly_text"],
+    )
+    md_content = _to_md_monthly(result, data)
+    result["md_content"] = md_content
+
+    try:
+        psum_upsert("monthly", month, result.get("headline", ""), md_content, json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("月度总结落库失败: %s", e)
+
+    if save_txt:
+        result["txt_path"] = _save_txt_plan(md_content, f"monthly_{month}.txt")
+    if save_md:
+        result["md_path"] = _save_txt_plan(md_content, f"monthly_{month}.md")
+
+    logger.info(f"月度总结完成: {month}")
+    return result
+
+
+async def distill_yearly(year: str = "", save_txt: bool = True, save_md: bool = True) -> dict:
+    """年度综合蒸馏（聚合全年月度总结）"""
+    if not year:
+        year = datetime.now().strftime("%Y")
+
+    logger.info(f"开始年度总结: {year}")
+    data = _gather_yearly(year)
+
+    if data["monthly_count"] == 0:
+        logger.info(f"年度总结跳过: {year} 无月度总结可聚合")
+        try:
+            psum_upsert("yearly", year, f"{year} 无活动记录", "", "")
+        except Exception as e:
+            logger.warning("年度总结(空)落库失败: %s", e)
+        return {"year": year, "skipped": True, "reason": "无月度总结可聚合"}
+
+    result = await _call_distill_llm(
+        _PROMPT_YEARLY,
+        year=year,
+        monthly_text=data["monthly_text"],
+    )
+    md_content = _to_md_yearly(result, data)
+    result["md_content"] = md_content
+
+    try:
+        psum_upsert("yearly", year, result.get("headline", ""), md_content, json.dumps(result, ensure_ascii=False))
+    except Exception as e:
+        logger.warning("年度总结落库失败: %s", e)
+
+    if save_txt:
+        result["txt_path"] = _save_txt_plan(md_content, f"yearly_{year}.txt")
+    if save_md:
+        result["md_path"] = _save_txt_plan(md_content, f"yearly_{year}.md")
+
+    logger.info(f"年度总结完成: {year}")
+    return result
+
+
+def _to_md_monthly(result: dict, data: dict) -> str:
+    month = data.get("month", "")
+    lines = [
+        f"# 月总结 — {month}",
+        "",
+        f"> {result.get('headline', '')}",
+        "",
+        f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        "",
+        "## 本月全貌",
+        result.get("monthly_summary", ""),
+        "",
+    ]
+    for key, title in [("major_events", "## 重要事项"),
+                        ("trends", "## 趋势变化"),
+                        ("achievements", "## 月度成就"),
+                        ("lessons", "## 经验教训"),
+                        ("next_month_plan", "## 下月规划")]:
+        items = result.get(key, [])
+        if items:
+            lines.append(title)
+            for it in items:
+                lines.append(f"- {it}")
+            lines.append("")
+    tags = result.get("tags", [])
+    if tags:
+        lines.append("## 标签")
+        lines.append(" ".join(f"`#{t}`" for t in tags))
+    return "\n".join(lines) + "\n"
+
+
+def _to_md_yearly(result: dict, data: dict) -> str:
+    year = data.get("year", "")
+    lines = [
+        f"# 年度总结 — {year}",
+        "",
+        f"> {result.get('headline', '')}",
+        "",
+        f"*生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+        "",
+        "## 年度全貌",
+        result.get("yearly_summary", ""),
+        "",
+    ]
+    for key, title in [("milestones", "## 年度里程碑"),
+                        ("growth", "## 成长与变化"),
+                        ("lessons", "## 经验教训"),
+                        ("next_year_plan", "## 来年方向")]:
+        items = result.get(key, [])
+        if items:
+            lines.append(title)
+            for it in items:
+                lines.append(f"- {it}")
+            lines.append("")
+    tags = result.get("tags", [])
+    if tags:
+        lines.append("## 标签")
+        lines.append(" ".join(f"`#{t}`" for t in tags))
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------

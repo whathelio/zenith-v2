@@ -1,0 +1,10 @@
+# 代码质量门禁（pre-commit）
+# 首次使用：pip install pre-commit && pre-commit install
+# 只跑 ruff lint（报告真正的错误），不自动 format，避免大规模格式化存量代码。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.0
+    hooks:
+      - id: ruff
+        name: ruff-lint
+        args: [--fix]

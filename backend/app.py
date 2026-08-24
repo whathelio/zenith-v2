@@ -8,35 +8,29 @@ import json
 import re
 import asyncio
 import sys
-import webbrowser
 import logging
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
-from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news, cache, summaries, academic
 from .database import conv_update_summary
-from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled, is_auto_distill_enabled
-from .tools import TOOLS_SCHEMA, execute_tool
-from .llm_client import chat_stream, plan_time, call_llm
-from .memory_engine import maybe_extract_memories, build_memory_injection, reset_counter, mem_consolidate, extract_memories_from_text
-from .confirm_flow import get_pending_proposals, confirm_proposal, reject_proposal, modify_proposal
+from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled
+from .llm_client import call_llm
+from .memory_engine import reset_counter, flush_conversation_memories
+from .confirm_flow import confirm_proposal, reject_proposal, modify_proposal
 from .confirm_flow import get_pending_proposals_merged, confirm_action, reject_action
 from .confirm_flow import TutorialFlow, list_active_tutorials
-from .context_compressor import maybe_compress
-from .schedule_reminder import check_reminders, get_due_reminders, get_upcoming_schedules, REMINDER_PRESETS
-from .timezone import now_tz
+from .schedule_reminder import get_due_reminders, get_upcoming_schedules, REMINDER_PRESETS
 from .recurrence import expand_recurring
 from .file_analyzer import analyze_file_stream
 from .unified_distill import distill_conversation, distill_schedules, distill_memories, distill_all, distill_daily, distill_weekly
-from . import knowledge_service
 from . import scheduler
 
 PROJECT_DIR = Path(__file__).parent.parent
@@ -57,6 +51,20 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # 优雅停止后台定时任务（避免残留 pending task）
+    try:
+        await scheduler.stop_all_background_tasks()
+        logging.getLogger("zenith.app").info("后台定时任务已停止")
+    except Exception as e:
+        logging.getLogger("zenith.app").warning("后台任务停止失败: %s", e)
+
+    # 关闭共享 httpx 客户端（连接复用）
+    try:
+        from .http_client import close_client
+        await close_client()
+    except Exception as e:
+        logging.getLogger("zenith.app").warning("httpx 客户端关闭失败: %s", e)
+
     # 关闭时清理 MCP stdio 子进程连接池，避免残留进程
     try:
         from .mcp_client import close_all
@@ -66,171 +74,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         import logging
         logging.getLogger("zenith.app").warning("MCP 连接池清理失败: %s", e)
-
-
-async def _reminder_loop():
-    """后台每5分钟扫描 remind_before 到期提醒，记录到 schedule_reminders 表"""
-    logger = logging.getLogger("zenith.schedule")
-    while True:
-        try:
-            # check_reminders 会调 get_due_reminders + _record_reminder 写表
-            text = check_reminders()
-            if text:
-                logger.info("日程提醒扫描发现到期项:\n%s", text)
-        except Exception as e:
-            logger.warning("日程提醒扫描失败: %s", e)
-        await asyncio.sleep(5 * 60)
-
-
-async def _memory_maintenance_loop():
-    """每6小时自动整理记忆：合并相似 + 衰减旧记忆"""
-    import asyncio
-    while True:
-        await asyncio.sleep(6 * 3600)
-        try:
-            result = mem_consolidate()
-            if result.get("merged") or result.get("decayed"):
-                import logging
-                logging.getLogger("zenith.memory").info(
-                    "记忆整理完成: 合并 %d 条, 衰减 %d 条",
-                    result["merged"], result["decayed"]
-                )
-        except Exception as e:
-            import logging
-            logging.getLogger("zenith.memory").warning("记忆整理失败: %s", e)
-
-
-async def _auto_distill_conv(conv_id: str):
-    """后台自动提取对话记忆（共用 _do_extract 内核，与 periodic 同路径）"""
-    import logging
-    logger = logging.getLogger("zenith.distill")
-    try:
-        msgs = db.msg_list(conv_id)
-        text = "\n".join(m.get("content", "") for m in msgs if m.get("role") in ("user", "assistant"))
-        if not text.strip():
-            return
-        result = await extract_memories_from_text(text, conv_id)
-        new_count = result.get("new", 0)
-        if new_count > 0:
-            logger.info("对话结束记忆提取: conv=%s, 新增%d条", conv_id, new_count)
-    except Exception as e:
-        logging.getLogger("zenith.distill").warning("对话结束记忆提取失败: %s", e)
-
-
-# ===== 完成日程 → 自动提炼经验记忆 =====
-_pending_schedule_tasks: set = set()
-
-_SCHEDULE_MEMORY_PROMPT = """你是一个经验提炼助手。根据以下日程信息，生成一条简洁的经验教训记忆。
-
-输出 JSON 格式（不要额外文字）：
-{"content": "一句话经验总结（含发生了什么+学到了什么）", "importance": 1-5, "keywords": "关键词1,关键词2"}
-
-要求：
-- 内容简练，10-30字为宜
-- importance 根据事件价值评估（已完成任务3, 交易经验4-5, 重大事项4-5）
-- keywords 提取2-4个关键词"""
-
-
-async def _auto_extract_schedule_memory(sid: int, schedule: dict):
-    """后台任务：日程标记完成 → 提炼经验记忆"""
-    logger = logging.getLogger("zenith.memory")
-    title = schedule.get("title", "")
-    desc = schedule.get("description", "")
-    text_parts = [f"标题: {title}"]
-    if desc:
-        text_parts.append(f"描述: {desc}")
-    text_parts.append(f"地点: {schedule.get('location', '无')}")
-    text_parts.append(f"分类: {schedule.get('category', 'other')}")
-
-    source_text = "\n".join(text_parts)
-    try:
-        messages = [
-            {"role": "system", "content": _SCHEDULE_MEMORY_PROMPT},
-            {"role": "user", "content": source_text},
-        ]
-        result = await call_llm(messages, temperature=0.3, max_tokens=500,
-                                response_format={"type": "json_object"})
-        raw = result.get("content", "")
-        m = re.search(r'\{[\s\S]*\}', raw)
-        parsed = json.loads(m.group()) if m else json.loads(raw)
-        content = parsed.get("content", "").strip()
-        if not content:
-            logger.debug("日程#%d 完成: LLM 未生成有效记忆", sid)
-            return
-        importance = int(parsed.get("importance", 3))
-        keywords = parsed.get("keywords", "")
-
-        db.mem_add(type_="experience", content=content, importance=importance,
-                   keywords=keywords, source_conv_id=f"schedule_{sid}")
-        logger.info("日程#%d「%s」完成 → 已提炼经验记忆: %s", sid, title, content[:50])
-    except Exception as e:
-        logger.debug("日程#%d 自动提炼记忆失败: %s", sid, e)
-
-
-async def _daily_distill_loop():
-    """每天 23:00 自动执行当日内容蒸馏"""
-    import logging
-    from datetime import timedelta
-    logger = logging.getLogger("zenith.distill")
-    while True:
-        now = datetime.now()
-        # 计算到下一个 23:00 的等待时间
-        target = now.replace(hour=23, minute=0, second=0, microsecond=0)
-        if now >= target:
-            # 已过今天23点，等到明天23点
-            target = target + timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        logger.info("每日蒸馏: 等待 %d 秒后执行（目标 %s）", int(wait_seconds), target.isoformat())
-        await asyncio.sleep(wait_seconds)
-        try:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            logger.info("每日蒸馏开始: %s", date_str)
-            result = await distill_daily(date=date_str, save_txt=True)
-            logger.info("每日蒸馏完成: %s, 对话%d 日程%d 笔记%d 记忆%d",
-                        date_str,
-                        result.get("conv_count", 0),
-                        result.get("schedule_count", 0),
-                        result.get("note_count", 0),
-                        result.get("memory_count", 0))
-        except Exception as e:
-            logger.warning("每日蒸馏失败: %s", e)
-
-
-async def _weekly_distill_loop():
-    """每周日 23:00 自动执行当周内容蒸馏"""
-    import logging
-    from datetime import timedelta
-    logger = logging.getLogger("zenith.distill")
-    while True:
-        now = datetime.now()
-        # 计算到下一个周日 23:00 的等待时间
-        days_until_sunday = (6 - now.weekday()) % 7  # 0=Monday, 6=Sunday
-        if days_until_sunday == 0 and now.hour < 23:
-            # 今天是周日但还没到23点
-            target = now.replace(hour=23, minute=0, second=0, microsecond=0)
-        else:
-            if days_until_sunday == 0:
-                days_until_sunday = 7  # 已过周日23点，等到下周日
-            target = (now + timedelta(days=days_until_sunday)).replace(
-                hour=23, minute=0, second=0, microsecond=0)
-        wait_seconds = (target - now).total_seconds()
-        logger.info("每周蒸馏: 等待 %d 秒后执行（目标 %s）", int(wait_seconds), target.isoformat())
-        await asyncio.sleep(wait_seconds)
-        try:
-            # 计算本周周一日期
-            today = datetime.now()
-            monday = today - __import__('datetime').timedelta(days=today.weekday())
-            week_start = monday.strftime("%Y-%m-%d")
-            logger.info("每周蒸馏开始: %s", week_start)
-            result = await distill_weekly(week_start=week_start, save_txt=True)
-            logger.info("每周蒸馏完成: %s, 对话%d 日程%d 笔记%d 记忆%d",
-                        week_start,
-                        result.get("conv_count", 0),
-                        result.get("schedule_count", 0),
-                        result.get("note_count", 0),
-                        result.get("memory_count", 0))
-        except Exception as e:
-            logger.warning("每周蒸馏失败: %s", e)
 
 
 app = FastAPI(
@@ -427,6 +270,7 @@ async def get_conversation(conv_id: str):
 
 @app.delete("/api/conversations/{conv_id}")
 async def delete_conversation(conv_id: str):
+    flush_conversation_memories(conv_id)  # 先消费未提取的残余对话文本，再删除
     db.conv_del(conv_id)
     reset_counter(conv_id)
     return {"success": True}
@@ -518,6 +362,71 @@ async def clear_conversation_bg(conv_id: str):
     return {"success": True}
 
 
+# ───────────────────────────────────────────────────────────
+# 全局背景图片（设置页「外观」常用设置）
+# 文件名固定为 global{ext}，存于 data/backgrounds/，路径记录在 config.background_image
+# ───────────────────────────────────────────────────────────
+GLOBAL_BG_KEY = "global"
+
+
+@app.post("/api/settings/background-image")
+async def upload_global_bg(file: UploadFile = File(...)):
+    """上传全局背景图片 — 保存到 data/backgrounds/global{ext}，并记录到配置"""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in BG_ALLOWED_EXT:
+        raise HTTPException(400, f"不支持的图片格式: {ext}，仅支持 png/jpg/jpeg/webp/gif")
+    BG_DIR.mkdir(parents=True, exist_ok=True)
+    # 清理旧的全局背景图（任意扩展名）
+    for old in BG_DIR.glob(f"{GLOBAL_BG_KEY}.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    target = BG_DIR / f"{GLOBAL_BG_KEY}{ext}"
+    content = await file.read()
+    if len(content) > 15 * 1024 * 1024:
+        raise HTTPException(400, "图片不能超过 15MB")
+    target.write_bytes(content)
+    cfg = load_config()
+    cfg["background_image"] = f"{GLOBAL_BG_KEY}{ext}"
+    save_config(cfg)
+    return {"success": True, "image": "/api/settings/background-image"}
+
+
+@app.get("/api/settings/background-image")
+async def get_global_bg():
+    """返回全局背景图片（二进制）"""
+    cfg = load_config()
+    img = cfg.get("background_image", "") or ""
+    if not img:
+        raise HTTPException(404, "未设置全局背景图片")
+    path = BG_DIR / img
+    if not path.exists():
+        raise HTTPException(404, "背景图片文件不存在")
+    media = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(str(path), media_type=media)
+
+
+@app.delete("/api/settings/background-image")
+async def clear_global_bg():
+    """清除全局背景图片"""
+    cfg = load_config()
+    img = cfg.get("background_image", "") or ""
+    if img:
+        path = BG_DIR / img
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    cfg["background_image"] = ""
+    save_config(cfg)
+    return {"success": True}
+
+
 @app.post("/api/conversations/{conv_id}/summarize")
 async def summarize_conversation(conv_id: str):
     """深度总结对话 — 蒸馏关键决策、经验与知识"""
@@ -571,7 +480,7 @@ async def summarize_conversation(conv_id: str):
     # 自动存储提炼的经验到记忆库（带去重）
     experiences = result.get("experiences", [])
     saved_memories = []
-    from .memory_engine import _is_duplicat, extract_memories_from_text
+    from .memory_engine import _is_duplicate
     for exp in experiences:
         content = exp.get("content", "").strip()
         if not content or _is_duplicate(content):
@@ -728,7 +637,6 @@ async def api_distill_list_files():
 async def api_distill_get_file(filename: str):
     """下载指定蒸馏 txt 文件"""
     from .unified_distill import _OUTPUT_DIR
-    import os
     from pathlib import Path as _P
     # 路径穿越防护：仅允许 _OUTPUT_DIR 内的 .txt 文件
     base = _P(_OUTPUT_DIR).resolve()
@@ -893,7 +801,7 @@ async def get_calendar_week(date: str = ""):
                 },
             })
     except Exception as e:
-        logger.warning("合并财经事件失败: %s", e)
+        logging.getLogger("zenith.calendar").warning("合并财经事件失败: %s", e)
     return {"monday": monday, "sunday": sunday, "events": expanded}
 
 
@@ -1126,7 +1034,6 @@ async def transform_item(data: dict = Body(default=None)):
         )
 
     # 2. LLM 生成目标数据
-    prompt_key = (source_type, target_type)
     system_prompt = _TRANSFORM_PROMPTS.get(source_type, {}).get(target_type, "")
     if not system_prompt:
         raise HTTPException(400, f"Transform {source_type}->{target_type} not supported")
@@ -1142,15 +1049,53 @@ async def transform_item(data: dict = Body(default=None)):
 
     raw = resp.get("content", "")
     try:
-        import re
         m = re.search(r'\{[\s\S]*\}', raw)
         result = json.loads(m.group()) if m else json.loads(raw)
     except Exception:
         raise HTTPException(500, "LLM transform parse failed")
 
-    # 3. 创建目标条目 (proposed 状态)
-    created_id = None
-    created_item = None
+    # 3. 创建目标条目（proposed 状态，用户确认后生效）
+    if target_type == "memory":
+        mtype = result.get("type", "fact")
+        if mtype not in ("personal_info", "preference", "event", "decision", "fact", "experience"):
+            mtype = "fact"
+        created_id = db.mem_add(
+            type_=mtype,
+            content=result.get("content", "").strip(),
+            importance=int(result.get("importance", 3) or 3),
+            keywords=result.get("keywords", ""),
+        )
+        if created_id < 0:
+            raise HTTPException(400, "生成的记忆内容被守卫拒绝（可能含敏感信息）")
+        created_item = db.mem_get(created_id)
+    elif target_type == "note":
+        created_id = db.note_add({
+            "title": result.get("title", "").strip() or "未命名笔记",
+            "content": result.get("content", ""),
+            "tags": result.get("tags", ""),
+            "status": "proposed",
+        })
+        created_item = db.note_get(created_id)
+    else:  # schedule
+        created_id = db.sch_add({
+            "title": result.get("title", "").strip() or "未命名日程",
+            "description": result.get("description", ""),
+            "start_time": result.get("start_time", ""),
+            "end_time": result.get("end_time", ""),
+            "location": result.get("location", ""),
+            "priority": result.get("priority", "normal"),
+            "category": result.get("category", "other"),
+            "status": "proposed",
+        })
+        created_item = db.sch_get(created_id)
+
+    return {
+        "success": True,
+        "source_type": source_type,
+        "target_type": target_type,
+        "id": created_id,
+        "item": created_item,
+    }
 
 # [C.5] Skills merged into memories — /api/skills endpoints removed
 
@@ -1278,7 +1223,6 @@ async def delete_analysis_document(doc_id: int):
 async def calendar_data(year: int = 0, month: int = 0):
     """返回指定月份的日历聚合数据：日程、笔记、对话、记忆、文件分析按日期分组"""
     from datetime import datetime, timedelta
-    import calendar as cal_module
 
     now = datetime.now()
     y = year or now.year
@@ -1396,28 +1340,14 @@ async def market_status():
 
 @app.get("/api/market/cftc")
 async def market_cftc():
-    """CFTC 持仓数据（JSON）"""
-    from .cftc_service import get_cftc_service
-    svc = get_cftc_service()
-    try:
-        await svc.fetch_incremental()
-        data = await svc.get_positioning_json()
-    except Exception as e:
-        return {"error": str(e), "data": []}
-    return {"data": data, "report_date": svc._report_date, "freshness": svc.check_freshness()}
+    """CFTC 持仓数据 — 模块已封存"""
+    return JSONResponse(status_code=410, content={"error": "市场分析模块已封存", "detail": "CFTC 服务已归档"})
 
 
 @app.get("/api/market/cftc/gold")
 async def market_cftc_gold():
-    """CFTC 黄金专项分析"""
-    from .cftc_service import get_cftc_service
-    svc = get_cftc_service()
-    try:
-        await svc.fetch_incremental()
-        data = await svc.gold_focus()
-    except Exception as e:
-        return {"error": str(e)}
-    return data
+    """CFTC 黄金专项分析 — 模块已封存"""
+    return JSONResponse(status_code=410, content={"error": "市场分析模块已封存", "detail": "CFTC 黄金分析已归档"})
 
 
 @app.get("/api/market/reports")
@@ -1531,6 +1461,9 @@ app.include_router(chat.router)
 app.include_router(audit.router)
 app.include_router(modules.router)
 app.include_router(news.router)
+app.include_router(cache.router)
+app.include_router(summaries.router)
+app.include_router(academic.router)
 
 
 @app.get("/{full_path:path}")

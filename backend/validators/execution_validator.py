@@ -2,7 +2,6 @@
 import re
 import ast
 import logging
-from datetime import datetime
 
 logger = logging.getLogger("zenith.validators")
 

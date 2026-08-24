@@ -13,6 +13,13 @@ from typing import Optional
 
 DB_PATH = Path(__file__).parent.parent / "data" / "zenith.db"
 _TESTING = os.environ.get("ZENITH_TESTING") == "1"
+if _TESTING:
+    # 测试隔离：重定向到临时文件，避免 init_db / 迁移 / 增删改污染生产库。
+    # 所有迁移函数均通过 str(DB_PATH) 直连，故必须在此处（模块加载时）替换路径。
+    import tempfile as _tempfile
+    _test_fd, _test_tmp_path = _tempfile.mkstemp(suffix=".db", prefix="zenith_v2_test_")
+    os.close(_test_fd)
+    DB_PATH = Path(_test_tmp_path)
 _test_conn = None
 
 
@@ -21,6 +28,8 @@ def _conn():
     c = sqlite3.connect(str(DB_PATH))
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA busy_timeout=5000")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA foreign_keys=ON")
     return c
 
@@ -53,7 +62,7 @@ def _migrate_memory_types():
             return
 
         old_sql = table_check[0]
-        if "'experience'" in old_sql:
+        if "'experience'" in old_sql and "'skill'" in old_sql:
             return  # 已迁移
 
         # executescript 会自动提交每条语句，不需要显式 BEGIN/COMMIT
@@ -61,7 +70,7 @@ def _migrate_memory_types():
         c.executescript("""
 CREATE TABLE IF NOT EXISTS memories_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT CHECK(type IN ('personal_info','preference','event','decision','fact','experience')),
+    type TEXT CHECK(type IN ('personal_info','preference','event','decision','fact','experience','skill')),
     content TEXT,
     importance INTEGER DEFAULT 3,
     keywords TEXT,
@@ -93,7 +102,7 @@ def _migrate_schedules():
             ("category", "TEXT DEFAULT 'other'"),
             ("impact", "TEXT DEFAULT ''"),
             ("country", "TEXT DEFAULT ''"),
-            ("remind_before", "INTEGER DEFAULT 0"),
+            ("remind_before", "INTEGER DEFAULT 30"),
             ("goal_id", "INTEGER DEFAULT NULL"),
             ("recurrence", "TEXT DEFAULT ''"),
             ("parent_id", "INTEGER DEFAULT NULL"),
@@ -145,6 +154,7 @@ def _migrate_memories():
             ("recorded_at", "TEXT"),
             ("distilled_from", "INTEGER DEFAULT NULL"),
             ("user_edited", "INTEGER DEFAULT 0"),
+            ("last_touched_at", "TEXT"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
@@ -180,7 +190,7 @@ def _migrate_conversations():
             c.execute("ALTER TABLE conversations ADD COLUMN source_id TEXT DEFAULT NULL")
         if "learning_progress" not in cols:
             c.execute("ALTER TABLE conversations ADD COLUMN learning_progress TEXT DEFAULT NULL")
-            c.commit()
+        c.commit()
     finally:
         c.close()
 
@@ -260,8 +270,51 @@ def _migrate_messages():
         if "thinking" not in cols:
             c.execute("ALTER TABLE messages ADD COLUMN thinking TEXT")
             c.commit()
+        if "archived" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN archived INTEGER DEFAULT 0")
+            c.commit()
     finally:
         c.close()
+
+
+def _migrate_cache_stats():
+    """迁移 cache_stats 表 — 新增 prompt_cache_hit_tokens 列（P2 缓存命中率埋点）。
+    旧库若已建无该列的表，补充列；新库由 CREATE TABLE IF NOT EXISTS 直接建全。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(cache_stats)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        if "prompt_cache_hit_tokens" not in cols:
+            c.execute("ALTER TABLE cache_stats ADD COLUMN prompt_cache_hit_tokens INTEGER DEFAULT 0")
+            c.commit()
+    finally:
+        c.close()
+
+
+def _migrate_academic_papers():
+    """迁移 academic_papers 表 — 补充 arxiv_id / pdf_url / code_links 字段。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(DB_PATH))
+    try:
+        info = c.execute("PRAGMA table_info(academic_papers)").fetchall()
+        if not info:
+            return
+        cols = {row[1] for row in info}
+        new_cols = [
+            ("arxiv_id", "TEXT DEFAULT ''"),
+            ("pdf_url", "TEXT DEFAULT ''"),
+            ("code_links", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in new_cols:
+            if col_name not in cols:
+                c.execute(f"ALTER TABLE academic_papers ADD COLUMN {col_name} {col_def}")
+        c.commit()
+    finally:
+        c.close()
+
 
 
 def init_db():
@@ -274,12 +327,20 @@ def init_db():
     _migrate_memories()
     _migrate_goals()
     _migrate_messages()
+    _migrate_cache_stats()
+    _migrate_academic_papers()
     with db() as c:
         c.executescript("""
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT DEFAULT 'New Chat',
     summary TEXT DEFAULT '',
+    persona_name TEXT DEFAULT NULL,
+    background TEXT DEFAULT NULL,
+    background_image TEXT DEFAULT NULL,
+    source_type TEXT DEFAULT NULL,
+    source_id TEXT DEFAULT NULL,
+    learning_progress TEXT DEFAULT NULL,
     created_at TEXT,
     updated_at TEXT
 );
@@ -290,19 +351,22 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT CHECK(role IN ('user','assistant','system')),
     content TEXT,
     thinking TEXT,
+    archived INTEGER DEFAULT 0,
     created_at TEXT,
     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT CHECK(type IN ('personal_info','preference','event','decision','fact','experience')),
+    type TEXT CHECK(type IN ('personal_info','preference','event','decision','fact','experience','skill')),
     content TEXT,
     importance INTEGER DEFAULT 3,
     keywords TEXT,
     source_conv_id TEXT,
     recorded_at TEXT,
     distilled_from INTEGER DEFAULT NULL,
+    user_edited INTEGER DEFAULT 0,
+    last_touched_at TEXT,
     created_at TEXT
 );
 
@@ -319,7 +383,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     category TEXT DEFAULT 'other' CHECK(category IN ('economic','market','reminder','personal','other')),
     impact TEXT DEFAULT '' CHECK(impact IN ('','bullish','bearish','neutral')),
     country TEXT DEFAULT '',
-    remind_before INTEGER DEFAULT 0,
+    remind_before INTEGER DEFAULT 30,
     goal_id INTEGER DEFAULT NULL,
     recurrence TEXT DEFAULT '',
     parent_id INTEGER DEFAULT NULL,
@@ -392,6 +456,18 @@ CREATE TABLE IF NOT EXISTS goals (
     created_at TEXT,
     updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cache_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT,
+    provider TEXT DEFAULT '',
+    model TEXT DEFAULT '',
+    kind TEXT DEFAULT 'chat' CHECK(kind IN ('chat','background','other')),
+    prompt_tokens INTEGER DEFAULT 0,
+    prompt_cache_hit_tokens INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cache_stats_time ON cache_stats(created_at);
 
 CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
 
@@ -481,6 +557,67 @@ CREATE TABLE IF NOT EXISTS conversation_traces (
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_traces_conv ON conversation_traces(conv_id, created_at);
+
+-- 周期总结表（日/周/月/年总结正文，可查可回溯）
+CREATE TABLE IF NOT EXISTS periodic_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_type TEXT NOT NULL CHECK(period_type IN ('daily','weekly','monthly','yearly')),
+    period_key TEXT NOT NULL,
+    headline TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    summary TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE(period_type, period_key)
+);
+CREATE INDEX IF NOT EXISTS idx_periodic_summaries ON periodic_summaries(period_type, period_key);
+
+-- 学术论文缓存表（Nature/Science/OpenAlex/Crossref 检索结果本地化）
+CREATE TABLE IF NOT EXISTS academic_papers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doi TEXT UNIQUE,
+    title TEXT NOT NULL,
+    authors TEXT DEFAULT '',
+    venue TEXT DEFAULT '',
+    year INTEGER DEFAULT 0,
+    date TEXT DEFAULT '',
+    citations INTEGER DEFAULT 0,
+    tier TEXT DEFAULT '',
+    rankings TEXT DEFAULT '',
+    abstract TEXT DEFAULT '',
+    url TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    region TEXT DEFAULT '',
+    venue_kind TEXT DEFAULT '',
+    arxiv_id TEXT DEFAULT '',
+    pdf_url TEXT DEFAULT '',
+    code_links TEXT DEFAULT '',
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_academic_venue ON academic_papers(venue);
+CREATE INDEX IF NOT EXISTS idx_academic_year ON academic_papers(year);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS academic_papers_fts USING fts5(
+    title, authors, venue, abstract,
+    content='academic_papers', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS academic_papers_ai AFTER INSERT ON academic_papers BEGIN
+    INSERT INTO academic_papers_fts(rowid, title, authors, venue, abstract)
+    VALUES (new.id, new.title, new.authors, new.venue, new.abstract);
+END;
+CREATE TRIGGER IF NOT EXISTS academic_papers_ad AFTER DELETE ON academic_papers BEGIN
+    INSERT INTO academic_papers_fts(academic_papers_fts, rowid, title, authors, venue, abstract)
+    VALUES ('delete', old.id, old.title, old.authors, old.venue, old.abstract);
+END;
+CREATE TRIGGER IF NOT EXISTS academic_papers_au AFTER UPDATE ON academic_papers BEGIN
+    INSERT INTO academic_papers_fts(academic_papers_fts, rowid, title, authors, venue, abstract)
+    VALUES ('delete', old.id, old.title, old.authors, old.venue, old.abstract);
+    INSERT INTO academic_papers_fts(rowid, title, authors, venue, abstract)
+    VALUES (new.id, new.title, new.authors, new.venue, new.abstract);
+END;
+INSERT INTO academic_papers_fts(academic_papers_fts) VALUES('rebuild');
+
 """)
 
 
@@ -624,7 +761,7 @@ def msg_add(cid: str, role: str, content: str, thinking: str = "") -> int:
 def msg_list(cid: str) -> list:
     with db() as c:
         rs = c.execute(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id", (cid,)
+            "SELECT * FROM messages WHERE conversation_id = ? AND archived = 0 ORDER BY id", (cid,)
         ).fetchall()
     return [dict(r) for r in rs]
 
@@ -632,7 +769,7 @@ def msg_list(cid: str) -> list:
 def msg_recent(cid: str, n: int = 10) -> list:
     with db() as c:
         rs = c.execute(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?", (cid, n)
+            "SELECT * FROM messages WHERE conversation_id = ? AND archived = 0 ORDER BY id DESC LIMIT ?", (cid, n)
         ).fetchall()
     return [dict(r) for r in reversed(rs)]
 
@@ -640,7 +777,7 @@ def msg_recent(cid: str, n: int = 10) -> list:
 def msg_count(cid: str) -> int:
     with db() as c:
         r = c.execute(
-            "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ? AND role != 'system'", (cid,)
+            "SELECT COUNT(*) as cnt FROM messages WHERE conversation_id = ? AND role != 'system' AND archived = 0", (cid,)
         ).fetchone()
     return r["cnt"] if r else 0
 
@@ -688,6 +825,22 @@ def msg_del_one(msg_id: int) -> int:
         cur = c.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
         if row:
             c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), row["conversation_id"]))
+        return cur.rowcount
+
+
+def msg_archive(cid: str, msg_ids: list[int]) -> int:
+    """归档消息（压缩后保留原文，避免破坏 regenerate/edit 语义）。返回归档数量。"""
+    ids = [int(i) for i in msg_ids if int(i) > 0]
+    if not ids:
+        return 0
+    with db() as c:
+        placeholders = ",".join("?" * len(ids))
+        cur = c.execute(
+            f"UPDATE messages SET archived = 1 WHERE conversation_id = ? AND id IN ({placeholders})",
+            [cid] + ids,
+        )
+        if cur.rowcount:
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), cid))
         return cur.rowcount
 
 
@@ -947,7 +1100,7 @@ def sch_add(data: dict) -> int:
                 data.get("category", "other"),
                 data.get("impact", ""),
                 data.get("country", ""),
-                data.get("remind_before", 0),
+                data.get("remind_before", 30),
                 data.get("goal_id", None),
                 data.get("recurrence", ""),
                 data.get("parent_id", None),
@@ -1009,6 +1162,59 @@ def sch_update(sid: int, data: dict):
 def sch_del(sid: int):
     with db() as c:
         c.execute("DELETE FROM schedules WHERE id = ?", (sid,))
+
+
+# ---------------------------------------------------------------------------
+# Periodic Summaries (日/周/月/年总结)
+# ---------------------------------------------------------------------------
+
+def psum_upsert(period_type: str, period_key: str, headline: str = "", content: str = "", summary: str = "") -> int:
+    """upsert 一条周期总结，返回其 id。"""
+    now = _now()
+    with db() as c:
+        c.execute(
+            """INSERT INTO periodic_summaries (period_type, period_key, headline, content, summary, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(period_type, period_key) DO UPDATE SET
+                 headline=excluded.headline, content=excluded.content,
+                 summary=excluded.summary, updated_at=excluded.updated_at""",
+            (period_type, period_key, headline, content, summary, now, now)
+        )
+        row = c.execute(
+            "SELECT id FROM periodic_summaries WHERE period_type=? AND period_key=?",
+            (period_type, period_key)
+        ).fetchone()
+        return row["id"]
+
+
+def psum_get(period_type: str, period_key: str) -> Optional[dict]:
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM periodic_summaries WHERE period_type=? AND period_key=?",
+            (period_type, period_key)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def psum_list(period_type: str = "") -> list:
+    q = "SELECT * FROM periodic_summaries"
+    ps = []
+    if period_type:
+        q += " WHERE period_type = ?"
+        ps.append(period_type)
+    q += " ORDER BY period_key DESC"
+    with db() as c:
+        rs = c.execute(q, ps).fetchall()
+    return [dict(r) for r in rs]
+
+
+def psum_delete(period_type: str, period_key: str) -> bool:
+    with db() as c:
+        cur = c.execute(
+            "DELETE FROM periodic_summaries WHERE period_type=? AND period_key=?",
+            (period_type, period_key)
+        )
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -1704,6 +1910,215 @@ def event_delete(eid: int):
     """删除缓存事件。"""
     with db() as c:
         c.execute("DELETE FROM schedule_events WHERE id = ?", (eid,))
+
+
+# ---------------------------------------------------------------------------
+# Cache stats（P2 缓存命中率埋点）
+# ---------------------------------------------------------------------------
+
+def cache_stat_add(provider: str = "", model: str = "", kind: str = "chat",
+                   prompt_tokens: int = 0, prompt_cache_hit_tokens: int = 0,
+                   completion_tokens: int = 0):
+    """记录一次 LLM 调用的 token / 前缀缓存命中数据。"""
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO cache_stats (created_at, provider, model, kind, prompt_tokens, "
+                "prompt_cache_hit_tokens, completion_tokens) VALUES (?,?,?,?,?,?,?)",
+                (_now(), provider[:64], model[:64], kind,
+                 int(prompt_tokens or 0), int(prompt_cache_hit_tokens or 0),
+                 int(completion_tokens or 0))
+            )
+    except Exception:
+        # 埋点失败不影响主流程
+        pass
+
+
+def cache_stats_summary(hours: int = 24) -> dict:
+    """聚合最近 N 小时的缓存命中统计。"""
+    import datetime as _dt
+    cutoff = (_dt.datetime.now(_dt.timezone.utc).astimezone() - _dt.timedelta(hours=hours)).isoformat()
+    with db() as c:
+        rows = c.execute(
+            "SELECT COUNT(*) AS calls, "
+            "COALESCE(SUM(prompt_tokens),0) AS prompt_tokens, "
+            "COALESCE(SUM(prompt_cache_hit_tokens),0) AS hit_tokens, "
+            "COALESCE(SUM(completion_tokens),0) AS completion_tokens "
+            "FROM cache_stats WHERE created_at >= ?", (cutoff,)
+        ).fetchone()
+        by_kind = c.execute(
+            "SELECT kind, COUNT(*) AS calls, COALESCE(SUM(prompt_cache_hit_tokens),0) AS hit, "
+            "COALESCE(SUM(prompt_tokens),0) AS prompt FROM cache_stats "
+            "WHERE created_at >= ? GROUP BY kind", (cutoff,)
+        ).fetchall()
+    total = dict(rows) if rows else {}
+    hit = total.get("hit_tokens", 0) or 0
+    prompt = total.get("prompt_tokens", 0) or 0
+    total["hit_rate"] = round(hit / prompt, 4) if prompt else 0.0
+    total["by_kind"] = [dict(r) for r in by_kind]
+    return total
+
+
+
+# ---------------------------------------------------------------------------
+# Academic papers cache（Nature/Science/OpenAlex/Crossref 本地缓存）
+# ---------------------------------------------------------------------------
+
+def academic_paper_upsert(paper: dict) -> int:
+    """按 DOI upsert 一篇论文；无 DOI 时退化为 title+year 去重。返回论文 ID。"""
+    doi = (paper.get("doi") or "").strip()
+    title = (paper.get("title") or "").strip()
+    if not title:
+        return 0
+    now = _now()
+    with db() as c:
+        existing = None
+        if doi:
+            existing = c.execute("SELECT id FROM academic_papers WHERE doi = ?", (doi,)).fetchone()
+        if existing is None:
+            existing = c.execute(
+                "SELECT id FROM academic_papers WHERE title = ? AND year = ? LIMIT 1",
+                (title, int(paper.get("year") or 0)),
+            ).fetchone()
+
+        if existing:
+            pid = existing["id"]
+            c.execute(
+                """UPDATE academic_papers SET
+                    title=?, authors=?, venue=?, year=?, date=?, citations=?, tier=?,
+                    rankings=?, abstract=?, url=?, source=?, region=?, venue_kind=?,
+                    arxiv_id=?, pdf_url=?, code_links=?, updated_at=?
+                WHERE id=?""",
+                (
+                    title,
+                    (paper.get("authors") or ""),
+                    (paper.get("venue") or ""),
+                    int(paper.get("year") or 0),
+                    (paper.get("date") or ""),
+                    int(paper.get("citations") or 0),
+                    (paper.get("tier") or ""),
+                    (paper.get("rankings") or ""),
+                    (paper.get("abstract") or ""),
+                    (paper.get("url") or ""),
+                    (paper.get("source") or ""),
+                    (paper.get("region") or ""),
+                    (paper.get("venue_kind") or ""),
+                    (paper.get("arxiv_id") or ""),
+                    (paper.get("pdf_url") or ""),
+                    json.dumps(paper.get("code_links") or [], ensure_ascii=False),
+                    now,
+                    pid,
+                ),
+            )
+            return pid
+
+        cur = c.execute(
+            """INSERT INTO academic_papers
+                (doi, title, authors, venue, year, date, citations, tier, rankings,
+                 abstract, url, source, region, venue_kind, arxiv_id, pdf_url, code_links,
+                 created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                doi or None,
+                title,
+                (paper.get("authors") or ""),
+                (paper.get("venue") or ""),
+                int(paper.get("year") or 0),
+                (paper.get("date") or ""),
+                int(paper.get("citations") or 0),
+                (paper.get("tier") or ""),
+                (paper.get("rankings") or ""),
+                (paper.get("abstract") or ""),
+                (paper.get("url") or ""),
+                (paper.get("source") or ""),
+                (paper.get("region") or ""),
+                (paper.get("venue_kind") or ""),
+                (paper.get("arxiv_id") or ""),
+                (paper.get("pdf_url") or ""),
+                json.dumps(paper.get("code_links") or [], ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        return cur.lastrowid
+
+
+def _paper_from_row(r) -> dict:
+    """把 SQLite 行转为 dict，并解析 code_links JSON。"""
+    d = dict(r)
+    try:
+        raw = d.get("code_links") or ""
+        d["code_links"] = json.loads(raw) if raw else []
+    except (json.JSONDecodeError, TypeError):
+        d["code_links"] = []
+    return d
+
+
+
+def academic_paper_get(paper_id: int) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM academic_papers WHERE id = ?", (paper_id,)).fetchone()
+    return _paper_from_row(r) if r else None
+
+
+def academic_paper_get_by_doi(doi: str) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM academic_papers WHERE doi = ?", (doi,)).fetchone()
+    return _paper_from_row(r) if r else None
+
+
+def academic_paper_search(query: str = "", venue: str = "", year_from: int = 0,
+                          year_to: int = 0, limit: int = 20, offset: int = 0) -> list:
+    """本地学术论文检索（优先 FTS，失败/为空时回退 LIKE）。"""
+    with db() as c:
+        if query and query.strip():
+            q = """
+                SELECT p.* FROM academic_papers p
+                JOIN academic_papers_fts f ON p.id = f.rowid
+                WHERE academic_papers_fts MATCH ?
+            """
+            ps = [query.strip()]
+        else:
+            q = "SELECT p.* FROM academic_papers p WHERE 1=1"
+            ps = []
+        if venue:
+            q += " AND p.venue = ?"
+            ps.append(venue)
+        if year_from:
+            q += " AND p.year >= ?"
+            ps.append(int(year_from))
+        if year_to:
+            q += " AND p.year <= ?"
+            ps.append(int(year_to))
+        q += " ORDER BY p.citations DESC, p.year DESC LIMIT ? OFFSET ?"
+        ps.extend([int(limit), int(offset)])
+        try:
+            rs = c.execute(q, ps).fetchall()
+        except Exception:
+            rs = []
+        if query and query.strip() and not rs:
+            # FTS 查询语法错误/中文分词无命中时回退 LIKE
+            like = f"%{query.strip()}%"
+            q2 = ("SELECT * FROM academic_papers WHERE title LIKE ? OR abstract LIKE ? "
+                  "OR authors LIKE ? OR venue LIKE ? ORDER BY citations DESC LIMIT ? OFFSET ?")
+            rs = c.execute(q2, (like, like, like, like, int(limit), int(offset))).fetchall()
+    return [dict(r) for r in rs]
+
+
+def academic_paper_stats() -> dict:
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) AS cnt FROM academic_papers").fetchone()["cnt"]
+        by_venue = c.execute(
+            "SELECT venue, COUNT(*) AS cnt FROM academic_papers GROUP BY venue ORDER BY cnt DESC LIMIT 20"
+        ).fetchall()
+        by_year = c.execute(
+            "SELECT year, COUNT(*) AS cnt FROM academic_papers GROUP BY year ORDER BY year DESC LIMIT 10"
+        ).fetchall()
+    return {
+        "total": total,
+        "by_venue": [dict(r) for r in by_venue],
+        "by_year": [dict(r) for r in by_year],
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1,14 +1,8 @@
 @echo off
 chcp 65001 >nul
-setlocal enabledelayedexpansion
+setlocal
 
-REM Zenith v2 启动脚本
-REM 用法: 双击启动（会显示启动结果窗口）；或在命令行传入参数，例如:
-REM   zenith.bat --no-browser
-REM   zenith.bat --reset-lock
-REM   zenith.bat --no-aux
-REM   zenith.bat --stop
-REM   zenith.bat --status
+REM Zenith v2 launcher (ASCII-only to avoid GBK/UTF-8 cmd parsing breakage)
 
 cd /d "%~dp0"
 set "PROJECT_DIR=%~dp0"
@@ -16,35 +10,60 @@ set "PYTHONW_EXE=%PROJECT_DIR%.venv\Scripts\pythonw.exe"
 set "PYTHON_EXE=%PROJECT_DIR%.venv\Scripts\python.exe"
 set "START_PY=%PROJECT_DIR%start.py"
 
-REM 优先使用 pythonw.exe（无控制台窗口），失败时回退到 python.exe
+REM prefer pythonw (no console); fallback to python.exe
 set "PY_EXE=%PYTHONW_EXE%"
-if not exist "%PY_EXE%" (
-    set "PY_EXE=%PYTHON_EXE%"
+if not exist "%PY_EXE%" set "PY_EXE=%PYTHON_EXE%"
+
+REM feedback window uses console python.exe; fallback to pythonw
+set "WAIT_EXE=%PYTHON_EXE%"
+if not exist "%WAIT_EXE%" set "WAIT_EXE=%PY_EXE%"
+
+REM pure control commands run in foreground
+echo %* | findstr /c:"--stop" >nul
+if not errorlevel 1 (
+    "%WAIT_EXE%" "%START_PY%" %*
+    goto :done
+)
+echo %* | findstr /c:"--status" >nul
+if not errorlevel 1 (
+    "%WAIT_EXE%" "%START_PY%" %*
+    goto :done
+)
+echo %* | findstr /c:"--wait" >nul
+if not errorlevel 1 (
+    "%WAIT_EXE%" "%START_PY%" %*
+    goto :done
+)
+echo %* | findstr /c:"--help" >nul
+if not errorlevel 1 (
+    "%WAIT_EXE%" "%START_PY%" %*
+    goto :done
 )
 
 if not exist "%PY_EXE%" (
-    echo [ERROR] 未找到 Python 解释器: %PY_EXE%
-    echo 请确认 .venv 已创建，或手动运行: python start.py
+    echo [ERROR] Python interpreter not found: %PY_EXE%
+    echo Please ensure .venv exists, or run: python start.py
     pause
     exit /b 1
 )
 
 if not exist "%START_PY%" (
-    echo [ERROR] 未找到启动脚本: %START_PY%
+    echo [ERROR] start.py not found: %START_PY%
     pause
     exit /b 1
 )
 
-REM 启动 Zenith；所有参数原样传递给 start.py
+REM launch Zenith; pass all args through to start.py
 start "" /D "%PROJECT_DIR%" "%PY_EXE%" "%START_PY%" %*
 
-REM 双击反馈：等待服务就绪并显示结果（有控制台的 python.exe 运行 --wait）
-REM 无论启动成功还是"已在运行"，这里都会给出明确提示，避免黑窗一闪
-"%PYTHON_EXE%" "%START_PY%" --wait --wait-timeout 25
+REM double-click feedback: wait for readiness and show result
+"%WAIT_EXE%" "%START_PY%" --wait --wait-timeout 25
 echo.
-echo 日志: %PROJECT_DIR%zenith.log
-echo 停止: 双击 stop.bat，或运行 start.py --stop
+echo Log: %PROJECT_DIR%zenith.log
+echo Stop: double-click stop.bat, or run start.py --stop
 echo.
+:done
+
 pause
 
 endlocal

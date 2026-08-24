@@ -1,5 +1,4 @@
 """Skill Loader — 仿 WorkBuddy 目录扫描 SKILL.md 文件加载技能"""
-import os
 import re
 import json
 import logging
@@ -179,7 +178,6 @@ def import_all_from_dir(skills_dir: str) -> dict:
     """扫描目录并批量导入所有 SKILL.md 到 memories 表"""
     scanned = scan_skills_dir(skills_dir)
     imported = []
-    skipped = []
     errors = []
 
     for skill in scanned:

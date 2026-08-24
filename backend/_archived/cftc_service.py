@@ -3,7 +3,6 @@
 CFTC Socrata API 当前返回 403，无法获取数据。本模块随市场分析功能一起封存。"""
 from __future__ import annotations
 
-import json
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -311,7 +310,6 @@ class CFTCService:
 
     async def fetch_incremental(self) -> dict:
         """增量拉取 CFTC 数据（优先从缓存获取，缺失部分从 API 拉取）"""
-        from .database import cftc_cache_get_latest, cftc_cache_add, macro_indicator_list_latest
 
         start_date = (datetime.now() - timedelta(days=self._cache_days)).strftime('%Y-%m-%d')
 

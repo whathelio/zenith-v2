@@ -1,9 +1,7 @@
 """Zenith v2 重复日程展开工具 — 轻量规则"""
 from __future__ import annotations
 
-import re
 from datetime import datetime, timedelta
-from typing import Optional
 from .timezone import DEFAULT_TIMEZONE
 
 

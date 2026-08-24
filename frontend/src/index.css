@@ -90,13 +90,20 @@
 
 html, body, #root {
   height: 100%;
-  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-family: var(--font-family);
   font-size: var(--font-size-base);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* 底色放 html/body；#root 透明，让全局背景图（GlobalBackground 写入 body 背景）透出 */
+html, body {
+  background: var(--color-bg-app);
+}
+#root {
+  background: transparent;
 }
 
 a {
@@ -154,7 +161,8 @@ code {
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  background: var(--color-bg-app);
+  /* 背景透明，让 body 的全局背景图透出 */
+  background: transparent;
 }
 
 .app-layout .topbar {

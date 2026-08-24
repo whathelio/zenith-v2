@@ -1,4 +1,4 @@
-﻿"""Zenith v2 — Main Entry Point
+"""Zenith v2 — Main Entry Point
 
 启动 FastAPI 后端并打开浏览器。提供单实例控制、进程清理、启动诊断。
 
@@ -29,6 +29,7 @@ import time
 import json
 import logging
 import argparse
+import asyncio
 import signal
 import webbrowser
 import threading
@@ -47,6 +48,9 @@ _BROWSER_TS_FILE = PROJECT_DIR / ".zenith.browser"
 _BROWSER_COOLDOWN_SECONDS = 5
 _HEALTH_TIMEOUT_SECONDS = 20
 
+# 辅助服务进程句柄（gateway / worker），供 watchdog 监控与重启
+_AUX_PROCS: dict[str, subprocess.Popen] = {}
+
 # 知识库中台与异步任务 worker（launcher 旧版直接拉起，此处统一托管，避免多入口不一致）
 _GATEWAY_PATH = PROJECT_DIR.parent / "api_gateway.py"
 _WORKER_PATH = PROJECT_DIR.parent / "task_worker.py"
@@ -56,6 +60,8 @@ _GATEWAY_PORT = 8788
 # 该 venv 的 site-packages 已装好依赖，仅 pyvenv.cfg 指针需指向本机解释器）
 _RAG_VENV_PYTHONW = PROJECT_DIR.parent / ".venv" / "Scripts" / "pythonw.exe"
 _RAG_VENV_PYTHON = PROJECT_DIR.parent / ".venv" / "Scripts" / "python.exe"
+_RAG_VENV_PYTHON_UNIX = PROJECT_DIR.parent / ".venv" / "bin" / "python"
+
 _RAG_EMBED_DIR = PROJECT_DIR.parent / "bge-small-model"
 # 注意：旧库 zenith_rag/chroma_db 的 HNSW 索引损坏（link_lists.bin 0 字节，2026-08-05 验证），
 # 已重建至 zenith_rag_new；旧目录因句柄占用暂保留（含 .bak 备份），勿改回。
@@ -119,7 +125,7 @@ def _process_exists(pid: int) -> bool:
         try:
             import ctypes
             kernel = ctypes.windll.kernel32
-            handle = kernel.OpenProcess(1, False, pid)  # PROCESS_TERMINATE=1，查询也够用
+            handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if handle:
                 kernel.CloseHandle(handle)
                 return True
@@ -150,6 +156,11 @@ def _acquire_instance_lock(port: int) -> Tuple[Optional[int], bool]:
                 import msvcrt
                 fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_RDWR)
                 try:
+                    # Windows 锁定基于文件字节区间，空文件可能导致锁定失败。
+                    # 先确保文件至少包含 1 字节，再回到文件头加锁。
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"\0")
+                    os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     return fd, True
                 except (IOError, OSError):
@@ -192,15 +203,15 @@ def _is_stale_lock(port: int) -> bool:
 
 
 def _cleanup_lock_and_pid():
-    """清理锁文件和 PID 文件。"""
+    """清理锁文件和 PID 文件。失败必须可见（否则僵尸锁会导致后续启动误判"已在运行"）。"""
     try:
         _LOCK_FILE.unlink(missing_ok=True)
     except Exception as e:
-        logger.debug("清理锁文件失败: %s", e)
+        logger.warning("清理锁文件失败: %s (%s)", e, _LOCK_FILE)
     try:
         _PID_FILE.unlink(missing_ok=True)
     except Exception as e:
-        logger.debug("清理 PID 文件失败: %s", e)
+        logger.warning("清理 PID 文件失败: %s (%s)", e, _PID_FILE)
 
 
 def _write_pid_file():
@@ -384,7 +395,11 @@ def _kill_process(pid: int) -> bool:
         return False
     if sys.platform == "win32":
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False, timeout=5)
+            result = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False, timeout=5)
+            if result.returncode == 0:
+                return True
+            time.sleep(0.5)
+            return not _process_exists(pid)
             return True
         except Exception as e:
             logger.debug("taskkill 失败 PID=%d: %s", pid, e)
@@ -447,6 +462,30 @@ def stop_existing_instance(port: int = DEFAULT_PORT) -> dict:
     return summary
 
 
+
+def _is_cmdline_running_unix(keyword: str) -> bool:
+    """Linux/macOS: 检查是否有进程命令行包含关键字。
+
+    用于避免 zenith.sh 已启动的 api_gateway/task_worker 被 start.py 再次拉起。
+    """
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", keyword],
+            capture_output=True, text=True, check=False, timeout=5,
+            errors="replace",
+        )
+        return any(line.strip().isdigit() for line in r.stdout.splitlines())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        try:
+            r = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True, text=True, check=False, timeout=5,
+                errors="replace",
+            )
+            return any(keyword in line.lower() for line in r.stdout.splitlines())
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+
 def _is_cmdline_running(keyword: str) -> bool:
     """检查是否有 python/pythonw 进程的命令行包含关键字（幂等判断）。
 
@@ -454,6 +493,8 @@ def _is_cmdline_running(keyword: str) -> bool:
     （含关键字）会被误匹配，导致永远判定为"已在运行"。
     """
     if sys.platform != "win32":
+        return _is_cmdline_running_unix(keyword)
+    if False:
         return False
     try:
         ps_cmd = (
@@ -488,6 +529,21 @@ def _read_env_key(name: str) -> Optional[str]:
         return None
     return None
 
+def _read_yaml_key(name: str) -> Optional[str]:
+    """从 config/config.yaml 读取单个标量键值，供辅助服务复用主服务 LLM 配置。"""
+    config_file = PROJECT_DIR / "config" / "config.yaml"
+    if not config_file.exists():
+        return None
+    try:
+        import yaml
+        with open(config_file, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        value = cfg.get(name)
+        return str(value).strip() if value is not None else None
+    except Exception:
+        return None
+
+
 
 def _build_aux_env() -> dict:
     """构造 api_gateway / task_worker 的运行环境：
@@ -496,11 +552,11 @@ def _build_aux_env() -> dict:
     env.setdefault("ZENITH_RAG_EMBED_MODEL", str(_RAG_EMBED_DIR))
     env.setdefault("ZENITH_RAG_WORK_DIR", str(_RAG_WORK_DIR))
     env.setdefault("ZENITH_API_KEY", _RAG_API_KEY)
-    llm_key = env.get("ZENITH_LLM_API_KEY") or _read_env_key("ZENITH_LLM_API_KEY")
+    llm_key = env.get("ZENITH_LLM_API_KEY") or _read_env_key("ZENITH_LLM_API_KEY") or _read_yaml_key("api_key")
     if llm_key:
         env.setdefault("LLM_API_KEY", llm_key)
-    env.setdefault("LLM_BASE_URL", "https://api.deepseek.com/v1")
-    env.setdefault("LLM_MODEL", "deepseek-v4-flash")
+    env.setdefault("LLM_BASE_URL", _read_yaml_key("api_base") or "https://api.deepseek.com/v1")
+    env.setdefault("LLM_MODEL", _read_yaml_key("model") or "deepseek-v4-flash")
     return env
 
 
@@ -522,33 +578,41 @@ def _wait_for_gateway_health(timeout: float = 15.0) -> bool:
     return False
 
 
+def _pick_aux_runner() -> str:
+    """选择辅助服务的 Python runner：优先根工作区 .venv（已装 RAG 依赖），否则用项目 .venv 或当前解释器。"""
+    pythonw = PROJECT_DIR / ".venv" / "Scripts" / "pythonw.exe"
+    if sys.platform == "win32" and _RAG_VENV_PYTHONW.exists():
+        return str(_RAG_VENV_PYTHONW)
+    if sys.platform == "win32" and pythonw.exists():
+        return str(pythonw)
+    if sys.platform != "win32" and _RAG_VENV_PYTHON_UNIX.exists():
+        return str(_RAG_VENV_PYTHON_UNIX)
+    return sys.executable
+
+
+def _launch_aux_proc(script_path: Path, extra_args: list[str] | None = None) -> subprocess.Popen:
+    """启动单个辅助服务子进程，返回 Popen 句柄（供 watchdog 接管）。"""
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    return subprocess.Popen(
+        [_pick_aux_runner(), str(script_path), *(extra_args or [])],
+        cwd=str(script_path.parent), creationflags=flags,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_build_aux_env(),
+    )
+
+
 def _spawn_aux_services():
     """幂等拉起知识库中台（api_gateway:8788）与异步任务 worker。
 
     脚本缺失 / 端口被占用 / 进程已存在时自动跳过，失败只记日志不影响主服务。
     由 start.py 统一托管，保证 bat / launcher / 命令行各入口行为一致。
     RAG 依赖（pypdfium2/chromadb/torch）在根工作区 .venv，优先用它作为 runner。
+    进程句柄存入 _AUX_PROCS 供 watchdog 监控与自动重启。
     """
-    pythonw = PROJECT_DIR / ".venv" / "Scripts" / "pythonw.exe"
-    if sys.platform == "win32" and _RAG_VENV_PYTHONW.exists():
-        runner = str(_RAG_VENV_PYTHONW)
-    elif sys.platform == "win32" and pythonw.exists():
-        runner = str(pythonw)
-    else:
-        runner = sys.executable
-    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    # 必须重定向子进程输出：否则子进程持有父进程 stdout/stderr 管道，
-    # 在 bash/cmd 场景会导致父命令无法结束
-    devnull = subprocess.DEVNULL
-
     if _GATEWAY_PATH.exists() and not _is_port_in_use(_GATEWAY_PORT) and not _is_cmdline_running("api_gateway.py"):
         try:
-            subprocess.Popen(
-                [runner, str(_GATEWAY_PATH)],
-                cwd=str(_GATEWAY_PATH.parent), creationflags=flags,
-                stdout=devnull, stderr=devnull, env=_build_aux_env(),
-            )
-            logger.info("已启动知识库中台: %s (端口 %d)", _GATEWAY_PATH.name, _GATEWAY_PORT)
+            _AUX_PROCS["gateway"] = _launch_aux_proc(_GATEWAY_PATH)
+            logger.info("已启动知识库中台: %s (端口 %d, PID=%d)",
+                        _GATEWAY_PATH.name, _GATEWAY_PORT, _AUX_PROCS["gateway"].pid)
             # 等待 8788 就绪（网关 health 路径为 /health，与主服务 /api/health 不同），
             # 把隐形崩溃变成显式日志
             if not _wait_for_gateway_health(timeout=15.0):
@@ -560,16 +624,61 @@ def _spawn_aux_services():
 
     if _WORKER_PATH.exists() and not _is_cmdline_running("task_worker.py"):
         try:
-            subprocess.Popen(
-                [runner, str(_WORKER_PATH), "--poll", "2.0"],
-                cwd=str(_WORKER_PATH.parent), creationflags=flags,
-                stdout=devnull, stderr=devnull, env=_build_aux_env(),
-            )
-            logger.info("已启动异步任务 worker: %s", _WORKER_PATH.name)
+            _AUX_PROCS["worker"] = _launch_aux_proc(_WORKER_PATH, ["--poll", "2.0"])
+            logger.info("已启动异步任务 worker: %s (PID=%d)",
+                        _WORKER_PATH.name, _AUX_PROCS["worker"].pid)
         except Exception as e:
             logger.warning("启动 task_worker 失败: %s", e)
     else:
         logger.debug("task_worker 跳过（脚本缺失/已运行）")
+
+
+def _aux_services_watchdog(stop_event: threading.Event):
+    """辅助服务 watchdog：定期检查 api_gateway / task_worker 存活，死了自动重启。
+
+    指数退避（2/4/8/... 秒，最多 30s），单服务崩溃 > 3 次后停止重启（防崩溃循环）。
+    主进程退出时通过 stop_event 通知 watchdog 线程结束。
+    """
+    restart_count = {"gateway": 0, "worker": 0}
+    specs = [
+        ("gateway", _GATEWAY_PATH, [], "知识库中台"),
+        ("worker", _WORKER_PATH, ["--poll", "2.0"], "任务 worker"),
+    ]
+    while not stop_event.is_set():
+        # 用 wait 代替 sleep，以便 stop_event.set() 后立即退出
+        if stop_event.wait(timeout=30):
+            break
+        for key, script, extra_args, label in specs:
+            proc = _AUX_PROCS.get(key)
+            if proc is None:
+                continue
+            rc = proc.poll()
+            if rc is None:
+                continue  # 仍在运行
+            # 进程已退出
+            if restart_count[key] >= 3:
+                logger.warning("%s 已崩溃 %d 次，停止自动重启（rc=%s）",
+                               label, restart_count[key], rc)
+                continue
+            restart_count[key] += 1
+            backoff = min(30, 2 ** restart_count[key])
+            logger.warning("%s 已退出 (rc=%s)，%ds 后自动重启（第 %d 次）",
+                           label, rc, backoff, restart_count[key])
+            if stop_event.wait(timeout=backoff):
+                break
+            try:
+                if not script.exists():
+                    logger.warning("%s 脚本不存在，跳过重启", label)
+                    continue
+                # 重新拉起（不依赖 _is_port_in_use，避免被刚退出的端口 TIME_WAIT 影响判断）
+                _AUX_PROCS[key] = _launch_aux_proc(script, extra_args)
+                logger.info("%s 已自动重启 (PID=%d)", label, _AUX_PROCS[key].pid)
+                # 重启成功后重置计数（让稳定后能容忍再次崩溃）
+                if rc == 0:
+                    restart_count[key] = 0
+            except Exception as e:
+                logger.warning("重启 %s 失败: %s", label, e)
+    logger.debug("辅助服务 watchdog 已退出")
 
 
 def _print_wait_result(port: int, timeout: float = 25.0):
@@ -710,12 +819,26 @@ def main():
     lock_fd, is_first_instance = _acquire_instance_lock(port)
 
     if not is_first_instance:
-        if _browser_recently_opened():
-            logger.info("Zenith 已在运行，浏览器冷却期内，跳过打开")
-        else:
-            logger.info("Zenith 已在运行，打开浏览器: %s", url)
-            _write_browser_ts()
-            webbrowser.open(url)
+        if _is_port_in_use(port):
+            # 端口确有监听 → 真在运行，打开浏览器
+            if _browser_recently_opened():
+                logger.info("Zenith 已在运行，浏览器冷却期内，跳过打开")
+            else:
+                logger.info("Zenith 已在运行，打开浏览器: %s", url)
+                _write_browser_ts()
+                webbrowser.open(url)
+            return
+        # 锁没拿到但端口空闲 → 疑似僵尸锁 / 僵死进程占用锁，必须显式告警而非静默"已在运行"
+        lock_exists = _LOCK_FILE.exists()
+        pid = _read_pid_file()
+        logger.error(
+            "Zenith 启动失败：未能获取单实例锁，但端口 %d 未被监听。"
+            "锁文件存在=%s，PID文件=%s（%s）。"
+            "可能存在残留的僵死 start.py 进程占用了锁文件，导致新实例无法启动。"
+            "请先运行 start.py --reset-lock 清理；如仍失败，请手动结束残留的 start.py / api_gateway.py / task_worker.py 进程后重试。",
+            port, lock_exists, pid,
+            ("存活" if pid and _process_exists(pid) else "无效/无"),
+        )
         return
 
     # 启动前再次确认端口（防止锁刚释放但旧进程仍在收尾）
@@ -745,10 +868,18 @@ def main():
     import uvicorn
 
     # 知识库中台与任务 worker 托管 — 独立线程，与是否打开浏览器无关
+    aux_stop_event = threading.Event()
     if not args.no_aux:
         def _aux_services_thread():
             if _wait_for_health(port, timeout=_HEALTH_TIMEOUT_SECONDS):
                 _spawn_aux_services()
+                # 启动 watchdog 监控辅助服务（崩溃自动重启）
+                threading.Thread(
+                    target=_aux_services_watchdog,
+                    args=(aux_stop_event,),
+                    daemon=True,
+                    name="aux-watchdog",
+                ).start()
             else:
                 logger.warning("健康检查超时，跳过知识库中台与任务 worker 启动")
         threading.Thread(target=_aux_services_thread, daemon=True).start()
@@ -784,6 +915,22 @@ def main():
         logger.exception("Uvicorn 启动失败: %s", e)
         raise
     finally:
+        # 通知 watchdog 退出
+        aux_stop_event.set()
+        # 优雅关闭：flush 各对话 buffer 中的残余文本（最后 1~2 轮），避免数据丢失。
+        # 在独立 event loop 中同步等待 LLM 提取完成（uvicorn 已退出但进程尚存）。
+        # 加 15s 总超时，避免 LLM 慢/卡住时无限期阻塞退出。
+        try:
+            from backend.memory_engine import flush_all_pending_memories
+            flush_loop = asyncio.new_event_loop()
+            try:
+                flush_loop.run_until_complete(
+                    asyncio.wait_for(flush_all_pending_memories(), timeout=15.0)
+                )
+            finally:
+                flush_loop.close()
+        except Exception as e:
+            logger.warning("flush pending memories 失败/超时: %s", e)
         _cleanup_lock_and_pid()
 
 
