@@ -67,6 +67,11 @@ python start.py 8766
 
 若未部署这些外部脚本，Zenith 主功能（对话/日程/笔记/目标）不受影响，仅 `/knowledge` 页面显示离线。
 
+> ⚠️ **部署要点（2026-08-25 排障沉淀）**：
+> - `zotero_parse_rag_core.py` 的 Chroma 向量库（HNSW）**必须放在纯 ASCII 路径**（如 `D:\dshs\zenith_rag_new`），否则 chromadb 1.5 Rust HNSW reader 在中文路径下加载失败（报 `Error loading hnsw index`）。
+> - embedding 模型默认回退本地 `bge-small-model/`，无需依赖 `ZENITH_RAG_EMBED_MODEL` 环境变量注入。
+> - 参考副本见 `tools/zotero_parse_rag_core.py`（与外部脚本同步，仓库内留档防止重建环境踩坑）。
+
 ### 6. 构建前端（可选）
 
 前端已预构建在 `frontend/dist/`，如需修改前端：
