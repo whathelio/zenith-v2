@@ -31,5 +31,6 @@ async def update_memory(mid: int, data: dict = Body(default=None)):
 
 @router.delete("/{mid}")
 async def delete_memory(mid: int):
-    db.mem_del(mid)
+    if not db.mem_del(mid):
+        raise HTTPException(status_code=404, detail=f"记忆 ID:{mid} 不存在")
     return {"success": True}

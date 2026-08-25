@@ -1054,9 +1054,11 @@ def mem_update(mid: int, content: str = "", type_: str = "", importance: int = 0
     return True
 
 
-def mem_del(mid: int):
+def mem_del(mid: int) -> bool:
+    """删除记忆。返回是否真的删除了（ID 不存在时返回 False，防幻觉 ID 静默成功）。"""
     with db() as c:
-        c.execute("DELETE FROM memories WHERE id = ?", (mid,))
+        cur = c.execute("DELETE FROM memories WHERE id = ?", (mid,))
+        return cur.rowcount > 0
 
 
 def mem_get(mid: int) -> dict | None:
@@ -1301,9 +1303,11 @@ def note_update(nid: int, data: dict):
         c.execute(f"UPDATE notes SET {', '.join(fs)} WHERE id = ?", ps)
 
 
-def note_del(nid: int):
+def note_del(nid: int) -> bool:
+    """删除笔记。返回是否真的删除了（ID 不存在时返回 False，防幻觉 ID 静默成功）。"""
     with db() as c:
-        c.execute("DELETE FROM notes WHERE id = ?", (nid,))
+        cur = c.execute("DELETE FROM notes WHERE id = ?", (nid,))
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

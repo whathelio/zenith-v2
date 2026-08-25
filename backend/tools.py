@@ -953,6 +953,15 @@ def _verify_tool_result(name: str, args: dict, result: dict) -> dict | None:
             from .memory_engine import _is_duplicate
             if content and _is_duplicate(content, threshold=0.8):
                 return {"level": "info", "message": "相似记忆已存在，跳过重复添加"}
+
+        elif name in ("delete_memory", "delete_note", "consolidate_memories"):
+            # 删除类：结果含 failed（ID 不存在）或 success:false 时产出 warning
+            if result.get("success") is False:
+                return {"level": "warning", "message": f"删除操作失败: {result.get('result', '')}"}
+            failed = result.get("failed") or []
+            if failed:
+                ids = ", ".join(str(f.get("id", "?")) for f in failed[:10])
+                return {"level": "warning", "message": f"{len(failed)} 个 ID 删除失败（可能不存在）: {ids}"}
     except Exception:
         pass
     return None
@@ -1111,6 +1120,9 @@ def _handle_search_memory(args: dict) -> dict:
     lines = ["🧠 相关记忆："]
     for m in items:
         lines.append(f"  [ID:{m['id']}][{m['type']}] {m['content']}")
+    # 机器可读 ID 清单（锚点，供 LLM 逐字核对，避免编造 ID；限前 50 条防截断）
+    ids = [str(m["id"]) for m in items[:50]]
+    lines.append("可用ID: " + ",".join(ids))
     return {"success": True, "result": "\n".join(lines)}
 
 
@@ -2546,6 +2558,12 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
 
     total_after = len(all_mems) - sum(len(g["delete_ids"]) for g in merged_groups) - len(final_outdated)
 
+    # 标记所有 ID 均已通过 existing_ids 校验（L3 锚点：调用方/前端可据此确认无幻觉 ID）
+    for g in merged_groups:
+        g["id_verified"] = True
+    for o in final_outdated:
+        o["id_verified"] = True
+
     return {
         "total": len(all_mems),
         "total_after": total_after,
@@ -2568,8 +2586,11 @@ async def apply_consolidate_plan(plan: dict) -> dict:
             continue
         for did in delete_ids:
             try:
-                mem_del(did)
-                deleted_ids.append(did)
+                if mem_del(did):
+                    deleted_ids.append(did)
+                else:
+                    # ID 不存在（幻觉 ID 或已被删）——显式计入失败，不再静默
+                    failed.append({"id": did, "reason": "ID 不存在"})
             except Exception as e:
                 failed.append({"id": did, "reason": str(e)})
 
@@ -2578,8 +2599,10 @@ async def apply_consolidate_plan(plan: dict) -> dict:
         if not oid:
             continue
         try:
-            mem_del(oid)
-            deleted_ids.append(oid)
+            if mem_del(oid):
+                deleted_ids.append(oid)
+            else:
+                failed.append({"id": oid, "reason": "ID 不存在"})
         except Exception as e:
             failed.append({"id": oid, "reason": str(e)})
 

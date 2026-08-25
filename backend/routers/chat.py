@@ -549,6 +549,15 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
         "不要声称你没有这些能力。修改类工具调用后前端会弹出确认卡片，用户点「执行」才会生效；read_document_chunk 是只读工具，直接返回段落内容。"
     )
 
+    # 受控执行协议 — 整理/删除类任务的步骤化约束（防幻觉 ID）
+    system_parts.append(
+        "## 整理/删除类任务规范\n"
+        "- 整理记忆、删除记忆/笔记前，**必须先用 search_memory / list_notes / read_note 拉取真实 ID**，只对工具返回中真实存在的 ID 操作。\n"
+        "- **禁止凭记忆或印象编造 ID**——任何删除/修改请求的 ID 必须能在同一轮工具返回中逐字找到。\n"
+        "- 删除前逐条核对 ID 与内容一致（ID 与正文对应无误）。\n"
+        "- 每一步完成并确认结果后再进入下一步，不要跳步。\n"
+    )
+
     # 代码执行沙箱说明 — 避免模型用 execute_code 去读宿主数据（沙箱隔离，看不到 zenith.db / 项目文件）
     system_parts.append(
         "## 代码执行沙箱说明\n"

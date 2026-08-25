@@ -37,7 +37,8 @@ async def update_note(nid: int, data: dict = Body(default=None)):
 
 @router.delete("/{nid}")
 async def delete_note(nid: int):
-    db.note_del(nid)
+    if not db.note_del(nid):
+        raise HTTPException(status_code=404, detail=f"笔记 ID:{nid} 不存在")
     return {"success": True}
 
 
