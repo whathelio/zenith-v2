@@ -89,3 +89,7 @@ frontend/_*.cjs
 
 # 本地归档目录（清理时移动的旧文件，不入库）
 _archive_cleanup_20260825/
+
+
+# 运行时外部归档（服务生成的归档输出，不入库）
+data/archive_external/
