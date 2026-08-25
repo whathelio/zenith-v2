@@ -33,6 +33,7 @@ import asyncio
 import signal
 import webbrowser
 import threading
+import faulthandler
 import socket
 import tempfile
 import subprocess
@@ -65,7 +66,13 @@ _RAG_VENV_PYTHON_UNIX = PROJECT_DIR.parent / ".venv" / "bin" / "python"
 _RAG_EMBED_DIR = PROJECT_DIR.parent / "bge-small-model"
 # 注意：旧库 zenith_rag/chroma_db 的 HNSW 索引损坏（link_lists.bin 0 字节，2026-08-05 验证），
 # 已重建至 zenith_rag_new；旧目录因句柄占用暂保留（含 .bak 备份），勿改回。
-_RAG_WORK_DIR = PROJECT_DIR.parent / "zenith_rag_new"
+# 注意：ChromaDB 1.5.x 的 Rust HNSW reader 在含中文的路径下会报
+# "Error loading hnsw index"（索引本身完好）。因此 Windows 上 RAG 工作目录
+# 必须落在纯 ASCII 路径（2026-08-25 实测复现）。
+_RAG_WORK_DIR = Path(os.environ.get(
+    "ZENITH_RAG_WORK_DIR",
+    r"D:\dshs\zenith_rag_new" if os.name == "nt" else str(PROJECT_DIR.parent / "zenith_rag_new"),
+))
 _RAG_API_KEY = "test-key"  # 与 backend/knowledge_service.py 默认一致
 
 DEFAULT_PORT = 8766
@@ -76,10 +83,27 @@ def _is_running_under_pythonw() -> bool:
     return Path(sys.executable).name.lower().startswith("pythonw")
 
 
+def _pick_log_file() -> Path:
+    """选择一个可写的日志文件。
+
+    zenith.log 可能被外部日志查看器以只读句柄占用（此时无法以 append 打开），
+    按 zenith.log → zenith-1.log → zenith-2.log 顺序回退，保证服务可启动。
+    """
+    candidates = [_LOG_FILE] + [PROJECT_DIR / f"zenith-{i}.log" for i in range(1, 6)]
+    for candidate in candidates:
+        try:
+            with open(candidate, "a", encoding="utf-8", errors="replace"):
+                pass
+            return candidate
+        except OSError:
+            continue
+    return _LOG_FILE
+
 def _setup_logging(verbose: bool = False):
     """配置日志。pythonw 下将 stdout/stderr 重定向到日志文件，避免崩溃无声。"""
     level = logging.DEBUG if verbose else logging.INFO
-    handlers: list[logging.Handler] = [logging.FileHandler(str(_LOG_FILE), encoding="utf-8", mode="a")]
+    log_file = _pick_log_file()
+    handlers: list[logging.Handler] = [logging.FileHandler(str(log_file), encoding="utf-8", mode="a")]
 
     # pythonw 没有控制台；普通 python 仍可在终端看到输出
     if not _is_running_under_pythonw():
@@ -87,7 +111,7 @@ def _setup_logging(verbose: bool = False):
     else:
         # 捕获 print 与未处理异常，写入同一日志文件
         try:
-            log_stream = open(str(_LOG_FILE), "a", encoding="utf-8", errors="replace")
+            log_stream = open(str(log_file), "a", encoding="utf-8", errors="replace")
             sys.stdout = log_stream
             sys.stderr = log_stream
         except Exception:
@@ -100,6 +124,9 @@ def _setup_logging(verbose: bool = False):
         handlers=handlers,
         force=True,
     )
+    if log_file != _LOG_FILE:
+        logging.getLogger("zenith.start").warning("zenith.log 被占用，本次日志回退写入 %s", log_file)
+
 
 
 def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -544,6 +571,28 @@ def _read_yaml_key(name: str) -> Optional[str]:
         return None
 
 
+def _read_provider_setting(name: str, provider_name: str = "deepseek") -> Optional[str]:
+    """从 config/config.yaml 的 providers 列表读取指定 provider 的字段。
+
+    顶层 `model`/`api_base` 是旧版兼容字段，可能是占位值（如 test-model）；
+    LLM 调用应以 providers 列表中的模型与 base_url 为准。
+    """
+    config_file = PROJECT_DIR / "config" / "config.yaml"
+    if not config_file.exists():
+        return None
+    try:
+        import yaml
+        with open(config_file, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        for provider in cfg.get("providers", []) or []:
+            if isinstance(provider, dict) and provider.get("name") == provider_name:
+                value = provider.get(name)
+                return str(value).strip() if value is not None else None
+    except Exception:
+        return None
+    return None
+
+
 
 def _build_aux_env() -> dict:
     """构造 api_gateway / task_worker 的运行环境：
@@ -555,8 +604,8 @@ def _build_aux_env() -> dict:
     llm_key = env.get("ZENITH_LLM_API_KEY") or _read_env_key("ZENITH_LLM_API_KEY") or _read_yaml_key("api_key")
     if llm_key:
         env.setdefault("LLM_API_KEY", llm_key)
-    env.setdefault("LLM_BASE_URL", _read_yaml_key("api_base") or "https://api.deepseek.com/v1")
-    env.setdefault("LLM_MODEL", _read_yaml_key("model") or "deepseek-v4-flash")
+    env.setdefault("LLM_BASE_URL", _read_provider_setting("api_base") or "https://api.deepseek.com/v1")
+    env.setdefault("LLM_MODEL", _read_provider_setting("model") or "deepseek-v4-flash")
     return env
 
 
@@ -679,6 +728,47 @@ def _aux_services_watchdog(stop_event: threading.Event):
             except Exception as e:
                 logger.warning("重启 %s 失败: %s", label, e)
     logger.debug("辅助服务 watchdog 已退出")
+
+_SELF_WATCHDOG_INTERVAL = 20
+_SELF_WATCHDOG_MAX_FAILS = 4
+
+
+def _self_health_watchdog(port: int):
+    """主服务自我健康守护：事件循环卡死/服务假死时，先 dump 全部线程栈，再强制退出。
+
+    退出后由外部 supervisor（zenith-watchdog.ps1）拉起；即使没有外部 supervisor，
+    至少留下了卡死现场的线程栈文件，便于定位 18:06 这类 50 分钟 CPU 空转问题。
+    """
+    import urllib.request
+    logger = logging.getLogger("zenith.selfwatch")
+    fails = 0
+    while True:
+        time.sleep(_SELF_WATCHDOG_INTERVAL)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=10) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if data.get("status") == "ok":
+                        fails = 0
+                        continue
+        except Exception:
+            pass
+        fails += 1
+        logger.warning("主服务健康检查失败（连续 %d 次，阈值 %d）", fails, _SELF_WATCHDOG_MAX_FAILS)
+        if fails >= _SELF_WATCHDOG_MAX_FAILS:
+            dump_path = PROJECT_DIR / "data" / f"watchdog_stack_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            try:
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(dump_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(f"[self-watchdog] {fails} 次连续健康检查失败，服务疑似假死，即将强制退出。\n")
+                    f.flush()
+                    faulthandler.dump_traceback(file=f, all_threads=True)
+                    f.flush()
+                logger.error("主服务假死，线程栈已写入 %s，即将退出", dump_path)
+            except Exception:
+                logger.exception("写 watchdog 线程栈失败")
+            os._exit(70)
+
 
 
 def _print_wait_result(port: int, timeout: float = 25.0):
@@ -883,6 +973,15 @@ def main():
             else:
                 logger.warning("健康检查超时，跳过知识库中台与任务 worker 启动")
         threading.Thread(target=_aux_services_thread, daemon=True).start()
+
+    # 主服务自我守护：事件循环卡死时 dump 线程栈并退出，交由外部 supervisor 拉起
+    threading.Thread(
+        target=_self_health_watchdog,
+        args=(port,),
+        daemon=True,
+        name="self-health-watchdog",
+    ).start()
+
 
     # 注册启动后健康检查线程，服务就绪后再打开浏览器，避免打开无效标签页
     def _health_open_browser():

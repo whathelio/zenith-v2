@@ -182,7 +182,7 @@ async def _process_conv(
         assistant_text = ""
         assistant_thinking = ""  # 收集思考过程（与 WorkBuddy 对齐持久化）
         tool_results = []
-        MAX_TOOL_ROUNDS = 6
+        MAX_TOOL_ROUNDS = 10
 
         for round_num in range(MAX_TOOL_ROUNDS):
             round_text = ""
@@ -242,7 +242,7 @@ async def _process_conv(
                 t_start = time.time()
                 try:
                     result = await execute_tool(tool_name, tool_args, conv_id=conv_id)
-                    success = not result.get("error")
+                    success = bool(result.get("success", True)) and not result.get("error")
                 except Exception as exc:
                     result = {"error": str(exc), "result": f"工具执行异常: {exc}"}
                     success = False
@@ -341,6 +341,25 @@ async def _process_conv(
                     "tool_call_id": tool_id,
                     "content": tool_content,
                 })
+
+        # ── 收尾保护：工具循环耗尽后强制生成正式回答（避免截断式回复）──
+        # 触发条件：循环因轮次上限退出（最后一轮仍有 tool_calls）。
+        # 此时再发一次不带工具的 LLM 调用，让模型基于已有工具结果给出完整答案。
+        if round_tool_calls:
+            logger.info("工具循环耗尽（round=%d）仍有 tool_call，追加收尾回答", round_num + 1)
+            try:
+                wrap_text = ""
+                async for chunk in chat_stream(messages, tools=None, provider_name=provider_name):
+                    if chunk["type"] == "text":
+                        wrap_text += chunk["content"]
+                    elif chunk["type"] == "thinking":
+                        assistant_thinking += chunk["content"]
+                if wrap_text.strip():
+                    # 用收尾回答替换各轮拼接的“过程旁白”，避免把截断文本当成最终回复
+                    assistant_text = wrap_text
+                    event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': assistant_text, 'conversation_id': conv_id}, ensure_ascii=False))
+            except Exception as e:
+                logger.warning("收尾回答生成失败: %s", e)
 
         if assistant_text:
             db.msg_add(conv_id, "assistant", assistant_text, thinking=assistant_thinking)
@@ -528,6 +547,14 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
         "- read_document_chunk(item_id, chunk_index): 逐段学习——读取已入库文档第 N 段文本（自动更新学习进度）\n"
         "当用户要求删除/修改笔记、编辑代码、修改对话背景设定、清理对话中的隐私消息、或逐段学习文档时，调用对应工具，"
         "不要声称你没有这些能力。修改类工具调用后前端会弹出确认卡片，用户点「执行」才会生效；read_document_chunk 是只读工具，直接返回段落内容。"
+    )
+
+    # 代码执行沙箱说明 — 避免模型用 execute_code 去读宿主数据（沙箱隔离，看不到 zenith.db / 项目文件）
+    system_parts.append(
+        "## 代码执行沙箱说明\n"
+        "- execute_code 运行在隔离沙箱中，**看不到宿主机文件系统**（zenith 的数据库、笔记、配置都不可见）。\n"
+        "- 需要读取笔记正文请用 read_note(note_id)；需要查询记忆用 search_memory(keyword)；需要读取已入库文档用 read_document_chunk。\n"
+        "- 禁止用 execute_code 试图翻找宿主数据库或文件——那是无效操作，只会浪费轮次。\n"
     )
 
     # 学术检索能力声明 — 告知 AI 具备论文检索与 DOI 题录查询工具

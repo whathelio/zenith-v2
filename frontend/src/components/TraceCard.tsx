@@ -93,7 +93,7 @@ function ToolBadge({ name }: { name: string }) {
 
 function CodeTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
   const [showArgs, setShowArgs] = useState(false)
-  const [showOutput, setShowOutput] = useState(true)
+  const [showOutput, setShowOutput] = useState(false)
   // 受控模式：forceExpand 覆盖局部状态（null 时不干预）
   const effArgs = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showArgs
   const effOutput = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showOutput
@@ -152,7 +152,7 @@ function CodeTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: bo
 /* ── 文件编辑卡片（预留，diff 视图）── */
 
 function FileEditTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(false)
   const effExpanded = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : expanded
   return (
     <div className="trace-card trace-file">

@@ -86,3 +86,6 @@ frontend/_*.cjs
 
 # 通用备份文件
 *.bak
+
+# 本地归档目录（清理时移动的旧文件，不入库）
+_archive_cleanup_20260825/

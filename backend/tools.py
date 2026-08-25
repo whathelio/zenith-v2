@@ -89,6 +89,20 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "read_note",
+            "description": "读取笔记完整正文。当需要查看某条笔记的具体内容（而非仅标题列表）时必须使用此工具，禁止用 execute_code 翻数据库。参数为笔记 ID（list_notes 返回的 [ID:x]）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "integer", "description": "笔记 ID（list_notes 返回的 [ID:x]）"}
+                },
+                "required": ["note_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "execute_code",
             "description": "在本地 Python 安全沙箱中执行代码并返回结果。用户要让跑代码时调用。",
             "parameters": {
@@ -828,6 +842,7 @@ _TOOL_HANDLERS = {
     "add_note":           lambda a: _handle_add_note(a),
     "list_schedule":      lambda a: _handle_list_schedule(a),
     "list_notes":         lambda a: _handle_list_notes(a),
+    "read_note":          lambda a: _handle_read_note(a),
     "execute_code":       lambda a: _handle_execute_code(a),
     "search_memory":      lambda a: _handle_search_memory(a),
     "complete_schedule":  lambda a: _handle_complete_schedule(a),
@@ -1040,6 +1055,28 @@ def _handle_list_notes(args: dict) -> dict:
     for n in items:
         lines.append(f"  [ID:{n['id']}] {n['title']}")
     return {"success": True, "result": "\n".join(lines)}
+
+
+def _handle_read_note(args: dict) -> dict:
+    """读取笔记完整正文（禁止模型用 execute_code 翻数据库）。"""
+    nid = args.get("note_id")
+    if nid is None:
+        return {"success": False, "result": "缺少 note_id 参数（list_notes 返回的 [ID:x]）"}
+    try:
+        nid = int(nid)
+    except (TypeError, ValueError):
+        return {"success": False, "result": f"note_id 必须是整数，收到: {nid!r}"}
+    note = note_get(nid)
+    if not note:
+        return {"success": False, "result": f"未找到笔记 ID={nid}"}
+    parts = [f"【{note.get('title', '未命名')}】(ID:{nid})"]
+    if note.get("tags"):
+        parts.append(f"标签: {note.get('tags')}")
+    if note.get("recorded_at"):
+        parts.append(f"记录时间: {note.get('recorded_at')}")
+    parts.append("")
+    parts.append(note.get("content", "") or "(无内容)")
+    return {"success": True, "result": "\n".join(parts), "note_id": nid, "title": note.get("title", "")}
 
 
 async def _handle_execute_code(args: dict) -> dict:
@@ -2402,7 +2439,7 @@ async def detect_consolidate_intent(user_message: str) -> dict:
 
 async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
     """生成记忆整理计划（真实 ID）。结合自动相似度 + LLM 建议。"""
-    from .memory_engine import _similarity, MERGE_SIM_THRESHOLD
+    from .memory_engine import find_similar_memory_groups
     from datetime import datetime, timedelta
     from .llm_client import call_llm
 
@@ -2420,36 +2457,18 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
         ]
 
     # 1. 自动相似度合并候选（>= 0.85 强相似）
-    # C4: 比对范围限前 500 条 — 全量 O(n²) 在记忆量大时耗时分钟级，先设上限止血
-    merge_groups = []
+    # O1+O2+O3 优化（2026-08-25）：相似度分组收敛到 memory_engine.find_similar_memory_groups，
+    # 3-gram 倒排候选召回（O(n·k) 非 O(n²)）、支持全量、无 500 上限；通过 to_thread
+    # 把 CPU 密集段移出事件循环，对话请求不阻塞。
+    from .memory_engine import find_similar_memory_groups
+    merge_groups = await asyncio.to_thread(find_similar_memory_groups, all_mems)
+
+    # 已被相似度合并命中的 ID（keep + delete），不再进入过时/重复候选
     seen_ids = set()
-    scan_mems = all_mems[:500]
-    for i, m in enumerate(scan_mems):
-        if m["id"] in seen_ids:
-            continue
-        group_delete = []
-        for j in range(i + 1, len(scan_mems)):
-            other = scan_mems[j]
-            if other["id"] in seen_ids:
-                continue
-            if other.get("type") != m.get("type"):
-                continue
-            sim = _similarity(m.get("content", ""), other.get("content", ""))
-            if sim >= MERGE_SIM_THRESHOLD:
-                group_delete.append(other)
-                seen_ids.add(other["id"])
-        if group_delete:
-            seen_ids.add(m["id"])
-            keeper = m
-            for o in group_delete:
-                if o.get("importance", 3) > keeper.get("importance", 3):
-                    keeper = o
-            merge_groups.append({
-                "keep_id": keeper["id"],
-                "delete_ids": [o["id"] for o in group_delete if o["id"] != keeper["id"]],
-                "reason": "强相似（内容相似度>=0.85），保留重要度更高/更早的",
-                "merged_content": keeper.get("content", ""),
-            })
+    for g in merge_groups:
+        if g.get("keep_id") is not None:
+            seen_ids.add(g["keep_id"])
+        seen_ids.update(g.get("delete_ids", []))
 
     # 2. 30天前创建且重要度=1 的过时候选
     cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -2675,7 +2694,17 @@ async def _handle_retrieve_docs(args: dict) -> dict:
     try:
         r = await knowledge_service.search(question, top_k)
         if "error" in r:
-            return {"success": False, "result": r["error"]}
+            raw = r.get("error")
+            detail = raw
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        detail = parsed.get("error") or parsed.get("message") or raw
+                except Exception:
+                    detail = raw
+            code = r.get("code") or "SEARCH_FAIL"
+            return {"success": False, "result": f"知识库检索失败（{code}）: {detail}", "code": code}
         return {"success": True, "result": r.get("answer", "")}
     except Exception as e:
         return {"success": False, "result": f"知识库检索失败: {e}"}

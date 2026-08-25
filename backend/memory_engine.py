@@ -318,8 +318,12 @@ def _shared_text_vectors(a: str, b: str, idf_weights: dict = None) -> tuple[np.n
     words_a = set(re.findall(r'[a-zA-Z0-9]+', a.lower()))
     words_b = set(re.findall(r'[a-zA-Z0-9]+', b.lower()))
 
-    vocab = set(idf_weights) if idf_weights else set()
-    vocab |= grams_a | grams_b | words_a | words_b
+    # 关键修复（2026-08-25）：vocab 只取两文本的特征并集。
+    # 旧实现 `vocab = set(idf_weights)` 把全量 IDF 词表（几万个 n-gram）塞进循环，
+    # 每次相似度比较 O(几万 × 文本长度)，consolidate_memories 的 500 条两两比较
+    # （12.5 万次）直接 CPU 空转数分钟 → 假死 → watchdog 强杀。
+    # 两文本向量维度一致只需「两文本 gram/word 并集」，IDF 权重对 vocab 内 gram 查表即可。
+    vocab = grams_a | grams_b | words_a | words_b
     vocab = sorted(vocab)
     if not vocab:
         return np.zeros(0), np.zeros(0)
@@ -436,6 +440,79 @@ def _similarity(a: str, b: str) -> float:
         return _semantic_similarity(a, b)
     except Exception:
         return _legacy_jaccard(a, b)
+
+
+def find_similar_memory_groups(mems: list[dict], threshold: float = None, id_key: str = "id", type_key: str = "type", content_key: str = "content") -> list[dict]:
+    """记忆相似度合并分组（供 consolidate 等写侧复用）。
+
+    用 3-gram 倒排索引做候选召回，替代 O(n²) 全量两两比较；只对「共享 3-gram」
+    的候选对算精确相似度。返回 [{keep_id, delete_ids, merged_content}]。
+
+    设计要点（2026-08-25 性能优化）：
+    - 3-gram 剪枝是安全的：_semantic_similarity 与 _legacy_jaccard 都以 n-gram 交集
+      为相似度非零的必要条件，两条文本无共享 3-gram 时相似度必为 0。
+    - 2-gram 太密集（中文常用字组合）剪枝无效，4-gram 对短文本有漏检风险，故取 3-gram。
+    - <3 字符短文本无 3-gram，单独全量比较兜底（数量极少）。
+    - 不设固定上限，支持全量；调用方如需限制可自行切片。
+    """
+    if threshold is None:
+        threshold = MERGE_SIM_THRESHOLD
+    if not mems:
+        return []
+
+    # 按 type 分组（跨 type 不比较），组内做 3-gram 倒排索引
+    by_type: dict = {}
+    for idx, m in enumerate(mems):
+        by_type.setdefault(m.get(type_key), []).append(idx)
+
+    merge_groups = []
+    seen_ids = set()
+    for tp, idxs in by_type.items():
+        if len(idxs) < 2:
+            continue
+        # <3 字符短文本兜底全量；其余走 3-gram 候选召回
+        short_idxs = {i for i in idxs if len(mems[i].get(content_key, "") or "") < 3}
+        gram_to_idxs: dict = {}
+        mem_grams: dict = {}
+        for idx in idxs:
+            grams = _ngrams(mems[idx].get(content_key, "") or "", 3)
+            mem_grams[idx] = grams
+            for g in grams:
+                gram_to_idxs.setdefault(g, []).append(idx)
+
+        for i in idxs:
+            if mems[i].get(id_key) in seen_ids:
+                continue
+            candidate_set = {j for j in idxs if j > i} if i in short_idxs else set()
+            if i not in short_idxs:
+                for g in mem_grams[i]:
+                    for j in gram_to_idxs.get(g, ()):
+                        if j > i:
+                            candidate_set.add(j)
+
+            group_delete = []
+            for j in sorted(candidate_set):
+                other = mems[j]
+                if other.get(id_key) in seen_ids:
+                    continue
+                sim = _similarity(mems[i].get(content_key, ""), other.get(content_key, ""))
+                if sim >= threshold:
+                    group_delete.append(other)
+                    seen_ids.add(other.get(id_key))
+
+            if group_delete:
+                seen_ids.add(mems[i].get(id_key))
+                keeper = mems[i]
+                for o in group_delete:
+                    if o.get("importance", 3) > keeper.get("importance", 3):
+                        keeper = o
+                merge_groups.append({
+                    "keep_id": keeper.get(id_key),
+                    "delete_ids": [o.get(id_key) for o in group_delete if o.get(id_key) != keeper.get(id_key)],
+                    "merged_content": keeper.get(content_key, ""),
+                })
+
+    return merge_groups
 
 
 # ---------------------------------------------------------------------------
