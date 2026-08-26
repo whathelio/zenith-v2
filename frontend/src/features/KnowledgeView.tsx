@@ -89,11 +89,11 @@ export default function KnowledgeView() {
       </div>
 
       <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {/* PDF 上传入库 */}
+        {/* 文件上传入库 */}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <label className="btn btn-sm" style={{ cursor: 'pointer' }}>
-            📄 上传 PDF 入库
-            <input type="file" accept="application/pdf" onChange={handleUpload} style={{ display: 'none' }} disabled={uploading} />
+            📄 上传 PDF / 文本 入库
+            <input type="file" accept="application/pdf,.md,.txt" onChange={handleUpload} style={{ display: 'none' }} disabled={uploading} />
           </label>
           {uploading && <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>入库中…</span>}
           {uploadResult && <span style={{ fontSize: 12 }}>{uploadResult}</span>}

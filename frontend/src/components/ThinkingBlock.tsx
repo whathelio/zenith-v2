@@ -15,8 +15,9 @@ interface ThinkingBlockProps {
 }
 
 export default function ThinkingBlock({ content, done = false, startTime }: ThinkingBlockProps) {
-  // 默认折叠策略：历史消息（done=true）默认收起，流式中（done=false）默认展开实时可见
-  const [collapsed, setCollapsed] = useState(done)
+  // 思考过程默认展开（历史消息也能直接查看），点击标题行可折叠。
+  // 注：曾改为 done 时默认折叠，但用户反馈"思考过程看不到了"——折叠后无提示，改为默认展开。
+  const [collapsed, setCollapsed] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const bodyRef = useRef<HTMLDivElement>(null)
 

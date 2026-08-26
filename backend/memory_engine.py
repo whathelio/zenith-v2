@@ -137,7 +137,25 @@ def build_memory_injection(current_query: str = "") -> str:
     if not groups and not notes:
         return ""
 
-    return "\n".join(lines)
+    # 预算控制（知识压缩：超限优先用周期摘要替代低层记忆，避免逐条原文撑爆上下文）
+    MAX_INJECT_CHARS = 1500  # 约 1000 tokens
+    text = "\n".join(lines)
+    if len(text) > MAX_INJECT_CHARS:
+        try:
+            from .database import psum_list
+            summary_lines = []
+            for s in psum_list()[:2]:
+                summ = (s.get("summary") or s.get("headline") or "")[:200]
+                if summ:
+                    summary_lines.append(f"- 【{s.get('period_type')}】{summ}")
+            if summary_lines:
+                text = ("## 记忆库（关于用户）\n（已压缩为周期摘要，细节可在对话中按需追问）\n"
+                        + "\n".join(summary_lines))
+            else:
+                text = text[:MAX_INJECT_CHARS] + "\n…（记忆注入超出预算，已截断）"
+        except Exception:
+            text = text[:MAX_INJECT_CHARS] + "\n…（记忆注入超出预算，已截断）"
+    return text
 
 
 def reset_counter(conv_id: str = ""):
@@ -229,6 +247,10 @@ async def _do_extract(text: str, conv_id: str):
     """后台执行记忆提取 + 去重。同时被 periodic 和 final 两种触发时机共用。"""
     try:
         from .llm_client import extract_memories
+        from .validators.noise_guard import strip_noise
+        # 入库前剥离平台元数据噪声（Conversation 头部/系统键值对/转发前缀），
+        # 防止 LLM 把系统噪声当事实提取进记忆。只做减法，不误伤正文内容。
+        text = strip_noise(text)
         # 提取前惰性刷新 IDF 权重，让去重的 TF-IDF 余弦真正用上 IDF 加权
         _maybe_refresh_idf()
         existing = _retrieve_related_memories(text)
@@ -723,3 +745,72 @@ def mem_consolidate():
         logger.info("记忆合并完成: 合并 %d 条, 衰减 %d 条", merged, decayed)
 
     return {"merged": merged, "decayed": decayed}
+
+
+async def reflect_memories(limit: int = 50) -> dict:
+    """按类型反思（借鉴 shiji-kb 反思机制）：审查事实类记忆，检测矛盾/过时/可提炼规则。
+
+    发现落 notes（stage='refined', source='reflection'），供用户确认后修订。
+    由 scheduler 周期触发或手动工具调用。
+    """
+    from .database import mem_list, note_add
+    from .unified_distill import _call_distill_llm
+
+    memories = []
+    for m in mem_list(limit=200):
+        if m.get("type") in ("fact", "experience", "decision"):
+            memories.append(m)
+        if len(memories) >= limit:
+            break
+    if len(memories) < 3:
+        return {"success": False, "reason": f"事实类记忆不足（{len(memories)} 条）"}
+
+    mem_text = "\n".join(f"[{i+1}] ({m['type']}) {m['content']}" for i, m in enumerate(memories))
+    prompt = (
+        "你是记忆质量审查员。审查以下用户记忆，检测三类问题并输出 JSON（不要代码块，直接输出 JSON）：\n"
+        "1. conflicts：相互矛盾的记忆对（内容直接冲突）\n"
+        "2. outdated：已过时/可能失效的事实\n"
+        "3. rules：可提炼为通用规则的经验（多条相似经验归纳为一条）\n\n"
+        "记忆列表：\n{memories}\n\n"
+        "输出格式：{\"conflicts\": [{\"a\": \"...\", \"b\": \"...\", \"reason\": \"...\"}], "
+        "\"outdated\": [{\"content\": \"...\", \"reason\": \"...\"}], "
+        "\"rules\": [{\"rule\": \"...\", \"based_on\": [\"...\"]}]}"
+    )
+    try:
+        result = await _call_distill_llm(prompt, memories=mem_text[:6000])
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    created = 0
+    for conflict in result.get("conflicts", []) or []:
+        note_add({
+            "title": "记忆矛盾（反思）",
+            "content": f"A: {conflict.get('a','')}\nB: {conflict.get('b','')}\n原因: {conflict.get('reason','')}",
+            "tags": "reflection",
+            "source": "reflection",
+            "stage": "refined",
+        })
+        created += 1
+    for outdated in result.get("outdated", []) or []:
+        note_add({
+            "title": "过时记忆（反思）",
+            "content": f"内容: {outdated.get('content','')}\n原因: {outdated.get('reason','')}",
+            "tags": "reflection",
+            "source": "reflection",
+            "stage": "refined",
+        })
+        created += 1
+    for rule in result.get("rules", []) or []:
+        note_add({
+            "title": "记忆规律（反思）",
+            "content": f"规则: {rule.get('rule','')}\n依据: {'；'.join(rule.get('based_on', []) or [])}",
+            "tags": "reflection",
+            "source": "reflection",
+            "stage": "refined",
+        })
+        created += 1
+
+    found = (len(result.get("conflicts", []) or [])
+             + len(result.get("outdated", []) or [])
+             + len(result.get("rules", []) or []))
+    return {"success": True, "reviewed": len(memories), "found": found, "created": created}

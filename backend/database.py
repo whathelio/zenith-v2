@@ -668,10 +668,10 @@ def conv_list_by_date(date_from: str = "", date_to: str = "") -> list:
     """
     ps = []
     if date_from:
-        q += " AND date(c.updated_at) >= date(?)"
+        q += " AND substr(c.updated_at, 1, 10) >= substr(?, 1, 10)"
         ps.append(date_from)
     if date_to:
-        q += " AND date(c.updated_at) <= date(?)"
+        q += " AND substr(c.updated_at, 1, 10) <= substr(?, 1, 10)"
         ps.append(date_to)
     q += " GROUP BY c.id ORDER BY c.updated_at DESC"
     with db() as c:
@@ -930,10 +930,10 @@ def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
     q = "SELECT * FROM memories WHERE 1=1"
     ps = []
     if date_from:
-        q += " AND date(created_at) >= date(?)"
+        q += " AND substr(created_at, 1, 10) >= substr(?, 1, 10)"
         ps.append(date_from)
     if date_to:
-        q += " AND date(created_at) <= date(?)"
+        q += " AND substr(created_at, 1, 10) <= substr(?, 1, 10)"
         ps.append(date_to)
     q += " ORDER BY importance DESC, created_at DESC"
     with db() as c:
@@ -1121,10 +1121,10 @@ def sch_list(status: str = "", date_from: str = "", date_to: str = "") -> list:
         q += " AND status = ?"
         ps.append(status)
     if date_from:
-        q += " AND date(start_time) >= date(?)"
+        q += " AND substr(start_time, 1, 10) >= substr(?, 1, 10)"
         ps.append(date_from)
     if date_to:
-        q += " AND date(start_time) <= date(?)"
+        q += " AND substr(start_time, 1, 10) <= substr(?, 1, 10)"
         ps.append(date_to)
     q += " ORDER BY start_time ASC"
     with db() as c:
@@ -1267,10 +1267,10 @@ def note_list_by_date(date_from: str = "", date_to: str = "") -> list:
     q = "SELECT * FROM notes WHERE status != 'cancelled'"
     ps = []
     if date_from:
-        q += " AND date(created_at) >= date(?)"
+        q += " AND substr(created_at, 1, 10) >= substr(?, 1, 10)"
         ps.append(date_from)
     if date_to:
-        q += " AND date(created_at) <= date(?)"
+        q += " AND substr(created_at, 1, 10) <= substr(?, 1, 10)"
         ps.append(date_to)
     q += " ORDER BY updated_at DESC"
     with db() as c:
@@ -1531,10 +1531,10 @@ def analysis_list_by_date(date_from: str = "", date_to: str = "") -> list:
         q = "SELECT id, filename, analysis_text, created_at FROM analysis_documents WHERE 1=1"
         ps = []
         if date_from:
-            q += " AND date(created_at) >= date(?)"
+            q += " AND substr(created_at, 1, 10) >= substr(?, 1, 10)"
             ps.append(date_from)
         if date_to:
-            q += " AND date(created_at) <= date(?)"
+            q += " AND substr(created_at, 1, 10) <= substr(?, 1, 10)"
             ps.append(date_to)
         q += " ORDER BY created_at DESC"
         rs = c.execute(q, ps).fetchall()

@@ -125,14 +125,20 @@ def import_skill_to_memory(name: str, frontmatter: dict, body: str,
     from . import database as db
 
     description = frontmatter.get("description", "")
+    category = frontmatter.get("category", "")   # 元技能/管线/参考 分层标签
+    layer = frontmatter.get("layer", "")         # 渐进载入层 L1/L2/L3
     mcp_required = frontmatter.get("mcp_required", [])
     if isinstance(mcp_required, list):
         mcp_str = ",".join(mcp_required)
     else:
         mcp_str = ""
 
-    # 构建 content: 技能名称 + 触发场景 + 步骤
+    # 构建 content: 技能名称 + 分类/层级 + 触发场景 + 步骤
     content_parts = [f"技能：{name}"]
+    if category:
+        content_parts.append(f"分类：{category}")
+    if layer:
+        content_parts.append(f"层级：{layer}")
     if description:
         content_parts.append(f"触发：{description[:200]}")
     content_parts.append(f"步骤：{json.dumps([body[:300]], ensure_ascii=False)}")
@@ -141,11 +147,13 @@ def import_skill_to_memory(name: str, frontmatter: dict, body: str,
     content = "\n".join(content_parts)
 
     keywords = name
+    if category:
+        keywords = f"{name},{category}"
     if description:
         # 提取关键词
         kw = re.findall(r'[\u4e00-\u9fff]{2,4}', description)[:5]
         if kw:
-            keywords = ",".join([name] + kw)
+            keywords = ",".join([keywords] + kw)
 
     # 检查是否已存在同名技能
     existing = db.mem_list(type_="skill")

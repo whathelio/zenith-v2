@@ -1188,6 +1188,11 @@ async def distill_daily(date: str = "", save_txt: bool = True, save_md: bool = T
     result["txt_content"] = txt_content
     result["md_content"] = md_content
     result["saved_count"] = saved_count
+    # 合并聚合统计字段（供 _handle_distill_daily 显示真实计数，修复"明细全 0"）
+    result["conv_count"] = daily_data.get("conv_count", 0)
+    result["schedule_count"] = daily_data.get("sch_count", 0)
+    result["note_count"] = daily_data.get("note_count", 0)
+    result["memory_count"] = daily_data.get("mem_count", 0)
 
     # 5. 保存文件
     if save_txt:
@@ -1294,6 +1299,10 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True, save_md: b
     result["txt_content"] = txt_content
     result["md_content"] = md_content
     result["saved_count"] = saved_count
+    result["conv_count"] = weekly_data.get("conv_count", 0)
+    result["schedule_count"] = weekly_data.get("sch_count", 0)
+    result["note_count"] = weekly_data.get("note_count", 0)
+    result["memory_count"] = weekly_data.get("mem_count", 0)
 
     # 5. 保存文件
     if save_txt:

@@ -63,15 +63,59 @@ async def extract_schedule_memory(sid: int, schedule: dict):
 
 # ===== 后台循环 =====
 
+# ── 后台任务健康追踪（停滞检测 + 显式告警）──
+# 借鉴 edict「停滞→重试→升级」思路：把后台任务的静默失败转为可观测 + 可告警。
+# 仅做观测，不改变任何 loop 的 sleep 节奏或 try/except 结构（最小安全改动）。
+_task_health: dict = {}          # name -> {"fail_count": int, "alerted": bool}
+_TASK_FAIL_ALERT_THRESHOLD = 3   # 连续失败 N 次后触发告警
+
+_scheduler_logger = logging.getLogger("zenith.scheduler")
+
+
+def _record_task_result(name: str, ok: bool) -> None:
+    """记录后台任务成功/失败。连续失败达阈值时：升级 error 日志 + 写一条待确认告警笔记。
+
+    告警笔记 status=proposed，走 confirm_flow 提案流在前端「待确认」列表可见；
+    任务恢复（成功一次）后清除计数与已告警标记。
+    """
+    h = _task_health.setdefault(name, {"fail_count": 0, "alerted": False})
+    if ok:
+        h["fail_count"] = 0
+        h["alerted"] = False
+        return
+    h["fail_count"] += 1
+    n = h["fail_count"]
+    if n < _TASK_FAIL_ALERT_THRESHOLD:
+        _scheduler_logger.warning("后台任务失败: %s（第 %d 次）", name, n)
+        return
+    if h["alerted"]:
+        return
+    h["alerted"] = True
+    _scheduler_logger.error("后台任务连续失败 %d 次: %s（需人工关注）", n, name)
+    try:
+        db.note_add({
+            "title": f"后台任务告警: {name}",
+            "content": f"后台任务「{name}」已连续失败 {n} 次，请检查 zenith.log 定位根因。",
+            "tags": "系统告警,后台任务",
+            "source": "scheduler",
+            "status": "proposed",
+        })
+        _scheduler_logger.info("后台任务告警已写入待确认列表: %s", name)
+    except Exception as e:
+        _scheduler_logger.warning("告警笔记写入失败: %s", e)
+
+
 async def _reminder_loop():
     """每5分钟扫描 remind_before 到期提醒"""
     logger = logging.getLogger("zenith.schedule")
     while True:
         try:
             text = check_reminders()
+            _record_task_result("reminder", True)
             if text:
                 logger.info("日程提醒扫描发现到期项:\n%s", text)
         except Exception as e:
+            _record_task_result("reminder", False)
             logger.warning("日程提醒扫描失败: %s", e)
         await asyncio.sleep(5 * 60)
 
@@ -83,10 +127,12 @@ async def _memory_maintenance_loop():
         await asyncio.sleep(6 * 3600)
         try:
             result = mem_consolidate()
+            _record_task_result("memory_maintenance", True)
             if result.get("merged") or result.get("decayed"):
                 logger.info("记忆整理完成: 合并 %d 条, 衰减 %d 条",
                             result["merged"], result["decayed"])
         except Exception as e:
+            _record_task_result("memory_maintenance", False)
             logger.warning("记忆整理失败: %s", e)
 
 
@@ -105,8 +151,10 @@ async def _daily_distill_loop():
             date_str = datetime.now().strftime("%Y-%m-%d")
             logger.info("每日蒸馏开始: %s", date_str)
             await distill_daily(date=date_str, save_txt=True)
+            _record_task_result("daily_distill", True)
             logger.info("每日蒸馏完成: %s", date_str)
         except Exception as e:
+            _record_task_result("daily_distill", False)
             logger.warning("每日蒸馏失败: %s", e)
 
 
@@ -127,8 +175,10 @@ async def _weekly_distill_loop():
             # 旧代码传 datetime.now()（周日当天）会把 week_start 误当周一，聚合出「周日~下周六」的错误范围。
             logger.info("每周蒸馏开始")
             await distill_weekly(save_txt=True)
+            _record_task_result("weekly_distill", True)
             logger.info("每周蒸馏完成")
         except Exception as e:
+            _record_task_result("weekly_distill", False)
             logger.warning("每周蒸馏失败: %s", e)
 
 
@@ -147,8 +197,10 @@ async def _monthly_distill_loop():
         last_month = (nxt - timedelta(days=1)).strftime("%Y-%m")
         try:
             await distill_monthly(month=last_month, save_txt=True)
+            _record_task_result("monthly_distill", True)
             logger.info("月度总结完成: %s", last_month)
         except Exception as e:
+            _record_task_result("monthly_distill", False)
             logger.warning("月度总结失败: %s", e)
 
 
@@ -164,8 +216,10 @@ async def _yearly_distill_loop():
         last_year = str(nxt.year - 1)
         try:
             await distill_yearly(year=last_year, save_txt=True)
+            _record_task_result("yearly_distill", True)
             logger.info("年度总结完成: %s", last_year)
         except Exception as e:
+            _record_task_result("yearly_distill", False)
             logger.warning("年度总结失败: %s", e)
 
 
@@ -190,8 +244,10 @@ async def _calendar_sync_loop():
         try:
             logger.info("财经日历启动即同步: days=%d min_star=%d", days, min_star)
             result = await cs.sync_calendar_events(days=days, min_star=min_star)
+            _record_task_result("calendar_sync", True)
             logger.info("财经日历启动同步完成: %s", result)
         except Exception as e:
+            _record_task_result("calendar_sync", False)
             logger.warning("财经日历启动同步失败: %s", e)
 
     while True:
@@ -205,8 +261,10 @@ async def _calendar_sync_loop():
         try:
             logger.info("财经日历同步开始: days=%d min_star=%d", days, min_star)
             result = await cs.sync_calendar_events(days=days, min_star=min_star)
+            _record_task_result("calendar_sync", True)
             logger.info("财经日历同步完成: %s", result)
         except Exception as e:
+            _record_task_result("calendar_sync", False)
             logger.warning("财经日历同步失败: %s", e)
 
 

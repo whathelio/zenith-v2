@@ -5,6 +5,7 @@ import re
 import json
 import asyncio
 import logging
+import contextvars
 from .database import sch_add, sch_list, sch_update, note_add, note_list, note_get, mem_search, mem_add, mem_del, mem_get, mem_list, MEMORY_TYPES, msg_list, conv_update_learning_progress
 from . import knowledge_service
 from .config import is_code_execution_enabled
@@ -163,6 +164,21 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "list_conversations",
+            "description": "列出最近的对话（含 ID、标题、消息数、更新时间）。当需要获取对话 ID 以进行 distill_conversation、或用户问「最近聊了什么/有哪些对话」时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "返回最近 N 条对话，默认 20"},
+                    "date": {"type": "string", "description": "按日期过滤（YYYY-MM-DD），只返回该天更新的对话，可选"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rename_conversation",
             "description": "重命名当前对话标题。生成待确认请求，用户确认后才会真正修改（改标题是元数据操作，不影响对话排序）。",
             "parameters": {
@@ -221,6 +237,20 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "complete_schedule",
             "description": "将日程标记为已完成。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "number", "description": "日程 ID"}
+                },
+                "required": ["id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_schedule",
+            "description": "删除日程（物理删除，不可恢复）。用户明确要求删除/取消日程时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -666,6 +696,34 @@ TOOLS_SCHEMA = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "shiji_wiki_lookup",
+            "description": "查《史记》知识库 wiki 页面（文件级查找，零向量索引）。适用：用户问某个历史人物/事件/概念的百科页，如『项羽的wiki页』『垓下之围』。参数 title 为页面标题关键词，支持模糊匹配。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "页面标题或关键词，如『项羽』『垓下之围』"},
+                    "max_chars": {"type": "integer", "description": "返回内容最大字符数，默认 800"}
+                },
+                "required": ["title"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reflect_memories",
+            "description": "按类型反思记忆：审查事实/经验/决定类记忆，检测矛盾对、过时事实、可提炼的通用规则，结果落为反思笔记。借鉴 shiji-kb 反思驱动质量闭环。触发词：反思记忆、记忆矛盾、记忆审查、记忆质量。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "审查记忆条数，默认 50"}
+                }
+            }
+        }
+    },
     # ── MCP 工具调用（B 级集成：让 Skill 步骤能真实调 MCP） ──
     {
         "type": "function",
@@ -834,8 +892,9 @@ TOOLS_SCHEMA = [
 
 
 # ── 工具处理器注册表 ──
-# 当前执行对话 ID（由 execute_tool 设置，供 update_background 等工具使用）
-_current_conv_id: str = ""
+# 当前执行对话 ID（上下文变量：每个异步任务独立，多对话并发不串号）
+# 由 execute_tool 在当前 task 上下文里 set，供 update_background 等工具读取
+_current_conv_id: 'contextvars.ContextVar[str]' = contextvars.ContextVar("current_conv_id", default="")
 
 _TOOL_HANDLERS = {
     "add_schedule":       lambda a: _handle_add_schedule(a),
@@ -846,6 +905,7 @@ _TOOL_HANDLERS = {
     "execute_code":       lambda a: _handle_execute_code(a),
     "search_memory":      lambda a: _handle_search_memory(a),
     "complete_schedule":  lambda a: _handle_complete_schedule(a),
+    "delete_schedule":    lambda a: _handle_delete_schedule(a),
     "time_plan":           lambda a: _handle_time_plan(),
     "create_plan_schedule": lambda a: _handle_create_plan_schedule(a),
     "web_fetch":          lambda a: _handle_web_fetch(a),
@@ -872,6 +932,8 @@ _TOOL_HANDLERS = {
     "retrieve_docs":       lambda a: _handle_retrieve_docs(a),
     "query_wiki":          lambda a: _handle_query_wiki(a),
     "kb_stats":            lambda a: _handle_kb_stats(a),
+    "shiji_wiki_lookup":   lambda a: _handle_shiji_wiki_lookup(a),
+    "reflect_memories":    lambda a: _handle_reflect_memories(a),
     "call_mcp":            lambda a: _handle_call_mcp(a),
     "delete_note":         lambda a: _handle_delete_note(a),
     "merge_notes":         lambda a: _handle_merge_notes(a),
@@ -883,6 +945,7 @@ _TOOL_HANDLERS = {
     "delete_message":      lambda a: _handle_delete_message(a),
     "read_document_chunk": lambda a: _handle_read_document_chunk(a),
     "rename_conversation": lambda a: _handle_rename_conversation(a),
+    "list_conversations": lambda a: _handle_list_conversations(a),
     "create_snapshot":     lambda a: _handle_create_snapshot(a),
     "rollback_code":       lambda a: _handle_rollback_code(a),
     "list_snapshots":      lambda a: _handle_list_snapshots(a),
@@ -899,9 +962,8 @@ async def execute_tool(name: str, args: dict, conv_id: str = "") -> dict:
     执行后自动附加 _verification 字段用于前端警告显示。
     conv_id: 当前对话 ID，供需要对话上下文的工具使用（如 update_background）。
     """
-    global _current_conv_id
     if conv_id:
-        _current_conv_id = conv_id
+        _current_conv_id.set(conv_id)
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         return {"success": False, "result": f"未知工具: {name}"}
@@ -1129,6 +1191,24 @@ def _handle_search_memory(args: dict) -> dict:
 def _handle_complete_schedule(args: dict) -> dict:
     sch_update(args["id"], {"status": "done"})
     return {"success": True, "result": f"日程 (ID:{args['id']}) 已标记完成。"}
+
+
+def _handle_delete_schedule(args: dict) -> dict:
+    """删除日程（物理删除）。删前校验 ID 存在，防幻觉 ID 静默成功。"""
+    sid = args.get("id")
+    if sid is None:
+        return {"success": False, "result": "缺少日程 id 参数"}
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return {"success": False, "result": f"日程 id 必须是整数，收到: {sid!r}"}
+    from .database import sch_list, sch_del
+    # 存在性校验
+    existing = sch_list()
+    if not any(s.get("id") == sid for s in existing):
+        return {"success": False, "result": f"日程 ID:{sid} 不存在（可能已被删或 ID 有误）"}
+    sch_del(sid)
+    return {"success": True, "result": f"日程 (ID:{sid}) 已删除。"}
 
 
 async def _handle_time_plan() -> dict:
@@ -1601,6 +1681,35 @@ is_thought=true 且 isn_plan=false 时，若需要保存整理后的笔记则输
 
 不需要的字段填 null，不要填空对象。
 只输出JSON，不要��任何解释文字。"""
+
+
+def _rule_preclassify(text: str) -> dict:
+    """柳叶刀式规则前置预判：规则兜确定性、LLM 兜模糊。
+
+    在 smart_classify 调 LLM 前运行，把强信号注入 prompt 作为参考（不改分发逻辑，
+    只降低明显信号的误判率）。借鉴 shiji-kb「LLM+规则混合」原则。
+    """
+    hints = []
+
+    # 1. 时间/日程强信号 → is_plan
+    if re.search(r'(明天|后天|今天|今晚|明早|明晚|下周|周[一二三四五六日天]|星期[一二三四五六日天])'
+                 r'|(\d{1,2}[点:：]\d{0,2})|(上午|下午|晚上|中午|凌晨)'
+                 r'|(提醒|开会|会议|聚餐|出发|截止|deadline|约会|见一面)', text):
+        hints.append("时间/日程强信号 → 倾向 is_plan=true")
+
+    # 2. 步骤化/方法论强信号 → is_skill
+    if re.search(r'(步骤|流程|方法论|首先|然后|其次|最后|怎么[做办]|如何[做操作]|先.+再.+最后|sop)', text):
+        hints.append("步骤化方法论表述 → 倾向 is_skill=true")
+
+    # 3. 个人偏好/决定强信号 → is_memory
+    if re.search(r'(我喜欢|我习惯|我决定|我选择|我[不没]|我住在|我来自|我的[姓名地址生日]|我[是]一个)', text):
+        hints.append("个人偏好/决定表述 → 倾向 is_memory=true")
+
+    # 4. 观点/思考强信号 → is_thought
+    if re.search(r'(我觉得|我认为|我想|感觉|看法|观点|思考|复盘|总结一下)', text):
+        hints.append("观点/思考表述 → 倾向 is_thought=true")
+
+    return {"hints": hints}
 
 
 def _extract_json(text: str) -> dict:
@@ -2091,6 +2200,12 @@ async def _handle_smart_classify(args: dict) -> dict:
     # 注入当前时间到 prompt（用 str.replace 避免 JSON 花括号冲突）
     current_dt = now_tz().strftime("%Y-%m-%d %H:%M:%S %A")
     prompt = SMART_CLASSIFY_PROMPT.replace("{current_datetime}", current_dt)
+
+    # 规则前置预判（柳叶刀：规则兜确定性）—— 作为参考注入，不改变分发逻辑
+    pre = _rule_preclassify(text)
+    if pre["hints"]:
+        prompt += "\n\n【规则预判参考（你仍需独立判断，可覆盖）】\n" + "\n".join("- " + h for h in pre["hints"])
+
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": text},
@@ -2931,7 +3046,7 @@ def _handle_update_background(args: dict) -> dict:
     需要对话 ID：从当前执行上下文获取（tools.py 全局 _current_conv_id）。
     """
     new_bg = (args.get("new_background") or "").strip()
-    conv_id = _current_conv_id
+    conv_id = _current_conv_id.get()
     if not conv_id:
         return {"success": False, "result": "无法获取当前对话 ID，无法更新背景"}
     if not new_bg:
@@ -2953,12 +3068,50 @@ def _handle_update_background(args: dict) -> dict:
     }
 
 
+def _handle_list_conversations(args: dict) -> dict:
+    """列出最近的对话（含 ID/标题/消息数/更新时间），供 LLM 拿 conv_id 做蒸馏或规划。"""
+    from .database import conv_list, conv_list_by_date
+
+    limit = args.get("limit") or 20
+    try:
+        limit = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit = 20
+
+    date = (args.get("date") or "").strip()
+    if date:
+        convs = conv_list_by_date(date_from=f"{date}T00:00:00", date_to=f"{date}T23:59:59")
+    else:
+        convs = conv_list()
+    convs = convs[:limit]
+
+    if not convs:
+        return {"success": True, "result": "暂无对话。"}
+
+    lines = [f"📋 对话列表（最近 {len(convs)} 条）："]
+    for c in convs:
+        title = c.get("title") or "未命名"
+        cid = c.get("id") or ""
+        msg_count = c.get("msg_count") or 0
+        updated = (c.get("updated_at") or "")[:16]
+        lines.append(f"  [ID:{cid}] {title[:40]}（{msg_count}条 | 更新 {updated}）")
+    return {
+        "success": True,
+        "result": "\n".join(lines),
+        "conversations": [
+            {"id": c.get("id"), "title": c.get("title"), "msg_count": c.get("msg_count"),
+             "updated_at": c.get("updated_at")}
+            for c in convs
+        ],
+    }
+
+
 def _handle_rename_conversation(args: dict) -> dict:
     """重命名当前对话标题 — 生成待确认动作，用户确认后才真正改名。
     改标题是元数据操作（conv_update_title 不改 updated_at），不影响对话排序。
     """
     new_title = (args.get("new_title") or "").strip()
-    conv_id = _current_conv_id
+    conv_id = _current_conv_id.get()
     if not conv_id:
         return {"success": False, "result": "无法获取当前对话 ID，无法重命名"}
     if not new_title:
@@ -3057,7 +3210,7 @@ def _handle_delete_message(args: dict) -> dict:
     只匹配当前对话的用户消息，单条删除（不影响前后消息）。
     """
     fragment = (args.get("content_fragment") or "").strip()
-    conv_id = _current_conv_id
+    conv_id = _current_conv_id.get()
     if not conv_id:
         return {"success": False, "result": "无法获取当前对话 ID，无法删除消息"}
     if len(fragment) < 8:
@@ -3100,7 +3253,7 @@ async def _handle_read_document_chunk(args: dict) -> dict:
     """
     item_id = args.get("item_id")
     chunk_index = args.get("chunk_index")
-    conv_id = _current_conv_id
+    conv_id = _current_conv_id.get()
     if not item_id:
         return {"success": False, "result": "item_id 不能为空"}
     try:
@@ -3179,6 +3332,70 @@ async def _handle_kb_stats(args: dict) -> dict:
         return {"success": True, "result": f"知识库状态: {h.get('status', '未知')}。详细统计请运行 zotero_parse_rag_core.py --stats"}
     except Exception as e:
         return {"success": False, "result": f"知识库离线: {e}"}
+
+
+def _handle_shiji_wiki_lookup(args: dict) -> dict:
+    """查《史记》wiki 页面（文件级查找，零向量索引）。
+
+    页面在 shiji-kb/wiki/public/pages/*.md，文件名即标题。
+    """
+    from pathlib import Path
+    title = (args.get("title") or "").strip()
+    if not title:
+        return {"success": False, "result": "title 不能为空"}
+    try:
+        max_chars = int(args.get("max_chars") or 800)
+    except (TypeError, ValueError):
+        max_chars = 800
+    max_chars = max(200, min(max_chars, 3000))
+
+    pages_dir = Path(r"D:\下载文件\新建文件夹\shiji-kb\wiki\public\pages")
+    if not pages_dir.exists():
+        return {"success": False, "result": "《史记》wiki 目录不存在"}
+
+    # 1. 精确标题匹配
+    exact = pages_dir / f"{title}.md"
+    candidates = [exact] if exact.exists() else []
+    # 2. 模糊 glob（文件名含关键词）
+    if not candidates:
+        try:
+            candidates = list(pages_dir.glob(f"*{title}*.md"))[:5]
+        except Exception:
+            candidates = []
+
+    if not candidates:
+        return {"success": False, "result": f"未找到《史记》wiki 页面: {title}（可尝试更短的关键词）"}
+
+    results = []
+    for p in candidates[:3]:
+        try:
+            content = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        results.append({"title": p.stem, "content": content[:max_chars], "size": len(content)})
+
+    if not results:
+        return {"success": False, "result": f"读取失败: {title}"}
+
+    if len(results) == 1:
+        r = results[0]
+        return {"success": True, "result": f"【{r['title']}】（共 {r['size']} 字）\n{r['content']}"}
+    titles = "\n".join(f"- {r['title']}（{r['size']}字）" for r in results)
+    return {"success": True, "result": f"找到 {len(results)} 个相关页面，请用更精确的标题：\n{titles}"}
+
+
+async def _handle_reflect_memories(args: dict) -> dict:
+    """按类型反思记忆：检测矛盾/过时/可提炼规则（借鉴 shiji-kb 反思机制）。"""
+    from .memory_engine import reflect_memories
+    try:
+        limit = min(max(int(args.get("limit") or 50), 10), 200)
+    except (TypeError, ValueError):
+        limit = 50
+    r = await reflect_memories(limit=limit)
+    if not r.get("success"):
+        return {"success": False, "result": r.get("reason") or r.get("error") or "反思失败"}
+    return {"success": True, "result":
+            f"记忆反思完成：审查 {r['reviewed']} 条，发现 {r['found']} 项（已生成 {r['created']} 条反思笔记，见笔记库）"}
 
 
 async def _handle_academic_search(args: dict) -> dict:

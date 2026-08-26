@@ -39,8 +39,8 @@ async def knowledge_ingest(file: UploadFile = File(...)):
         raise HTTPException(400, "missing filename")
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
-        raise HTTPException(400, "pdf too large")
-    result = await knowledge_service.ingest_pdf(file.filename, content)
+        raise HTTPException(400, "文件过大（>20MB）")
+    result = await knowledge_service.ingest_file(file.filename, content)
     if result.get("code") in ("GATEWAY_DOWN", "GATEWAY_TIMEOUT", "INGEST_ERROR"):
         raise HTTPException(503, result.get("error", "kb service down"))
     if result.get("error"):

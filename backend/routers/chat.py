@@ -152,6 +152,11 @@ def _build_skill_injection(current_query: str) -> str:
             reverse=True)
         if not hit_skills:
             return ""
+        # 三级渐进载入（借鉴 shiji-kb 渐进载入模型）：
+        # L1（元技能/方法论）：始终注入完整（本身已精简）
+        # L2（管线/步骤技能）：默认注入名称+触发+摘要，查询含「详细/步骤/如何」才展开完整
+        want_detail = any(tok in current_query.lower() for tok in
+                          ("详细", "步骤", "怎么做", "如何", "具体", "展开", "流程", "操作"))
         parts = [
             "【已启用技能 · 必须遵循】",
             "以下技能与本次请求相关。若用户请求适用其中某个技能，你必须严格按其定义的「触发」与「步骤」执行，"
@@ -162,7 +167,22 @@ def _build_skill_injection(current_query: str) -> str:
             if not c:
                 continue
             name = c[3:].split("\n")[0].strip() if c.startswith("技能：") else "(未命名)"
-            parts.append(f"\n### 技能：{name}\n{c}")
+            # 解析层级标签（skill_loader 写入的「层级：L1/L2/L3」行）
+            layer = "L1"
+            for line in c.splitlines():
+                if line.startswith("层级："):
+                    layer = line[3:].strip().upper()
+                    break
+            if layer.startswith("L2") and not want_detail:
+                trigger = ""
+                for line in c.splitlines():
+                    if line.startswith("触发："):
+                        trigger = line[3:]
+                        break
+                flat = " ".join(c.splitlines())
+                parts.append(f"\n### 技能：{name}\n触发：{trigger}\n摘要：{flat[:100]}…（如需详细步骤请询问）")
+            else:
+                parts.append(f"\n### 技能：{name}\n{c}")
         return "\n".join(parts).strip()
     except Exception:
         return ""

@@ -110,13 +110,20 @@ async def get_doc_chunks(item_id: int) -> dict:
     return r.json()
 
 
-async def ingest_pdf(filename: str, content: bytes) -> dict:
-    """转发 PDF 上传到 api_gateway /ingest。"""
+async def ingest_file(filename: str, content: bytes) -> dict:
+    """转发文件上传到 api_gateway /ingest（PDF/Markdown/文本）。"""
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        content_type = "application/pdf"
+    elif lower.endswith(".md") or lower.endswith(".txt"):
+        content_type = "text/plain"
+    else:
+        return {"error": "仅支持 PDF / Markdown / 文本", "code": "BAD_TYPE"}
     try:
         r = await get_client().post(
             f"{KNOWLEDGE_API_BASE}/ingest",
             headers=_headers(),
-            files={"file": (filename, content, "application/pdf")},
+            files={"file": (filename, content, content_type)},
             timeout=120.0,
         )
         if r.status_code >= 400:

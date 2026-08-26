@@ -63,6 +63,13 @@ export default function ChatView() {
 
   const loadConversation = useCallback(async (id: string) => {
     try {
+      // 清空流式残留状态（思考/文本/工具气泡），避免切换到旧对话时显示上一对话的思考历史
+      setThinkingText('')
+      setThinkingDone(false)
+      setThinkingStart(undefined)
+      setStreamingText('')
+      setToolCallBubbles([])
+
       const conv = await api.getConversation(id)
       setActiveConv(conv)
       const msgs: Message[] = conv.messages || []
