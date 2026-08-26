@@ -94,6 +94,21 @@ export default function ChatMessages({
 
   const lastMsgId = messages.length > 0 ? messages[messages.length - 1].id : null
 
+  // 工具痕迹按 messageId 分组：有 messageId 的交错插到对应 user 消息下方，无的（流式中）留底部
+  const tracesByMessage = new Map<number, TraceEntry[]>()
+  const unboundTraces: TraceEntry[] = []
+  if (toolCallBubbles && toolCallBubbles.length > 0) {
+    for (const t of toolCallBubbles) {
+      if (t.messageId != null) {
+        const arr = tracesByMessage.get(t.messageId) || []
+        arr.push(t)
+        tracesByMessage.set(t.messageId, arr)
+      } else {
+        unboundTraces.push(t)
+      }
+    }
+  }
+
   if (messages.length === 0 && !isLoading && !streamingText && !toolCallBubbles?.length) {
     return (
       <div className="chat-messages">
@@ -116,6 +131,7 @@ export default function ChatMessages({
         const isEditing = editingId === msg.id
 
         return (
+          <>
           <div key={msg.id} className={`message message-${isUser ? 'user' : 'ai'} message-group`}>
             <div className="message-avatar">
               {isUser ? 'I' : 'Z'}
@@ -187,18 +203,29 @@ export default function ChatMessages({
               </div>
             </div>
           </div>
+          {/* 该 user 消息关联的工具痕迹（历史回读，按 message_id 交错） */}
+          {isUser && tracesByMessage.get(msg.id) && (
+            <div className="trace-stack-inline">
+              {tracesByMessage.get(msg.id)!.map(entry => (
+                <div key={entry.id} className="trace-stack-item">
+                  <TraceCard entry={entry} forceExpand={traceExpand} />
+                </div>
+              ))}
+            </div>
+          )}
+          </>
         )
       })}
 
-      {/* 工具痕迹 — 渲染在流式回复上方（对齐 WorkBuddy：先过程后结论） */}
-      {toolCallBubbles && toolCallBubbles.length > 0 && (
+      {/* 未绑定消息的工具痕迹（流式进行中新增的）— 渲染在流式回复上方 */}
+      {unboundTraces.length > 0 && (
         <div className="message message-ai message-group">
           <div className="message-avatar" style={{ visibility: 'hidden' }}>Z</div>
           <div className="message-content">
             {/* 折叠控制条 */}
             <div className="trace-control-bar" style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
               <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
-                🔧 {toolCallBubbles.length} 次工具调用
+                🔧 {unboundTraces.length} 次工具调用
               </span>
               <button
                 className="btn btn-sm"
@@ -216,7 +243,7 @@ export default function ChatMessages({
                 onClick={() => setTraceExpand(null)}
               >↕ 默认</button>
             </div>
-            {toolCallBubbles.map(entry => (
+            {unboundTraces.map(entry => (
               <div key={entry.id} className="trace-stack-item">
                 <TraceCard entry={entry} forceExpand={traceExpand} />
               </div>

@@ -63,6 +63,9 @@ export default function ChatView() {
 
   const loadConversation = useCallback(async (id: string) => {
     try {
+      // 中断正在进行的 SSE 流（否则切换对话后旧对话的思考/工具仍在后台推数据，污染新对话）
+      abortRef.current?.abort()
+      abortRef.current = null
       // 清空流式残留状态（思考/文本/工具气泡），避免切换到旧对话时显示上一对话的思考历史
       setThinkingText('')
       setThinkingDone(false)
@@ -82,8 +85,10 @@ export default function ChatView() {
       // 回读历史执行痕迹（conversation_traces 表）— 切换模块回来不丢失工具气泡
       try {
         const traces = await api.getConvTraces(id)
+        // 后端返回 id DESC（最新在前），反转为正序（旧→新）让历史痕迹按时间顺序展示
         const bubbles = traces
           .filter((t: any) => t.trace_type === 'tool_call')
+          .reverse()
           .map((t: any) => {
             let data: any = {}
             try { data = JSON.parse(t.data || '{}') } catch { data = {} }
@@ -96,6 +101,7 @@ export default function ChatView() {
               durationMs: data.duration_ms,
               success: data.success,
               round: t.round_num,
+              messageId: t.message_id,
               stdout: data.stdout,
               stderr: data.stderr,
               exit_code: data.exit_code,

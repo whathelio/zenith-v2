@@ -21,6 +21,8 @@ export interface TraceEntry {
   durationMs?: number
   success?: boolean
   round?: number
+  // 关联的 user 消息 id（用于前端交错渲染）
+  messageId?: number | null
   // 代码执行
   stdout?: string
   stderr?: string
@@ -261,6 +263,7 @@ export function toTraceEntry(entry: {
   durationMs?: number
   success?: boolean
   round?: number
+  messageId?: number | null
   stdout?: string
   stderr?: string
   exit_code?: number | null
@@ -276,6 +279,7 @@ export function toTraceEntry(entry: {
     durationMs: entry.durationMs,
     success: entry.success,
     round: entry.round,
+    messageId: entry.messageId,
     stdout: entry.stdout,
     stderr: entry.stderr,
     exitCode: entry.exit_code,

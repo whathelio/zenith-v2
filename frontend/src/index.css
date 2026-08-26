@@ -1262,6 +1262,15 @@ textarea.form-input {
    Calendar View — 周视图日历
    ═══════════════════════════════════════════════════════ */
 
+/* 内容区滚动链：右侧 app-layout-right 是 overflow:hidden，
+   必须让 main-area 自身撑满并开启纵向滚动，否则日程/知识库内容超出屏幕无法下翻 */
+.main-area {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
 .calendar-container {
   padding: var(--space-4) var(--space-6);
   max-width: 760px;

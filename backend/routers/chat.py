@@ -191,8 +191,10 @@ def _build_skill_injection(current_query: str) -> str:
 async def _process_conv(
     conv_id: str, user_message: str, messages: list, cfg: dict,
     event_queue: asyncio.Queue, provider_name: str = "", persona_name: str = "",
+    user_msg_id: int = None,
 ):
-    """后台任务：LLM 调用 + 工具执行 + 消息保存，不受客户端断连影响"""
+    """后台任务：LLM 调用 + 工具执行 + 消息保存，不受客户端断连影响。
+    user_msg_id: 当前用户消息的 id，用于把工具痕迹关联到所属消息（前端交错渲染）。"""
     logger = logging.getLogger("zenith.chat")
     try:
         reminder = check_reminders()
@@ -307,6 +309,7 @@ async def _process_conv(
                                 "duration_ms": duration_ms,
                             },
                             round_num=round_num,
+                            message_id=user_msg_id,
                         )
                     except Exception:
                         pass
@@ -659,13 +662,15 @@ def _start_sse(conv_id: str, user_message: str, cfg: dict,
         _active_streams.pop(conv_id, None)
 
     if persist_user:
-        db.msg_add(conv_id, "user", user_message)
+        user_msg_id = db.msg_add(conv_id, "user", user_message)
+    else:
+        user_msg_id = None
 
     messages = _build_chat_messages(conv_id, cfg, persona_name, user_message)
 
     event_queue = asyncio.Queue()
     process_task = asyncio.create_task(
-        _process_conv(conv_id, user_message, messages, cfg, event_queue, provider_name, persona_name)
+        _process_conv(conv_id, user_message, messages, cfg, event_queue, provider_name, persona_name, user_msg_id)
     )
     _active_streams[conv_id] = process_task
 

@@ -310,6 +310,7 @@
 
 /* ── 痕迹卡片（工具 / 代码 / 文件编辑）── */
 .trace-stack-item { margin-bottom: 6px; }
+.trace-stack-inline { margin: 0 0 8px 44px; }  /* 交错插在 user 消息下方的痕迹块，左缩进对齐内容区 */
 .trace-card {
   margin: 6px 0;
   border-radius: var(--radius-lg);
