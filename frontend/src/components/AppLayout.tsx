@@ -141,6 +141,23 @@ export default function AppLayout() {
     } catch { /* silent */ }
   }
 
+  // 提醒条默认折叠：只占一行，不挤压对话区；点击展开看明细
+  const [reminderCollapsed, setReminderCollapsed] = useState(true)
+
+  // 忽略单条逾期日程：记录到后端（留痕），之后不再弹出
+  const ignoreOverdue = async (id: number) => {
+    try {
+      const r = await fetch('/api/reminders/ack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ schedule_ids: [id] }),
+      })
+      if (r.ok) {
+        setReminders(prev => ({ ...prev, overdue: prev.overdue.filter((s: any) => s.id !== id) }))
+      }
+    } catch { /* silent */ }
+  }
+
   // 周计算：以 selectedDate 为基准，显示其所在周（周一到周日）
   const refDate = selectedDate
   const monday = new Date(refDate.getTime() - ((refDate.getDay() || 7) - 1) * 86400000)
@@ -618,30 +635,70 @@ export default function AppLayout() {
           <div className="app-layout-right">
             {(reminders.due.length > 0 || reminders.overdue.length > 0) && (
               <div style={{
-                padding: '8px 12px', marginBottom: 4,
+                margin: '0 8px 4px',
                 background: 'rgba(255, 85, 85, 0.08)', borderRadius: 6,
-                border: '1px solid rgba(255, 85, 85, 0.2)', fontSize: 13,
+                border: '1px solid rgba(255, 85, 85, 0.2)', fontSize: 12,
               }}>
-                {reminders.overdue.map((s, i) => (
-                  <div key={`od-${i}`} style={{ color: '#ff5555' }}>
-                    🔴 已逾期: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
+                {/* 折叠态：仅一行摘要 —— 不挤压对话区 */}
+                <div
+                  onClick={() => setReminderCollapsed(v => !v)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '4px 10px', cursor: 'pointer', userSelect: 'none',
+                  }}
+                  title={reminderCollapsed ? '点击展开日程提醒' : '点击收起'}
+                >
+                  <span>🔔</span>
+                  {reminders.overdue.length > 0 && (
+                    <span style={{ color: '#ff5555' }}>逾期 {reminders.overdue.length}</span>
+                  )}
+                  {reminders.due.length > 0 && (
+                    <span style={{ color: '#f1fa8c' }}>即将开始 {reminders.due.length}</span>
+                  )}
+                  <span style={{ marginLeft: 'auto', color: 'var(--color-text-muted)', fontSize: 11 }}>
+                    {reminderCollapsed ? '展开 ▾' : '收起 ▴'}
+                  </span>
+                </div>
+
+                {/* 展开态：明细 + 逐条操作 */}
+                {!reminderCollapsed && (
+                  <div style={{ padding: '0 10px 8px' }}>
+                    {reminders.overdue.map((s, i) => (
+                      <div key={`od-${i}`} style={{
+                        display: 'flex', alignItems: 'center', gap: 6,
+                        color: '#ff5555', padding: '2px 0',
+                      }}>
+                        <span style={{ flex: 1 }}>
+                          🔴 已逾期: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
+                        </span>
+                        <button
+                          onClick={() => ignoreOverdue(s.id)}
+                          title="忽略该逾期日程（记录留痕，不再弹出；日程页「逾期」入口仍可查看）"
+                          style={{
+                            padding: '1px 8px', fontSize: 11, borderRadius: 4,
+                            background: 'transparent', border: '1px solid #ff5555',
+                            color: '#ff5555', cursor: 'pointer',
+                          }}
+                        >忽略</button>
+                      </div>
+                    ))}
+                    {reminders.due.map((s, i) => (
+                      <div key={`due-${i}`} style={{ color: '#f1fa8c', padding: '2px 0' }}>
+                        ⏰ 即将开始: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
+                      </div>
+                    ))}
+                    {reminders.due.length > 0 && (
+                      <button
+                        onClick={acknowledgeDue}
+                        style={{
+                          marginTop: 6, padding: '2px 10px', fontSize: 12, borderRadius: 4,
+                          background: 'transparent', border: '1px solid #f1fa8c', color: '#f1fa8c', cursor: 'pointer',
+                        }}
+                      >
+                        已读
+                      </button>
+                    )}
                   </div>
-                ))}
-                {reminders.due.map((s, i) => (
-                  <div key={`due-${i}`} style={{ color: '#f1fa8c' }}>
-                    ⏰ 即将开始: {s.title} @ {s.start_time?.slice(11, 16) || '待定'}
-                  </div>
-                ))}
-                {reminders.due.length > 0 && (
-                  <button
-                    onClick={acknowledgeDue}
-                    style={{
-                      marginTop: 6, padding: '2px 10px', fontSize: 12, borderRadius: 4,
-                      background: 'transparent', border: '1px solid #f1fa8c', color: '#f1fa8c', cursor: 'pointer',
-                    }}
-                  >
-                    已读
-                  </button>
                 )}
               </div>
             )}

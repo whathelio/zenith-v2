@@ -39,6 +39,8 @@ export default function CalendarView() {
   // 列表视图状态
   const [viewMode, setViewMode] = useState<'week' | 'list'>('week')
   const [listFilter, setListFilter] = useState('')
+  // 逾期日程默认不在列表里显示（避免噪音）；打开后可追溯查看被忽略/已过期的日程
+  const [showOverdue, setShowOverdue] = useState(false)
   const [listLoading, setListLoading] = useState(false)
   const [allSchedules, setAllSchedules] = useState<Schedule[]>([])
   const [batchMode, setBatchMode] = useState(false)
@@ -145,13 +147,14 @@ export default function CalendarView() {
       const now = new Date().toISOString()
       const filtered = listFilter ? list : list.filter((s: Schedule) => {
         if (s.status === 'done' || s.status === 'cancelled') return false
-        if (s.end_time && s.end_time < now && (s.status === 'proposed' || s.status === 'confirmed')) return false
+        // 已过期的默认隐藏（避免噪音）；打开「显示逾期」后保留，便于追溯
+        if (!showOverdue && s.end_time && s.end_time < now && (s.status === 'proposed' || s.status === 'confirmed')) return false
         return true
       })
       setAllSchedules(filtered)
       setSelectedIds(new Set())
     } catch { /* silent */ } finally { setListLoading(false) }
-  }, [listFilter])
+  }, [listFilter, showOverdue])
 
   useEffect(() => { loadEvents() }, [mondayStr])
   useEffect(() => { loadTemplates() }, [])
@@ -553,6 +556,18 @@ export default function CalendarView() {
                     <option key={k} value={k}>{v} ({statusCounts[k] || 0})</option>
                   ))}
                 </select>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setShowOverdue(v => !v)}
+                  title="已过期的日程默认隐藏；打开后可查看并处理（被忽略的逾期提醒也在这里追溯）"
+                  style={{
+                    fontSize: 11,
+                    borderColor: showOverdue ? '#ff5555' : undefined,
+                    color: showOverdue ? '#ff5555' : undefined,
+                  }}
+                >
+                  {showOverdue ? '🔴 隐藏逾期' : '⚪ 显示逾期'}
+                </button>
                 <span style={{ color: 'var(--color-text-muted)', fontSize: 11 }}>共 {allSchedules.length} 条</span>
                 <div style={{ flex: 1 }} />
                 {!batchMode ? (
@@ -610,6 +625,9 @@ export default function CalendarView() {
                   {allSchedules.map(s => {
                     const isProposed = s.status === 'proposed'
                     const isCancelled = s.status === 'cancelled'
+                    // 逾期：未完成且已过结束时间（仅供展示标记，是否被提醒由后端提醒记录决定）
+                    const sOverdue = !!s.end_time && s.end_time < new Date().toISOString()
+                      && s.status !== 'done' && s.status !== 'cancelled'
                     const borderColor = STATUS_COLORS[s.status] || '#717e95'
                     const bgColor = STATUS_BG_COLORS[s.status] || 'var(--color-bg-panel)'
                     const priorityColor = PRIORITY_COLORS[s.priority] || '#6272a4'
@@ -665,6 +683,7 @@ export default function CalendarView() {
                             <div style={{ flex: 1, minWidth: 0 }}>
                               <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
                                 {s.title}
+                                {sOverdue && <span style={{ fontSize: 9, background: '#ff5555', color: '#fff', padding: '1px 5px', borderRadius: 3, fontWeight: 700 }}>逾期</span>}
                                 {s.priority === 'high' && <span style={{ fontSize: 9, background: PRIORITY_COLORS.high, color: '#fff', padding: '1px 5px', borderRadius: 3, fontWeight: 700 }}>紧急</span>}
                               </div>
                               {s.description && (

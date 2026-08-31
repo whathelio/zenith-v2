@@ -60,6 +60,25 @@ def _already_reminded(sid: int) -> bool:
     return r is not None
 
 
+def _overdue_ignored(sid: int) -> bool:
+    """该逾期日程是否已被用户主动忽略。
+
+    与 due 阶段的「已读」区分：due ack 发生在 start_time 之前（不算忽略逾期），
+    忽略动作发生在 start_time 之后才算。这样同一日程先 ack 了到期提醒、
+    之后真正逾期时仍会再提醒一次，逾期被忽略后才彻底不再打扰。
+    """
+    with db() as c:
+        r = c.execute(
+            "SELECT 1 FROM schedule_reminders r "
+            "JOIN schedules s ON s.id = r.schedule_id "
+            "WHERE r.schedule_id = ? "
+            "  AND datetime(r.reminded_at) > datetime(s.start_time) "
+            "LIMIT 1",
+            (sid,)
+        ).fetchone()
+    return r is not None
+
+
 def _record_reminder(sid: int):
     """记录本次提醒"""
     with db() as c:
@@ -108,7 +127,9 @@ def get_due_reminders() -> dict:
         if start < now:
             if s.get("status") not in ("done", "cancelled"):
                 age = now - start
-                if age < timedelta(days=7):
+                # 用户已忽略的逾期项不再重复弹出（记录仍在 schedule_reminders 表，
+                # 日程页「逾期」入口可追溯查看 —— 留痕但不遮挡对话）
+                if age < timedelta(days=7) and not _overdue_ignored(s["id"]):
                     overdue.append(s)
             continue
 

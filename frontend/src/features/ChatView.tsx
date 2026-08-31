@@ -16,6 +16,8 @@ export default function ChatView() {
   const location = useLocation()
   // 记录已导航到的对话 ID，防止 useEffect 因 URL 规范化差异反复 navigate 造成渲染振荡
   const navigatedConvRef = useRef<string | null>(null)
+  // 当前正在查看的对话 id（ref，SSE 回调里实时判断，避免闭包过期导致串号）
+  const activeConvIdRef = useRef<string>('')
 
   const [conversations, setConversations] = useState<any[]>([])
   const [activeConv, setActiveConv] = useState<any>(null)
@@ -63,10 +65,9 @@ export default function ChatView() {
 
   const loadConversation = useCallback(async (id: string) => {
     try {
-      // 中断正在进行的 SSE 流（否则切换对话后旧对话的思考/工具仍在后台推数据，污染新对话）
-      abortRef.current?.abort()
-      abortRef.current = null
-      // 清空流式残留状态（思考/文本/工具气泡），避免切换到旧对话时显示上一对话的思考历史
+      // 同步当前查看对话 id（SSE 回调据此判断是否写 UI，切走后静默丢弃，不 abort 后台流）
+      activeConvIdRef.current = id
+      // 清空流式残留状态（思考/文本/工具气泡），切换到新对话时先展示干净，再由 loadConversation 拉取该对话数据
       setThinkingText('')
       setThinkingDone(false)
       setThinkingStart(undefined)
@@ -220,7 +221,7 @@ export default function ChatView() {
     let assistantText = ''
     let convIdRef = activeConv?.id || ''
 
-    abortRef.current?.abort()
+    // 不再 abort 旧流：后台继续生成，切走后由 activeConvIdRef 守卫静默丢弃 UI 更新
     const ac = new AbortController()
     abortRef.current = ac
 
@@ -237,6 +238,10 @@ export default function ChatView() {
           if (!line.startsWith('data: ')) continue
           const dataStr = line.slice(6)
           if (!dataStr) continue
+          // 守卫：该 SSE 流不属于当前正在查看的对话时，静默跳过（不写 UI 状态，避免串号）
+          if (convIdRef && activeConvIdRef.current && convIdRef !== activeConvIdRef.current) {
+            continue
+          }
           try {
             const data = JSON.parse(dataStr)
 
@@ -336,6 +341,7 @@ export default function ChatView() {
       try {
         const conv = await api.createConversation()
         setActiveConv(conv)
+        activeConvIdRef.current = conv.id
         await loadConversations()
         navigate(`/chat/${conv.id}`, { replace: true })
         userMsg.conversation_id = conv.id
