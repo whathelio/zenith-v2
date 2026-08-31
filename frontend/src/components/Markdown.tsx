@@ -7,7 +7,7 @@
  * 安全占位符与外部链接采用容器事件委托（见 ChatMessages 的 onClick），
  * 与旧版行为保持一致。
  */
-import { useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 /* ─────────────────────────── 类型 ─────────────────────────── */
@@ -112,6 +112,138 @@ function toRawLines(text: string): RawLine[] {
   })
 }
 
+interface ParseOneResult {
+  block: Block
+  next: number
+  closed: boolean
+}
+
+/** 前 k 行的字符偏移（含换行符）。k === lines.length 时不额外计入行尾换行。 */
+function lineOffset(lines: RawLine[], k: number): number {
+  const end = Math.min(k, lines.length)
+  let offset = 0
+  for (let j = 0; j < end; j++) offset += lines[j].text.length + 1
+  if (end > 0 && end === lines.length) offset -= 1
+  return Math.max(0, offset)
+}
+
+/**
+ * 解析单个块。lines[i] 必须是非空行。
+ *
+ * closed 表示是否拿到了“确定终止边界”：
+ * - true：后续追加任何内容都不会改变这个块的解析结果，可安全缓存（毕业）。
+ * - false：块可能尚未结束（如未闭合代码围栏 / 表格末尾 / 列表后悬空），
+ *   必须留在尾段，每次流式更新时重算。
+ */
+function parseOneBlock(lines: RawLine[], i: number): ParseOneResult {
+  const n = lines.length
+  const line = lines[i]
+
+  // 代码围栏
+  const fence = line.text.match(FENCE_RE)
+  if (fence) {
+    const lang = fence[1]
+    const codeLines: string[] = []
+    let j = i + 1
+    while (j < n && !FENCE_RE.test(lines[j].text)) {
+      codeLines.push(lines[j].text)
+      j++
+    }
+    const foundClose = j < n
+    if (foundClose) j++ // 跳过结束围栏
+    // 只有结束围栏后还跟着换行（存在后续行）才视为闭合；
+    // 否则后续 chunk 可能在同一行继续追加，把 ``` 变成非围栏。
+    const closed = foundClose && j < n
+    return { block: { type: 'code', lang, code: codeLines.join('\n') }, next: j, closed }
+  }
+
+  // 分割线
+  if (HR_RE.test(line.text.trim())) {
+    // 单行块也要等换行到达：行尾可能继续追加字符
+    return { block: { type: 'hr' }, next: i + 1, closed: i + 1 < n }
+  }
+
+  // 标题
+  const heading = line.text.match(HEADING_RE)
+  if (heading) {
+    return { block: { type: 'heading', level: heading[1].length, children: parseInline(heading[2]) }, next: i + 1, closed: i + 1 < n }
+  }
+
+  // 引用块 — 收集连续 > 行
+  if (BLOCKQUOTE_RE.test(line.text)) {
+    const quoteLines: string[] = []
+    let j = i
+    while (j < n && BLOCKQUOTE_RE.test(lines[j].text)) {
+      quoteLines.push(lines[j].text.replace(BLOCKQUOTE_RE, '$1'))
+      j++
+    }
+    const inner = parseBlocks(quoteLines.join('\n'))
+    return {
+      block: { type: 'blockquote', children: inner.length ? inner : [{ type: 'paragraph', children: [] }] },
+      next: j,
+      closed: j + 1 < n,
+    }
+  }
+
+  // 表格 — 当前行是 | 行且下一行是分隔行
+  if (TABLE_ROW_RE.test(line.text) && i + 1 < n && TABLE_SEP_RE.test(lines[i + 1].text)) {
+    const header = line.text.trim().replace(/^\||\|$/g, '').split('|').map(c => parseInline(c.trim()))
+    let j = i + 2
+    const rows: InlineToken[][][] = []
+    while (j < n && TABLE_ROW_RE.test(lines[j].text) && !TABLE_SEP_RE.test(lines[j].text)) {
+      const cells = lines[j].text.trim().replace(/^\||\|$/g, '').split('|').map(c => parseInline(c.trim()))
+      rows.push(cells)
+      j++
+    }
+    return { block: { type: 'table', headers: header, rows }, next: j, closed: j + 1 < n }
+  }
+
+  // 列表 — 收集连续的列表候选行（含缩进与空行，直到下一个非列表非空行）
+  if (LIST_RE.test(line.text)) {
+    const listLines: RawLine[] = []
+    let j = i
+    let closed = false
+    while (j < n) {
+      const l = lines[j]
+      if (LIST_RE.test(l.text)) {
+        listLines.push(l)
+        j++
+      } else if (!l.text.trim()) {
+        // 空行：若后面还跟列表行则并入（支持列表内空行）
+        let k = j + 1
+        while (k < n && !lines[k].text.trim()) k++
+        if (k < n && LIST_RE.test(lines[k].text) && lines[k].indent > line.indent) {
+          j = k
+        } else {
+          // 列表确实终止：要求终止行后面还有换行（保守，防末尾半行后续变回列表项）
+          closed = k + 1 < n
+          break
+        }
+      } else {
+        closed = j + 1 < n
+        break
+      }
+    }
+    const items = parseListLines(listLines)
+    if (items.length) {
+      return { block: { type: 'list', items }, next: j, closed }
+    }
+    // 理论不可达：LIST_RE 命中的行必然能解析出至少一个 item；此处仅防御死循环
+    return { block: { type: 'paragraph', children: parseInline(line.text) }, next: i + 1, closed: true }
+  }
+
+  // 普通段落 — 合并连续非空行
+  const paraLines: string[] = []
+  let j = i
+  while (j < n && lines[j].text.trim() && !FENCE_RE.test(lines[j].text) && !HEADING_RE.test(lines[j].text) && !LIST_RE.test(lines[j].text) && !BLOCKQUOTE_RE.test(lines[j].text)) {
+    paraLines.push(lines[j].text)
+    j++
+  }
+  // 段落以“空行或块标记”终止；但只有终止行后还存在换行才视为闭合，
+  // 否则末尾半行（单换行后的空占位 / 半截围栏标记）后续仍可能变成段落续行。
+  return { block: { type: 'paragraph', children: parseInline(paraLines.join('\n')) }, next: j, closed: j + 1 < n }
+}
+
 function parseBlocks(text: string): Block[] {
   const lines = toRawLines(text)
   const blocks: Block[] = []
@@ -124,104 +256,63 @@ function parseBlocks(text: string): Block[] {
     // 空行
     if (!line.text.trim()) { i++; continue }
 
-    // 代码围栏
-    const fence = line.text.match(FENCE_RE)
-    if (fence) {
-      const lang = fence[1]
-      const codeLines: string[] = []
-      i++
-      while (i < n && !FENCE_RE.test(lines[i].text)) {
-        codeLines.push(lines[i].text)
-        i++
-      }
-      if (i < n) i++ // 跳过结束围栏
-      blocks.push({ type: 'code', lang, code: codeLines.join('\n') })
-      continue
-    }
-
-    // 分割线
-    if (HR_RE.test(line.text.trim())) {
-      blocks.push({ type: 'hr' })
-      i++
-      continue
-    }
-
-    // 标题
-    const heading = line.text.match(HEADING_RE)
-    if (heading) {
-      blocks.push({ type: 'heading', level: heading[1].length, children: parseInline(heading[2]) })
-      i++
-      continue
-    }
-
-    // 引用块 — 收集连续 > 行
-    if (BLOCKQUOTE_RE.test(line.text)) {
-      const quoteLines: string[] = []
-      while (i < n && BLOCKQUOTE_RE.test(lines[i].text)) {
-        quoteLines.push(lines[i].text.replace(BLOCKQUOTE_RE, '$1'))
-        i++
-      }
-      const inner = parseBlocks(quoteLines.join('\n'))
-      blocks.push({ type: 'blockquote', children: inner.length ? inner : [{ type: 'paragraph', children: [] }] })
-      continue
-    }
-
-    // 表格 — 当前行是 | 行且下一行是分隔行
-    if (TABLE_ROW_RE.test(line.text) && i + 1 < n && TABLE_SEP_RE.test(lines[i + 1].text)) {
-      const header = line.text.trim().replace(/^\||\|$/g, '').split('|').map(c => parseInline(c.trim()))
-      i += 2
-      const rows: InlineToken[][][] = []
-      while (i < n && TABLE_ROW_RE.test(lines[i].text) && !TABLE_SEP_RE.test(lines[i].text)) {
-        const cells = lines[i].text.trim().replace(/^\||\|$/g, '').split('|').map(c => parseInline(c.trim()))
-        rows.push(cells)
-        i++
-      }
-      blocks.push({ type: 'table', headers: header, rows })
-      continue
-    }
-
-    // 列表 — 收集连续的列表候选行（含缩进与空行，直到下一个非列表非空行）
-    if (LIST_RE.test(line.text)) {
-      const listLines: RawLine[] = []
-      let j = i
-      while (j < n) {
-        const l = lines[j]
-        if (LIST_RE.test(l.text)) {
-          listLines.push(l)
-          j++
-        } else if (!l.text.trim()) {
-          // 空行：若后面还跟列表行则并入（支持列表内空行）
-          let k = j + 1
-          while (k < n && !lines[k].text.trim()) k++
-          if (k < n && LIST_RE.test(lines[k].text) && lines[k].indent > line.indent) {
-            j = k
-          } else {
-            break
-          }
-        } else {
-          break
-        }
-      }
-      const items = parseListLines(listLines)
-      if (items.length) {
-        blocks.push({ type: 'list', items })
-        i = j
-        continue
-      }
-      // 兜底：parseListLines 返回空（理论不该发生）时必须前进，防止死循环
-      i++
-    }
-
-    // 普通段落 — 合并连续非空行
-    const paraLines: string[] = []
-    while (i < n && lines[i].text.trim() && !FENCE_RE.test(lines[i].text) && !HEADING_RE.test(lines[i].text) && !LIST_RE.test(lines[i].text) && !BLOCKQUOTE_RE.test(lines[i].text)) {
-      paraLines.push(lines[i].text)
-      i++
-    }
-    blocks.push({ type: 'paragraph', children: parseInline(paraLines.join('\n')) })
+    const parsed = parseOneBlock(lines, i)
+    blocks.push(parsed.block)
+    i = parsed.next
   }
 
   return blocks
+}
+
+interface TrackedBlocks {
+  blocks: Block[]
+  offsets: number[]
+}
+
+/** 与 parseBlocks 同语义，额外记录每个块的起始字符偏移（用于稳定流式 key）。 */
+function parseBlocksTracked(text: string): TrackedBlocks {
+  const lines = toRawLines(text)
+  const blocks: Block[] = []
+  const offsets: number[] = []
+  let i = 0
+  const n = lines.length
+
+  while (i < n) {
+    if (!lines[i].text.trim()) { i++; continue }
+    offsets.push(lineOffset(lines, i))
+    const parsed = parseOneBlock(lines, i)
+    blocks.push(parsed.block)
+    i = parsed.next
+  }
+
+  return { blocks, offsets }
+}
+
+interface ScanClosedResult {
+  blocks: Block[]
+  nextLine: number
+}
+
+/** 从 startLine 起，只收取拿到确定终止边界的块；遇到第一个未闭合块即停。 */
+function scanClosedBlocks(lines: RawLine[], startLine: number): ScanClosedResult {
+  const blocks: Block[] = []
+  let i = Math.max(0, Math.min(startLine, lines.length))
+
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line.text.trim()) {
+      // 末尾空行可能是尚未写完的下一行（split 产生的占位），不可吞进稳定前缀；
+      // 只有空行后面还有行，才说明它确实是完整的分隔空行。
+      if (i < lines.length - 1) { i++; continue }
+      break
+    }
+    const parsed = parseOneBlock(lines, i)
+    if (!parsed.closed) break
+    blocks.push(parsed.block)
+    i = parsed.next
+  }
+
+  return { blocks, nextLine: i }
 }
 
 /** 递归解析列表行（按缩进构建嵌套） */
@@ -366,50 +457,154 @@ function renderListContainer(items: ListItem[], key: string): ReactNode {
     : <ul key={key} className="md-list">{renderListItems(items, key)}</ul>
 }
 
+function renderOneBlock(block: Block, k: string): ReactNode {
+  switch (block.type) {
+    case 'paragraph':
+      return <p className="md-p">{renderInline(block.children, k)}</p>
+    case 'heading': {
+      const content = renderInline(block.children, k)
+      switch (block.level) {
+        case 1: return <h1 className="md-h1">{content}</h1>
+        case 2: return <h2 className="md-h2">{content}</h2>
+        case 3: return <h3 className="md-h3">{content}</h3>
+        case 4: return <h4 className="md-h4">{content}</h4>
+        case 5: return <h5 className="md-h5">{content}</h5>
+        default: return <h6 className="md-h6">{content}</h6>
+      }
+    }
+    case 'blockquote':
+      return <blockquote className="md-blockquote">{renderBlocks(block.children, k)}</blockquote>
+    case 'list':
+      return renderListContainer(block.items, k)
+    case 'table':
+      return (
+        <div className="md-table-wrap">
+          <table className="md-table">
+            <thead>
+              <tr>{block.headers.map((h, i) => <th key={i}>{renderInline(h, `${k}-h${i}`)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, ri) => (
+                <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{renderInline(cell, `${k}-r${ri}c${ci}`)}</td>)}</tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )
+    case 'code':
+      return <CodeBlock lang={block.lang} code={block.code} />
+    case 'hr':
+      return <hr className="md-hr" />
+    default:
+      return null
+  }
+}
+
+const MemoBlock = memo(function MemoBlock({ block, k }: { block: Block; k: string }) {
+  return <>{renderOneBlock(block, k)}</>
+})
+
 function renderBlocks(blocks: Block[], keyPrefix: string): ReactNode[] {
   return blocks.map((block, idx) => {
     const k = `${keyPrefix}-${idx}`
-    switch (block.type) {
-      case 'paragraph':
-        return <p key={k} className="md-p">{renderInline(block.children, k)}</p>
-      case 'heading': {
-        const content = renderInline(block.children, k)
-        switch (block.level) {
-          case 1: return <h1 key={k} className="md-h1">{content}</h1>
-          case 2: return <h2 key={k} className="md-h2">{content}</h2>
-          case 3: return <h3 key={k} className="md-h3">{content}</h3>
-          case 4: return <h4 key={k} className="md-h4">{content}</h4>
-          case 5: return <h5 key={k} className="md-h5">{content}</h5>
-          default: return <h6 key={k} className="md-h6">{content}</h6>
-        }
-      }
-      case 'blockquote':
-        return <blockquote key={k} className="md-blockquote">{renderBlocks(block.children, k)}</blockquote>
-      case 'list':
-        return renderListContainer(block.items, k)
-      case 'table':
-        return (
-          <div key={k} className="md-table-wrap">
-            <table className="md-table">
-              <thead>
-                <tr>{block.headers.map((h, i) => <th key={i}>{renderInline(h, `${k}-h${i}`)}</th>)}</tr>
-              </thead>
-              <tbody>
-                {block.rows.map((row, ri) => (
-                  <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{renderInline(cell, `${k}-r${ri}c${ci}`)}</td>)}</tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )
-      case 'code':
-        return <CodeBlock key={k} lang={block.lang} code={block.code} />
-      case 'hr':
-        return <hr key={k} className="md-hr" />
-      default:
-        return null
-    }
+    return <MemoBlock key={k} block={block} k={k} />
   })
+}
+
+/* ─────────────────── 流式增量解析（层次 1） ─────────────────── */
+
+interface IncrementalCache {
+  /** 已闭合前缀的原文切片；下一次 content 必须以它开头，否则整体回退全量解析。 */
+  stablePrefix: string
+  closed: Block[]
+  closedIds: number[]
+  closedCharLen: number
+  closedLineCount: number
+  nextId: number
+}
+
+const EMPTY_CACHE: IncrementalCache = {
+  stablePrefix: '',
+  closed: [],
+  closedIds: [],
+  closedCharLen: 0,
+  closedLineCount: 0,
+  nextId: 0,
+}
+
+interface IncrementalResult {
+  closed: Block[]
+  closedIds: number[]
+  tailBlocks: Block[]
+  tailOffsets: number[]
+  tailStart: number
+  snapshot: IncrementalCache
+}
+
+function fallbackResult(content: string): IncrementalResult {
+  const full = parseBlocksTracked(content)
+  return {
+    closed: [],
+    closedIds: [],
+    tailBlocks: full.blocks,
+    tailOffsets: full.offsets,
+    tailStart: 0,
+    snapshot: EMPTY_CACHE,
+  }
+}
+
+/**
+ * 纯函数：只读 prev 缓存，返回本次渲染数据与下一份缓存快照。
+ * 副作用（写 useRef）放到 useEffect，保证 StrictMode 双调用安全。
+ */
+function computeIncremental(content: string, streaming: boolean, prev: IncrementalCache): IncrementalResult {
+  if (!streaming || !content) return fallbackResult(content)
+
+  const lines = toRawLines(content)
+  const prefixOk = prev.stablePrefix === ''
+    ? true
+    : prev.closedCharLen <= content.length
+      && prev.closedLineCount <= lines.length
+      && content.startsWith(prev.stablePrefix)
+
+  // 内容被重置 / 缩短 / 切换对话 / 重新生成：整体回退全量解析并重置缓存
+  if (!prefixOk) return fallbackResult(content)
+
+  // 只扫描“上次已闭合前缀之后”的增量文本；毕业新闭合块
+  const scan = scanClosedBlocks(lines, prev.closedLineCount)
+  let closed = prev.closed
+  let closedIds = prev.closedIds
+  let nextId = prev.nextId
+  let snapshot = prev
+
+  if (scan.blocks.length > 0) {
+    const newIds = scan.blocks.map((_, idx) => prev.nextId + idx)
+    closed = prev.closed.concat(scan.blocks)
+    closedIds = prev.closedIds.concat(newIds)
+    nextId = prev.nextId + scan.blocks.length
+    const closedCharLen = lineOffset(lines, scan.nextLine)
+    snapshot = {
+      stablePrefix: content.slice(0, closedCharLen),
+      closed,
+      closedIds,
+      closedCharLen,
+      closedLineCount: scan.nextLine,
+      nextId,
+    }
+  }
+
+  const tailStart = lineOffset(lines, scan.nextLine)
+  const tailText = lines.slice(scan.nextLine).map(l => l.text).join('\n')
+  const tail = parseBlocksTracked(tailText)
+
+  return {
+    closed,
+    closedIds,
+    tailBlocks: tail.blocks,
+    tailOffsets: tail.offsets,
+    tailStart,
+    snapshot,
+  }
 }
 
 interface MarkdownProps {
@@ -418,10 +613,27 @@ interface MarkdownProps {
 }
 
 export default function Markdown({ content, streaming = false }: MarkdownProps) {
-  const blocks = useMemo(() => parseBlocks(content), [content])
+  const cacheRef = useRef<IncrementalCache>(EMPTY_CACHE)
+
+  // 渲染期只读 ref 做纯计算；useEffect 在提交后回写快照（StrictMode 安全）
+  const result = useMemo(
+    () => computeIncremental(content, streaming, cacheRef.current),
+    [content, streaming],
+  )
+
+  useEffect(() => {
+    cacheRef.current = result.snapshot
+  }, [result])
+
   return (
     <div className="md">
-      {renderBlocks(blocks, 'md')}
+      {result.closed.map((block, i) => (
+        <MemoBlock key={`c${result.closedIds[i]}`} block={block} k={`c${result.closedIds[i]}`} />
+      ))}
+      {result.tailBlocks.map((block, i) => {
+        const offset = result.tailStart + result.tailOffsets[i]
+        return <MemoBlock key={`t${offset}`} block={block} k={`t${offset}`} />
+      })}
       {streaming && <span className="md-stream-cursor" />}
     </div>
   )
