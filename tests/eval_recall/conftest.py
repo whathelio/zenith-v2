@@ -4,7 +4,10 @@ import os
 import pathlib
 import sys
 
-import pytest
+try:
+    import pytest
+except ModuleNotFoundError:  # 无 pytest 环境由 run_eval.py 回退执行
+    pytest = None
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -14,24 +17,29 @@ EVAL_DATA = pathlib.Path(os.environ.get("ZENITH_EVAL_DATA", r"D:\dshs\eval_recal
 SNAPSHOT_DB = pathlib.Path(os.environ.get("ZENITH_EVAL_DB", str(EVAL_DATA / "snapshot.db")))
 PILOT_JSON = EVAL_DATA / "pilot.json"
 
-pytestmark = pytest.mark.skipif(
-    not SNAPSHOT_DB.exists() or not PILOT_JSON.exists(),
-    reason="评估快照缺失：先运行 build_dataset.py",
+pytestmark = (
+    pytest.mark.skipif(
+        not SNAPSHOT_DB.exists() or not PILOT_JSON.exists(),
+        reason="评估快照缺失：先运行 build_dataset.py",
+    )
+    if pytest is not None
+    else None
 )
 
 
-@pytest.fixture(scope="session")
-def engine():
-    """memory_engine 模块，其底层 DB_PATH 已指向快照库。"""
-    import backend.database as db
+if pytest is not None:
 
-    db.DB_PATH = SNAPSHOT_DB
-    from backend import memory_engine
+    @pytest.fixture(scope="session")
+    def engine():
+        """memory_engine 模块，其底层 DB_PATH 已指向快照库。"""
+        import backend.database as db
 
-    return memory_engine
+        db.DB_PATH = SNAPSHOT_DB
+        from backend import memory_engine
 
+        return memory_engine
 
-@pytest.fixture(scope="session")
-def dataset():
-    with open(PILOT_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
+    @pytest.fixture(scope="session")
+    def dataset():
+        with open(PILOT_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
