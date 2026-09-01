@@ -611,12 +611,15 @@ export default function ChatView() {
       />
 
       {/* 主聊天区 */}
+      {/* 背景优先级：对话独立背景 > 全局背景（settings.background_image）。
+          未设对话背景时 chat-main 透明，透出 body 上的全局背景（由 GlobalBackground 设置），
+          避免每个对话都要单独设置一次。 */}
       <div className="chat-main" style={convBgImage ? {
         backgroundImage: `url("${convBgImage}")`,
         backgroundSize: 'cover',
         backgroundPosition: 'center',
         backgroundAttachment: 'local',
-      } : undefined}>
+      } : { background: 'transparent' }}>
         {/* 背景图半透明遮罩 — 保证文字可读性 */}
         {convBgImage && <div className="chat-bg-overlay" />}
         {/* 工具条: 标题 + 总结按钮 */}

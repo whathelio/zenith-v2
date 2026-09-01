@@ -259,6 +259,24 @@ async def list_conversations():
     return db.conv_list()
 
 
+# 注意：这两个路由必须定义在 /api/conversations/{conv_id} 之前，
+# 否则 "backgrounds" 会被当作 conv_id 匹配走，导致 404。
+@app.get("/api/conversations/backgrounds")
+async def count_conversation_backgrounds():
+    """统计设置了独立背景的对话数（用于设置页提示是否需要统一清理）"""
+    return {"count": db.conv_count_backgrounds()}
+
+
+@app.delete("/api/conversations/backgrounds")
+async def clear_all_conversation_backgrounds():
+    """清除所有对话的独立背景，统一回落到全局背景设置。
+
+    只清 conversations 表字段，不删 data/backgrounds/ 下的图片文件（保留可恢复性）。
+    """
+    n = db.conv_clear_all_backgrounds()
+    return {"success": True, "cleared": n}
+
+
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation(conv_id: str):
     conv = db.conv_get(conv_id)
@@ -360,6 +378,7 @@ async def clear_conversation_bg(conv_id: str):
                 pass
     db.conv_update_background_image(conv_id, None)
     return {"success": True}
+
 
 
 # ───────────────────────────────────────────────────────────

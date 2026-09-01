@@ -497,6 +497,11 @@ export const api = {
   },
   clearGlobalBackgroundImage: () =>
     request<{ success: boolean }>('/settings/background-image', { method: 'DELETE' }),
+  // 对话独立背景（per-conversation）— 统计与批量清除，用于统一回落到全局背景
+  countConversationBackgrounds: () =>
+    request<{ count: number }>('/conversations/backgrounds'),
+  clearAllConversationBackgrounds: () =>
+    request<{ success: boolean; cleared: number }>('/conversations/backgrounds', { method: 'DELETE' }),
   // 学习对话工厂 — 从笔记/记忆/文档一键创建学习对话
   startLearning: (sourceType: 'note' | 'memory' | 'document', sourceId: number) =>
     request<{ success: boolean; conversation_id: string; title: string }>('/learning/start', {

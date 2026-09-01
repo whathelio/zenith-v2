@@ -58,6 +58,8 @@ export default function SettingsView() {
   const [apiKeyInput, setApiKeyInput] = useState('')  // 独立管理 key 输入
   const [bgPreview, setBgPreview] = useState('')        // 全局背景预览 URL
   const bgInputRef = useRef<HTMLInputElement>(null)
+  const [convBgCount, setConvBgCount] = useState(0)     // 设了独立背景的对话数
+  const [notice, setNotice] = useState('')              // 操作结果提示（非错误）
 
   useEffect(() => { loadSettings() }, [])
 
@@ -73,6 +75,11 @@ export default function SettingsView() {
       // 按 api_base 匹配预设（不要求 model 完全一致）
       const matched = PRESETS.find(p => p.api_base && s.api_base?.startsWith(p.api_base))
       setActivePreset(matched ? matched.id : 'custom')
+      // 有多少对话设了独立背景（>0 才显示「统一清理」入口）
+      try {
+        const cb = await api.countConversationBackgrounds()
+        setConvBgCount(cb.count || 0)
+      } catch { /* 静默：拿不到就不显示该入口 */ }
     } catch (e: any) { setError(e.message) }
     finally { setLoading(false) }
   }
@@ -138,6 +145,30 @@ export default function SettingsView() {
       applyGlobalBg('')
     } catch (err: any) {
       setError('清除背景图失败：' + (err?.message || err))
+    }
+  }
+
+  // 清除所有对话的独立背景，让全局背景统一生效（不删磁盘图片文件）
+  const [clearingConvBg, setClearingConvBg] = useState(false)
+  const handleClearAllConvBg = async () => {
+    const n = convBgCount
+    if (!window.confirm(
+      `确定清除全部 ${n} 个对话的独立背景吗？\n\n` +
+      `清除后这些对话将统一使用上方设置的全局背景。\n` +
+      `（仅清除数据库记录，data/backgrounds/ 下的图片文件保留）`
+    )) return
+    setClearingConvBg(true)
+    try {
+      const r = await api.clearAllConversationBackgrounds()
+      setConvBgCount(0)
+      setError('')
+      window.dispatchEvent(new CustomEvent('zenith:global-bg-change', { detail: '1' }))
+      setNotice(`已清除 ${r.cleared ?? n} 个对话的独立背景，现在统一使用全局背景。`)
+      setTimeout(() => setNotice(''), 4000)
+    } catch (err: any) {
+      setError('清除对话背景失败：' + (err?.message || err))
+    } finally {
+      setClearingConvBg(false)
     }
   }
 
@@ -217,6 +248,35 @@ export default function SettingsView() {
                   )}
                   <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>支持 png/jpg/webp/gif，≤15MB</span>
                 </div>
+                {convBgCount > 0 && (
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8, marginTop: 8,
+                    padding: '6px 10px', borderRadius: 6, fontSize: 12,
+                    background: 'rgba(240,160,48,0.08)', border: '1px solid rgba(240,160,48,0.2)',
+                  }}>
+                    <span style={{ color: 'var(--color-text-secondary)', flex: 1 }}>
+                      ⚠ 有 <b>{convBgCount}</b> 个对话设置了独立背景，会覆盖上面的全局背景
+                    </span>
+                    <button
+                      className="btn btn-sm"
+                      onClick={handleClearAllConvBg}
+                      disabled={clearingConvBg}
+                      title="清除这些对话的独立背景，统一使用全局背景（图片文件保留在 data/backgrounds/）"
+                      style={{ cursor: clearingConvBg ? 'wait' : 'pointer', fontSize: 11 }}
+                    >
+                      {clearingConvBg ? '清理中…' : '🔄 统一使用全局背景'}
+                    </button>
+                  </div>
+                )}
+                {notice && (
+                  <div style={{
+                    marginTop: 8, padding: '6px 10px', borderRadius: 6, fontSize: 12,
+                    background: 'rgba(80,250,123,0.08)', border: '1px solid rgba(80,250,123,0.25)',
+                    color: 'var(--color-accent-success)',
+                  }}>
+                    ✅ {notice}
+                  </div>
+                )}
                 <input
                   ref={bgInputRef}
                   type="file"

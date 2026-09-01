@@ -734,6 +734,30 @@ def conv_update_background_image(cid: str, image_file: str | None):
         c.execute("UPDATE conversations SET background_image = ?, updated_at = ? WHERE id = ?", (image_file, now, cid))
 
 
+def conv_count_backgrounds() -> int:
+    """统计设置了独立背景（图片或世界观）的对话数"""
+    with db() as c:
+        r = c.execute(
+            "SELECT COUNT(*) FROM conversations "
+            "WHERE (background IS NOT NULL AND background != '') "
+            "   OR (background_image IS NOT NULL AND background_image != '')"
+        ).fetchone()
+        return r[0] if r else 0
+
+
+def conv_clear_all_backgrounds() -> int:
+    """清除所有对话的独立背景（图片 + 世界观），统一回落到全局背景设置。
+
+    注意：只清 conversations 表上的字段，不删磁盘上的图片文件（保留可恢复性）。
+    返回受影响的对话数。
+    """
+    n = conv_count_backgrounds()
+    if n:
+        with db() as c:
+            c.execute("UPDATE conversations SET background = NULL, background_image = NULL")
+    return n
+
+
 def conv_update_learning_progress(cid: str, progress: dict | None):
     """更新对话的学习进度（JSON：{doc_id, chunk_index, total_chunks, title}）"""
     import json as _json
