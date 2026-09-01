@@ -7,7 +7,7 @@ from __future__ import annotations
 
 def test_dataset_shape(dataset):
     n = len(dataset["queries"])
-    assert 10 <= n <= 20, f"pilot 应在 10-20 条，当前 {n}"
+    assert 10 <= n <= 50, f"pilot/正式集应在 10-50 条，当前 {n}"
 
 
 def test_queries_unique(dataset):

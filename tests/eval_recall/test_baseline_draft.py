@@ -24,12 +24,36 @@ def _precision_at_k(retrieved: list[int], relevant: list[int], k: int) -> float:
     return len(set(top) & set(relevant)) / len(top)
 
 
+def _normalize(s: str) -> str:
+    import re
+
+    return re.sub(r"\s+", "", s)
+
+
+def _probe_included(injection: str, memory: dict) -> tuple[bool, str]:
+    """截断探针：优先 [ID:n] 锚点；注入未带锚点时退化为归一化内容前缀匹配。"""
+    mid = memory.get("id")
+    anchor = f"[ID:{mid}]"
+    if anchor in injection:
+        return True, "anchor"
+    content = _normalize(memory.get("content") or "")
+    probe = content[:60]
+    if probe and probe in _normalize(injection):
+        return True, "normalized-fallback"
+    return False, "normalized-fallback"
+
+
 def test_baseline_draft(engine, dataset):
     import backend.database as db
 
     per_query = []
+    anchor_supported = False
     for q in dataset["queries"]:
         relevant = [c["memory_id"] for c in q["candidates"]]
+        ngram_only = [c["memory_id"] for c in q["candidates"] if c["sources"] == ["ngram"]]
+        fts_only = [c["memory_id"] for c in q["candidates"] if c["sources"] == ["fts"]]
+        both = [c["memory_id"] for c in q["candidates"] if len(c["sources"]) >= 2]
+
         memories, _notes = engine.search_related_items(
             q["query"], limit=15, include_notes=False
         )
@@ -43,17 +67,23 @@ def test_baseline_draft(engine, dataset):
             "n_retrieved": len(retrieved),
             "recall": {str(k): _recall_at_k(retrieved, relevant, k) for k in (1, 3, 5, 10)},
             "precision": {str(k): _precision_at_k(retrieved, relevant, k) for k in (1, 3, 5, 10)},
+            # 偏置边界：被测系统本身是 n-gram，ngram_only 集对其天然偏乐观；
+            # fts_only 集相对独立，是更可信的 draft 下界。
+            "recall_ngram_only": {str(k): _recall_at_k(retrieved, ngram_only, k) for k in (1, 3, 5, 10)},
+            "recall_fts_only": {str(k): _recall_at_k(retrieved, fts_only, k) for k in (1, 3, 5, 10)},
+            "recall_both": {str(k): _recall_at_k(retrieved, both, k) for k in (1, 3, 5, 10)},
         }
 
-        # 1500 字符注入截断口径（draft 版）
         injection = engine.build_memory_injection(q["query"])
+        if "[ID:" in injection:
+            anchor_supported = True
         missing_ids = []
         for cid in relevant:
             m = db.mem_get(cid)
             if not m:
                 continue
-            probe = (m.get("content") or "").strip()[:60]
-            if probe and probe not in injection:
+            ok, _mode = _probe_included(injection, m)
+            if not ok:
                 missing_ids.append(cid)
         row["injection_chars"] = len(injection)
         row["candidates_missing_from_injection"] = missing_ids
@@ -71,6 +101,14 @@ def test_baseline_draft(engine, dataset):
             str(k): round(sum(r["precision"][str(k)] for r in per_query) / n, 4)
             for k in (1, 3, 5, 10)
         },
+        "avg_recall_ngram_only": {
+            str(k): round(sum(r["recall_ngram_only"][str(k)] for r in per_query) / n, 4)
+            for k in (1, 3, 5, 10)
+        },
+        "avg_recall_fts_only": {
+            str(k): round(sum(r["recall_fts_only"][str(k)] for r in per_query) / n, 4)
+            for k in (1, 3, 5, 10)
+        },
         "query_level_truncation_rate": round(
             sum(1 for r in per_query if r["truncated"]) / n, 4
         ),
@@ -79,7 +117,8 @@ def test_baseline_draft(engine, dataset):
             / max(1, sum(r["n_relevant"] for r in per_query)),
             4,
         ),
-        "label_status": "draft（机器初标，未人工确认）",
+        "probe_mode": "anchor" if anchor_supported else "normalized-fallback",
+        "label_status": "draft（机器初标，未人工确认；recall 存在系统性乐观偏差，正式基线以人工确认为准）",
     }
 
     out = conftest.EVAL_DATA / "baseline_draft.json"
@@ -94,4 +133,6 @@ def test_baseline_draft(engine, dataset):
     for k in (1, 3, 5, 10):
         assert 0.0 <= metrics["avg_recall"][str(k)] <= 1.0
         assert 0.0 <= metrics["avg_precision"][str(k)] <= 1.0
+        assert 0.0 <= metrics["avg_recall_ngram_only"][str(k)] <= 1.0
+        assert 0.0 <= metrics["avg_recall_fts_only"][str(k)] <= 1.0
     assert 0.0 <= metrics["query_level_truncation_rate"] <= 1.0

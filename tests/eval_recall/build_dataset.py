@@ -28,7 +28,7 @@ PROD_DB = pathlib.Path(os.environ.get("ZENITH_DB_PATH", str(REPO_ROOT / "data" /
 EVAL_DATA = pathlib.Path(os.environ.get("ZENITH_EVAL_DATA", r"D:\dshs\eval_recall"))
 SNAPSHOT_DB = pathlib.Path(os.environ.get("ZENITH_EVAL_DB", str(EVAL_DATA / "snapshot.db")))
 
-TARGET_N = 16          # pilot 10-20 范围内取 16
+TARGET_N = int(os.environ.get("ZENITH_EVAL_N", "32"))  # 正式集 30-50 区间取 32
 HALF_N = TARGET_N // 2
 MAX_CANDIDATES = 10    # 每条查询给人工审查的候选上限
 
@@ -74,7 +74,7 @@ def load_messages() -> list[dict]:
     for r in rows:
         d = dict(r)
         text = (d.get("content") or "").strip().replace("\n", " ")
-        if not (8 <= len(text) <= 80):
+        if not (6 <= len(text) <= 80):
             continue
         if not re.search(r"[\u4e00-\u9fff]", text):
             continue
@@ -87,8 +87,7 @@ def load_messages() -> list[dict]:
             continue
         if re.match(r"^(回复|请回复|总结一下|请总结|今天关键词)", text):
             continue
-        if not INTERROGATIVE_RE.search(text):
-            continue
+        # 正式集放宽：非问句但具主题特异性的指令也纳入（标注阶段由人工判定相关性）
         d["text"] = text
         d["hit_ids"] = _score_hits(text, mems)
         d["hit_count"] = len(d["hit_ids"])
@@ -103,7 +102,7 @@ def _score_hits(text: str, mems: list[dict]) -> set[int]:
 
     hits: set[int] = set()
     segs = [s for s in _extract_keywords(text)[:6] if s.lower() not in GENERIC_SEGMENTS]
-    if len(segs) < 2:
+    if len(segs) < 1:
         return set()
     for seg in segs:
         for m in mems:
@@ -126,6 +125,16 @@ def select_queries(messages: list[dict]) -> list[dict]:
     half1 = [m for m in messages if m["created_at"] < median]
     half2 = [m for m in messages if m["created_at"] >= median]
 
+    def _bands(bucket):
+        return {
+            "band_2_60": len([m for m in bucket if 2 <= m["hit_count"] <= 60]),
+            "band_1": len([m for m in bucket if m["hit_count"] == 1]),
+            "band_60plus": len([m for m in bucket if m["hit_count"] > 60]),
+            "band_0": len([m for m in bucket if m["hit_count"] == 0]),
+        }
+
+    print(f"[bands] half1={_bands(half1)} half2={_bands(half2)}")
+
     def pick(bucket: list[dict], n: int) -> list[dict]:
         picked, seen_conv, seen_text = [], set(), set()
 
@@ -140,9 +149,10 @@ def select_queries(messages: list[dict]) -> list[dict]:
                 seen_conv.add(m["conversation_id"])
                 seen_text.add(key)
 
-        take([m for m in bucket if 2 <= m["hit_count"] <= 60])
-        take([m for m in bucket if m["hit_count"] >= 1])
-        take([m for m in bucket if m["hit_count"] == 0])
+        take([m for m in bucket if 2 <= m["hit_count"] <= 60])   # 优选：主题特异性
+        take([m for m in bucket if m["hit_count"] == 1])          # 次选：弱特异性
+        take([m for m in bucket if m["hit_count"] > 60])          # 宽泛但有主题
+        take([m for m in bucket if m["hit_count"] == 0])          # 硬对照（预期无相关）
         return picked
 
     chosen = pick(half1, HALF_N) + pick(half2, HALF_N)
