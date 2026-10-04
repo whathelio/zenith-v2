@@ -99,6 +99,14 @@ def import_entities(top_n: int = 300, dry_run: bool = False):
     conn.commit()
     conn.close()
     print(f"导入 {imported} 个实体（跳过已存在 {skipped}）")
+    # 2026-09-11 备注（审计发现 B6）：
+    #   本脚本是唯一绕过 `backend.database.mem_add` 直接写 memories 的路径（其余调用点
+    #   2026-09-11 起已由 mem_add 内置门禁统一覆盖）。此处保留精确内容 + source_conv_id 的
+    #   幂等判据 —— 对「确定性批量灌入」这是恰当的（重跑不会翻倍）。
+    #   ⚠️ 但真正的问题不是去重，而是**层级**：KG 实体属于知识图谱/RAG 层，
+    #      塞进 memories 只是把 schema.check 里的 'fact' 当垃圾桶用。
+    #      这 300 条模板句（`X——类型（…出现 N 次）`）会稀释记忆检索。
+    #      处置方式（迁回 RAG 层 / 归档 / 保留）属数据层决策，未在本次改动中擅自处理。
 
 
 def stats():

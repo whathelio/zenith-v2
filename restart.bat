@@ -25,9 +25,9 @@ REM 2. wait for port release
 echo [2/3] Waiting for port release...
 timeout /t 3 /nobreak >nul
 
-REM 3. start new instance
+REM 3. start new instance (--detach: start.py self-detaches, no lingering parent shell)
 echo [3/3] Starting new instance...
-start "" /D "%PROJECT_DIR%" "%PYTHON_EXE%" "%PROJECT_DIR%start.py"
+"%PYTHON_EXE%" "%PROJECT_DIR%start.py" --detach
 
 echo.
 echo ============================================

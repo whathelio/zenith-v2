@@ -70,7 +70,7 @@ python task_worker.py --dry-run --max-tasks 1
 # 正式跑
 export LLM_API_KEY="sk-..."
 export LLM_BASE_URL="https://api.deepseek.com/v1"
-export LLM_MODEL="deepseek-v4-pro"
+export LLM_MODEL="deepseek-flash"
 python task_worker.py
 ```
 

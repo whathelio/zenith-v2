@@ -18,7 +18,7 @@ set "ZENITH_RAG_EMBED_MODEL=%~dp0..\bge-small-model"
 set "ZENITH_RAG_WORK_DIR=%~dp0..\zenith_rag_new"
 set "ZENITH_API_KEY=test-key"
 set "LLM_BASE_URL=https://api.deepseek.com/v1"
-set "LLM_MODEL=deepseek-v4-flash"
+set "LLM_MODEL=deepseek-flash"
 
 rem reuse zenith's LLM key from .env
 if exist "%~dp0.env" (

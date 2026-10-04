@@ -79,7 +79,7 @@ export ZENITH_API_KEY="your-token"
 export ZENITH_API_PORT=8788
 export LLM_API_KEY="sk-..."          # /wiki 需要
 export LLM_BASE_URL="https://api.deepseek.com/v1"
-export LLM_MODEL="deepseek-v4-pro"
+export LLM_MODEL="deepseek-flash"
 
 # 启动中台
 .venv/Scripts/python.exe api_gateway.py

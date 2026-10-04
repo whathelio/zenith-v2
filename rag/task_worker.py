@@ -7,7 +7,7 @@ Zenith 异步任务 worker
 用法：
     export LLM_API_KEY="sk-..."
     export LLM_BASE_URL="https://api.deepseek.com/v1"
-    export LLM_MODEL="deepseek-v4-pro"
+    export LLM_MODEL="deepseek-flash"
 
     # 正式跑（阻塞轮询）
     python task_worker.py
@@ -24,8 +24,6 @@ from __future__ import annotations
 import argparse
 import io
 import contextlib
-import os
-from pathlib import Path
 
 from task_queue import TaskQueue, DEFAULT_DB
 

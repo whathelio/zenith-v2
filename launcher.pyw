@@ -13,11 +13,16 @@ import os
 import time
 import urllib.request
 import json
-import webbrowser
 import ctypes
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.resolve()
+
+# 统一的「打开浏览器」入口（2026-10-03）：与 start.py 共用同一个 helper，
+# 支持 config.yaml 的 browser 段显式指定浏览器（例如 Tabbit），不再受系统默认浏览器摆布。
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+from browser_launcher import open_url as _open_browser_url  # noqa: E402
 PYTHONW = PROJECT_DIR / ".venv" / "Scripts" / "pythonw.exe"
 PYTHON = PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
 START_PY = PROJECT_DIR / "start.py"
@@ -109,8 +114,7 @@ def main():
             log("already healthy, browser cooldown, skip")
         else:
             _write_browser_ts()
-            webbrowser.open(f"http://127.0.0.1:{PORT}/")
-            log("already healthy, opened browser")
+            log(f"opened browser via {_open_browser_url(f'http://127.0.0.1:{PORT}/')}")
         log("already running, launcher done")
         sys.exit(0)
 
@@ -147,7 +151,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         import traceback
         tb = traceback.format_exc()
         log(f"FATAL: {tb}")

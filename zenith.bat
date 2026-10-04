@@ -53,8 +53,10 @@ if not exist "%START_PY%" (
     exit /b 1
 )
 
-REM launch Zenith; pass all args through to start.py
-start "" /D "%PROJECT_DIR%" "%PY_EXE%" "%START_PY%" %*
+REM launch Zenith detached via start.py --detach
+REM (single entry point for both bat and scripts/shell; --detach also makes sure
+REM  the parent shell exits immediately instead of waiting for the resident watchdogs)
+"%WAIT_EXE%" "%START_PY%" --detach %*
 
 REM double-click feedback: wait for readiness and show result
 "%WAIT_EXE%" "%START_PY%" --wait --wait-timeout 25

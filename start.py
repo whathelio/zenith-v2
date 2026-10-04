@@ -4,7 +4,9 @@
 
 CLI:
     python start.py [PORT] [--no-browser] [--browser-delay N] [--verbose]
-    python start.py --stop
+    python start.py --detach            # 守护化：后台启动后立即返回（脚本/自动化入口）
+    python start.py --stop              # 停止实例（含中台与 worker）
+    python start.py --stop --keep-aux   # 只停主服务，保留中台与 worker
     python start.py --status
     python start.py --reset-lock
 """
@@ -14,8 +16,11 @@ from __future__ import annotations
 import sys
 import os
 
-# pythonw.exe 无控制台，必须在最早阶段捕获 stdout/stderr，否则导入期异常会静默丢失。
-if sys.executable and sys.executable.lower().endswith("pythonw.exe"):
+# pythonw.exe / --detach 无控制台，必须在最早阶段捕获 stdout/stderr，否则导入期异常会静默丢失。
+if sys.executable and (
+    sys.executable.lower().endswith("pythonw.exe")
+    or os.environ.get("ZENITH_DETACHED") == "1"
+):
     try:
         _early_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zenith.log")
         _early_log_stream = open(_early_log_path, "a", encoding="utf-8", errors="replace")
@@ -31,7 +36,6 @@ import logging
 import argparse
 import asyncio
 import signal
-import webbrowser
 import threading
 import faulthandler
 import socket
@@ -42,10 +46,19 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 PROJECT_DIR = Path(__file__).parent.resolve()
+
+# 统一的「打开浏览器」入口（2026-10-03）：支持 config.yaml 的 browser 段显式指定浏览器，
+# 不再受系统默认浏览器摆布 —— 根因与回退语义详见 browser_launcher.py 的模块 docstring。
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+from browser_launcher import open_url as _open_browser_url  # noqa: E402
+
 _LOG_FILE = PROJECT_DIR / "zenith.log"
 _LOCK_FILE = Path(tempfile.gettempdir()) / "zenith_v2.lock"
 _PID_FILE = Path(tempfile.gettempdir()) / "zenith_v2.pid"
 _BROWSER_TS_FILE = PROJECT_DIR / ".zenith.browser"
+# 退出标记：记录「上次是否干净退出」，供下次启动自检（O-03 方案 A 的轻量补偿）。
+_EXIT_MARKER_FILE = PROJECT_DIR / "data" / "last_exit.json"
 _BROWSER_COOLDOWN_SECONDS = 5
 _HEALTH_TIMEOUT_SECONDS = 20
 
@@ -83,6 +96,15 @@ def _is_running_under_pythonw() -> bool:
     return Path(sys.executable).name.lower().startswith("pythonw")
 
 
+def _is_detached() -> bool:
+    """是否由 --detach 守护化启动。
+
+    --detach 的子进程没有控制台（stdout/stderr 指向 DEVNULL），日志处理需要
+    与 pythonw 走同一条「重定向到日志文件」的分支，否则崩溃现场无处可查。
+    """
+    return os.environ.get("ZENITH_DETACHED") == "1"
+
+
 def _pick_log_file() -> Path:
     """选择一个可写的日志文件。
 
@@ -99,14 +121,35 @@ def _pick_log_file() -> Path:
             continue
     return _LOG_FILE
 
+
+# ⚠️ 模块级 logger —— **必须在此定义，不要指望函数内临时取**（2026-09-22 修复）
+#
+# 本文件有 10 个函数在内部**直接使用 `logger`**：
+#   `_acquire_instance_lock` / `_cleanup_lock_and_pid` / `_write_pid_file` /
+#   `_find_processes_by_port` / `_find_zenith_processes` / `_kill_process` /
+#   `_spawn_aux_services` / `_aux_services_watchdog` / `_first_run_setup` / `stop_existing_instance`
+# 但原先只有 3 处（`stop_existing_instance` / `_self_health_watchdog` / `main`）各自在函数内
+# 临时 `logging.getLogger(...)` —— 其余函数一旦执行到 logger 那一行就 `NameError`。
+#
+# 为什么长期没被发现：那些调用**绝大多数位于 `except` 分支**（如 `logger.debug("wmic 查询失败")`），
+# 只有真出错才走到；而 Win11 24H2+ 已移除 `wmic` → 「wmic 必然失败 → except → NameError」成为必然崩溃。
+#
+# 实测影响：`python start.py --stop` 必然**中途崩溃**（崩点是命令行匹配那步的 wmic 兜底），
+# 导致后面的 `_cleanup_lock_and_pid()` / `_mark_intentional_stop()` 都不执行 →
+# 锁不清、`last_exit.json` 停在 "running"（下次启动误报「被硬杀」）。
+#
+# 修法：模块级定义一次即可（`getLogger` 返回单例；函数内的同名局部定义只会 shadow，无害）。
+logger = logging.getLogger("zenith.start")
+
+
 def _setup_logging(verbose: bool = False):
     """配置日志。pythonw 下将 stdout/stderr 重定向到日志文件，避免崩溃无声。"""
     level = logging.DEBUG if verbose else logging.INFO
     log_file = _pick_log_file()
     handlers: list[logging.Handler] = [logging.FileHandler(str(log_file), encoding="utf-8", mode="a")]
 
-    # pythonw 没有控制台；普通 python 仍可在终端看到输出
-    if not _is_running_under_pythonw():
+    # pythonw / --detach 都没有控制台；普通 python 仍可在终端看到输出
+    if not (_is_running_under_pythonw() or _is_detached()):
         handlers.append(logging.StreamHandler())
     else:
         # 捕获 print 与未处理异常，写入同一日志文件
@@ -221,12 +264,22 @@ def _acquire_instance_lock(port: int) -> Tuple[Optional[int], bool]:
 
 
 def _is_stale_lock(port: int) -> bool:
-    """判断当前锁是否为僵尸：端口空闲 或 PID 文件指向的进程已不存在。"""
+    """判断当前锁是否为僵尸。
+
+    ⚠️ 2026-09-11 修正：原判据是 `端口空闲 or PID 已死`（**或**）。
+    启动早期存在一个窗口：「锁已持有、PID 已写、但 uvicorn 尚未绑定端口」，
+    此时 `端口空闲 == True` 会把**活锁**判成僵尸 → 第二个实例删锁重抢 → 双实例。
+    这正是「每次点击反复启动」的根因。
+
+    改为「**且**」语义：只有 PID 记录不存在/已死、**并且**端口也没人听，才认定僵尸。
+    PID 复用导致误判「已在运行」时，用 `--reset-lock` 可强制清除（逃生门已存在）。
+    """
     pid = _read_pid_file()
-    port_free = not _is_port_in_use(port)
-    pid_dead = pid is not None and not _process_exists(pid)
-    # 端口空闲即大概率是僵尸；PID 死亡也确认是僵尸
-    return port_free or pid_dead
+    if pid is not None and _process_exists(pid):
+        return False                      # 持锁者活着 → 不是僵尸（哪怕端口还没起来）
+    if _is_port_in_use(port):
+        return False                      # 端口有人听 → 有实例在跑 → 不是僵尸
+    return True
 
 
 def _cleanup_lock_and_pid():
@@ -266,6 +319,20 @@ def _write_browser_ts():
         pass
 
 
+def _open_browser(url: str) -> None:
+    """打开浏览器（走 browser_launcher，可被 config.yaml 的 browser 段指定为 Tabbit 等）。
+
+    统一入口的意义：原先三处直接调 `webbrowser.open()`，等于把「开哪个浏览器」交给
+    系统默认关联；现在三处共用同一个 helper，改一次全局生效 —— 见 code-governance-workflow
+    §5b.11「修完一处，必须全库搜同形逻辑」。
+    """
+    try:
+        how = _open_browser_url(url)
+        logger.info("已打开浏览器（%s）: %s", how, url)
+    except Exception as e:  # noqa: BLE001 —— 开浏览器失败不该拖垮服务启动
+        logger.warning("打开浏览器失败: %s", e)
+
+
 def _wait_for_health(port: int, timeout: float = _HEALTH_TIMEOUT_SECONDS) -> bool:
     """等待后端健康检查通过。"""
     url = f"http://127.0.0.1:{port}/api/health"
@@ -299,7 +366,13 @@ def _find_processes_by_port(port: int) -> list[int]:
                 errors="replace",
             )
             for line in result.stdout.splitlines():
-                if f":{port}" in line and ("LISTENING" in line or "ESTABLISHED" in line):
+                # ⚠️ 2026-09-11 修正：**只认 LISTENING**。
+                # netstat -ano 对每条连接会输出**两行**（服务端一行、客户端一行），
+                # 两行的本地/外部地址里都含 ":port"。原判据把 ESTABLISHED 也算占用者，
+                # 就会把**客户端进程**的 PID 收进来 —— 真实场景下客户端是**浏览器**，
+                # 于是 `--stop` 会 taskkill 掉用户的浏览器。
+                # 实测：保持一个客户端连接时，本函数返回 [服务端PID, 客户端PID]。
+                if f":{port}" in line and "LISTENING" in line:
                     parts = line.strip().split()
                     if parts:
                         try:
@@ -427,7 +500,6 @@ def _kill_process(pid: int) -> bool:
                 return True
             time.sleep(0.5)
             return not _process_exists(pid)
-            return True
         except Exception as e:
             logger.debug("taskkill 失败 PID=%d: %s", pid, e)
             return False
@@ -448,8 +520,21 @@ def _kill_process(pid: int) -> bool:
             return False
 
 
-def stop_existing_instance(port: int = DEFAULT_PORT) -> dict:
-    """停止已运行的 Zenith 实例（含知识库中台与任务 worker），返回清理摘要。"""
+def stop_existing_instance(port: int = DEFAULT_PORT, keep_aux: bool = False) -> dict:
+    """停止已运行的 Zenith 实例，返回清理摘要。
+
+    keep_aux=False（默认）：连知识库中台(8788) 与任务 worker 一并停掉 —— 彻底清场。
+    keep_aux=True ：只停主服务，保留中台与 worker，避免打断正在跑的文档入库任务。
+    """
+    # ⚠️ 2026-09-22 修复：本函数原先**直接引用模块级 `logger`**，但本文件并没有模块级 logger
+    # （全文模式是每个函数内部各自 `logging.getLogger("zenith.start")`，见 L770/870/922/1146）。
+    # 于是本函数内 4 处 logger 调用（原 L504 / L508 / L513 / L522）都会 `NameError`：
+    #   · 以库方式调用 `stop_existing_instance(keep_aux=True)` → **必崩**在 keep_aux 分支；
+    #   · `python start.py --stop` 只要走到「端口占用者被成功终止」或「命令行匹配命中」也会崩。
+    # 崩点位于 `_cleanup_lock_and_pid()` / `_mark_intentional_stop()` **之前** →
+    # 锁不清、`last_exit.json` 停在 "running"（下次启动误报「被硬杀」）。
+    # 修法：与全文其它函数保持一致，在本函数内取 logger。
+    logger = logging.getLogger("zenith.start")
     summary = {"pid_file": None, "by_port": [], "by_name": [], "lock_cleared": False, "errors": []}
 
     # 1. PID 文件
@@ -462,30 +547,44 @@ def stop_existing_instance(port: int = DEFAULT_PORT) -> dict:
             summary["errors"].append(f"PID={pid} 终止失败")
 
     # 2. 端口占用（主服务 8766 + 知识库中台 8788）
+    #    注：_find_processes_by_port 现在只返回 LISTENING 的持有者，不再误收客户端进程。
     for p in _find_processes_by_port(port):
         if _kill_process(p):
             summary["by_port"].append(p)
+            logger.info("已终止占用端口 %d 的进程 PID=%d", port, p)
         else:
             summary["errors"].append(f"端口占用 PID={p} 终止失败")
-    for p in _find_processes_by_port(_GATEWAY_PORT):
-        if _kill_process(p):
-            summary["by_port"].append(p)
-        else:
-            summary["errors"].append(f"中台端口占用 PID={p} 终止失败")
+    if keep_aux:
+        logger.info("--keep-aux：保留知识库中台(%d)与任务 worker", _GATEWAY_PORT)
+    else:
+        for p in _find_processes_by_port(_GATEWAY_PORT):
+            if _kill_process(p):
+                summary["by_port"].append(p)
+                logger.info("已终止占用端口 %d 的进程 PID=%d", _GATEWAY_PORT, p)
+            else:
+                summary["errors"].append(f"中台端口占用 PID={p} 终止失败")
 
     # 3. 命令行匹配兜底（start.py / api_gateway.py / task_worker.py）
+    #    ⚠️ 这是**全机子串匹配**（'*start.py*'），无法区分是哪个项目的 start.py，
+    #    多会话 / 多项目并行时有误杀风险。故逐条记 WARNING 并带 PID，便于事后审计。
+    #    （更彻底的修法需要"项目级判别标识"，见 audit 报告 §9 —— 未验证前不盲改。）
     for p in _find_zenith_processes():
+        logger.warning("命令行匹配命中 'start.py'，准备终止 PID=%d（请确认不是别的项目）", p)
         if _kill_process(p):
             summary["by_name"].append(p)
-    for p in _find_zenith_processes(marker="api_gateway.py"):
-        if _kill_process(p):
-            summary["by_name"].append(p)
-    for p in _find_zenith_processes(marker="task_worker.py"):
-        if _kill_process(p):
-            summary["by_name"].append(p)
+    if not keep_aux:
+        for p in _find_zenith_processes(marker="api_gateway.py"):
+            if _kill_process(p):
+                summary["by_name"].append(p)
+        for p in _find_zenith_processes(marker="task_worker.py"):
+            if _kill_process(p):
+                summary["by_name"].append(p)
 
     _cleanup_lock_and_pid()
     summary["lock_cleared"] = True
+    # 这里是**操作者主动停止**，但进程是被 taskkill /F 硬杀的，main() 的 finally 跑不到，
+    # 退出标记会停留在 running → 下次启动会误报「被硬杀」。故在此代为落一个 clean 标记。
+    _mark_intentional_stop()
     return summary
 
 
@@ -605,7 +704,7 @@ def _build_aux_env() -> dict:
     if llm_key:
         env.setdefault("LLM_API_KEY", llm_key)
     env.setdefault("LLM_BASE_URL", _read_provider_setting("api_base") or "https://api.deepseek.com/v1")
-    env.setdefault("LLM_MODEL", _read_provider_setting("model") or "deepseek-v4-flash")
+    env.setdefault("LLM_MODEL", _read_provider_setting("model") or "deepseek-flash")
     return env
 
 
@@ -682,6 +781,82 @@ def _spawn_aux_services():
         logger.debug("task_worker 跳过（脚本缺失/已运行）")
 
 
+def _detach_runner() -> str:
+    """守护化自举所用的解释器：**必须用控制台版 python.exe**。
+
+    实测结论（2026-09-10，本机 Windows 11）：venv 的 `Scripts\\pythonw.exe` 是
+    启动器 stub，在 `DETACHED_PROCESS` 下会静默退出 —— 子进程连一行启动横幅都
+    来不及写就没了，日志无任何痕迹。改用同目录的 python.exe 后，脱离式启动
+    完全正常。
+
+    不会因此弹出控制台窗口：`DETACHED_PROCESS` 本身就不为子进程创建控制台。
+    若父进程是 pythonw，这里显式换成同目录的 python.exe。
+    """
+    exe = Path(sys.executable)
+    if sys.platform == "win32" and exe.name.lower().startswith("pythonw"):
+        console_exe = exe.with_name("python.exe")
+        if console_exe.exists():
+            return str(console_exe)
+    return str(exe)
+
+
+def _spawn_detached(port: int) -> bool:
+    """以脱离父进程的方式在后台重新拉起自己，本进程立即返回（守护化）。
+
+    为什么需要它：start.py 内建两个常驻 watchdog 线程（辅助服务守护、主服务自我
+    健康守护），主进程必须长期存活。因此任何「非双击」入口若直接调用 start.py，
+    调用方（shell / CI / 自动化）会一直阻塞等待，直到整个服务退出为止。
+
+    实现要点（两条都不能少，否则调用方仍会挂起）：
+    - 子进程用 DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP 启动，脱离父进程组，
+      否则 shell 会等待整个进程组；
+    - stdin/stdout/stderr 全部指向 DEVNULL。若子进程继承了调用方的管道句柄，
+      调用方读取管道时会一直等不到 EOF。
+
+    注意：DETACHED_PROCESS 只脱离「控制台/进程组」，**挡不住 Windows Job Object**。
+    若调用方把本进程放进了作业对象（例如某些 IDE / 沙箱 / CI 的进程包装），作业
+    对象被销毁时子进程会一并被终结。这是宿主环境的行为，脚本层无法规避。
+    """
+    lg = logging.getLogger("zenith.start")
+    script = Path(__file__).resolve()
+    # --detach 不传给子进程（否则无限自举），其余参数原样透传
+    child_args = [a for a in sys.argv[1:] if a != "--detach"]
+    cmd = [_detach_runner(), str(script), *child_args]
+
+    # 标记「无控制台运行」，让子进程的日志走重定向到文件的分支
+    child_env = os.environ.copy()
+    child_env["ZENITH_DETACHED"] = "1"
+
+    if sys.platform == "win32":
+        popen_kwargs: dict = {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+        }
+    else:
+        popen_kwargs = {"start_new_session": True}
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_DIR),
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            **popen_kwargs,
+        )
+    except Exception as e:
+        lg.exception("守护化启动失败: %s", e)
+        print(f"[FAIL] Zenith 后台启动失败: {e}")
+        return False
+
+    print(f"[OK] Zenith 已在后台启动 (PID={proc.pid})")
+    print(f"     地址: http://localhost:{port}")
+    print(f"     日志: {_LOG_FILE}")
+    print("     停止: python start.py --stop")
+    return True
+
+
 def _aux_services_watchdog(stop_event: threading.Event):
     """辅助服务 watchdog：定期检查 api_gateway / task_worker 存活，死了自动重启。
 
@@ -733,17 +908,160 @@ _SELF_WATCHDOG_INTERVAL = 20
 _SELF_WATCHDOG_MAX_FAILS = 4
 
 
-def _self_health_watchdog(port: int):
+def _flush_pending_memories_sync(timeout: float = 10.0) -> bool:
+    """在独立事件循环中同步等待「待提取记忆」落库（硬退出前的数据保全）。
+
+    背景：self-watchdog 判定服务假死时用 os._exit(70) 硬退出，这会**跳过** main()
+    的 finally 分支（其中含 flush_all_pending_memories()），导致对话 buffer 里最后
+    1~2 轮的待提取记忆直接丢失。这里在退出前尽力补一次 flush。
+
+    返回 True 表示 flush 正常完成；False 表示导入失败/异常/超时（均不抛出）。
+    """
+    lg = logging.getLogger("zenith.start")
+    try:
+        from backend.memory_engine import flush_all_pending_memories
+    except Exception as e:
+        lg.warning("退出前 flush 跳过（导入失败）: %s", e)
+        return False
+
+    try:
+        asyncio.run(asyncio.wait_for(flush_all_pending_memories(), timeout=timeout))
+        lg.info("退出前 flush 完成，待提取记忆已落库")
+        return True
+    except Exception as e:
+        lg.warning("退出前 flush 未完成（%s）: %s", type(e).__name__, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 退出标记（O-03 方案 A 的轻量补偿）
+# ---------------------------------------------------------------------------
+# 背景：self-watchdog 用 os._exit(70) 硬退出，宿主 Job Object 硬杀进程时更是连
+# finally 都跑不到 —— 两种情况都会「无声消失」，只能靠用户发现页面打不开来察觉。
+# 补偿做法：进程存活期间标记写 running；干净退出覆盖为 clean；自杀写 watchdog_suicide。
+# 下次启动读到非 clean（尤其 running = 上次被硬杀）就显式告警，让「消失」变得可见。
+_EXIT_REASON_RUNNING = "running"
+_EXIT_REASON_CLEAN = "clean"
+_EXIT_REASON_SUICIDE = "watchdog_suicide"
+_EXIT_REASON_EXCEPTION = "exception"
+
+# 本进程开始服务的时刻（main() 进入服务态时赋值），用于退出标记
+_SERVICE_STARTED_AT = ""
+
+
+def _write_exit_marker(reason: str, detail: str = "") -> None:
+    """写/覆盖退出标记。失败只告警，不影响主流程。"""
+    try:
+        _EXIT_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "reason": reason,
+            "pid": os.getpid(),
+            "started_at": _SERVICE_STARTED_AT,
+            "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "detail": detail[:500],
+        }
+        _EXIT_MARKER_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logging.getLogger("zenith.start").warning("写退出标记失败: %s", e)
+
+
+def _check_previous_exit() -> None:
+    """启动自检：上次若未干净退出则显式告警（不阻断启动）。"""
+    lg = logging.getLogger("zenith.start")
+    if not _EXIT_MARKER_FILE.exists():
+        return
+    try:
+        prev = json.loads(_EXIT_MARKER_FILE.read_text(encoding="utf-8", errors="replace"))
+    except Exception as e:
+        lg.warning("读取上次退出标记失败（忽略）: %s", e)
+        return
+
+    reason = prev.get("reason", "unknown")
+    started = prev.get("started_at", "?")
+    written = prev.get("written_at", "?")
+    pid = prev.get("pid", "?")
+
+    if reason == _EXIT_REASON_CLEAN:
+        return
+    if reason == _EXIT_REASON_RUNNING:
+        lg.warning(
+            "上次运行（PID=%s，启动于 %s）**未记录退出** → 被硬杀或进程崩溃，非正常关闭。"
+            "可能原因：宿主 Job Object 连坐、系统强制结束、断电。若数据异常请查该时段日志。",
+            pid, started,
+        )
+    elif reason == _EXIT_REASON_SUICIDE:
+        lg.warning(
+            "上次运行被 self-watchdog 判定假死并强制退出（PID=%s，退出于 %s）。"
+            "线程栈见 data/watchdog_stack_*.log，查清卡点后再重启。",
+            pid, written,
+        )
+    elif reason == _EXIT_REASON_EXCEPTION:
+        lg.warning("上次运行因异常退出（PID=%s，退出于 %s）：%s", pid, written, prev.get("detail", ""))
+    else:
+        lg.warning("上次退出原因未知（%s，PID=%s，退出于 %s）", reason, pid, written)
+
+
+def _mark_intentional_stop() -> None:
+    """由 `--stop` 代为落 clean 标记（进程被 taskkill /F 硬杀，自己写不了）。
+
+    保留原标记里的 pid / started_at，便于日志里看出「停的是哪一次运行」。
+    """
+    prev: dict = {}
+    try:
+        if _EXIT_MARKER_FILE.exists():
+            prev = json.loads(_EXIT_MARKER_FILE.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        prev = {}
+    try:
+        _EXIT_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "reason": _EXIT_REASON_CLEAN,
+            "pid": prev.get("pid"),
+            "started_at": prev.get("started_at", ""),
+            "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "detail": "由 start.py --stop 主动停止",
+        }
+        _EXIT_MARKER_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logging.getLogger("zenith.start").warning("写停止标记失败: %s", e)
+
+
+def _self_health_watchdog(port: int, stop_event: threading.Event):
     """主服务自我健康守护：事件循环卡死/服务假死时，先 dump 全部线程栈，再强制退出。
 
-    退出后由外部 supervisor（zenith-watchdog.ps1）拉起；即使没有外部 supervisor，
-    至少留下了卡死现场的线程栈文件，便于定位 18:06 这类 50 分钟 CPU 空转问题。
+    退出流程：dump 线程栈 → 尽力 flush 待提取记忆（10s 上限）→ os._exit(70)。
+
+    ⚠️ 能力边界（2026-09-10 实测，**推翻**旧注释里的 GIL 论断）
+    ------------------------------------------------------------------
+    旧注释称「纯 Python 死循环不释放 GIL，同进程线程抢不到 GIL」—— **该说法是错的**。
+    CPython 的 eval loop 每 sys.getswitchinterval()（本机 5ms）检查一次 eval breaker
+    并释放 GIL，故纯 Python 自旋不会饿死本线程。实测 `tools/audit/g04_gil_probe.py`：
+      · 纯 Python 自旋 → 本线程 tick 14/15，最大空档 221ms（正常调度）
+      · C 层长循环独占 → tick 3/15，最大空档 1148ms ≈ 单次 sum(range(1e8)) 耗时（被饿死）
+
+    故真正盲区是后者极端化：**单次不释放 GIL 的 C 层调用**（超大 numpy/pandas 运算、
+    超大 JSON 序列化、re 灾难性回溯…）持续超过
+    _SELF_WATCHDOG_INTERVAL × _SELF_WATCHDOG_MAX_FAILS 时，本线程同样被饿死。
+    该场景只能靠独立进程探活 / 外部 supervisor；本文件用退出标记 + 下次启动自检补偿
+    （见 `_write_exit_marker` / `_check_previous_exit`）。
+
+    历史战绩：2026-08-25 20:35 / 20:40 / 20:53 三次成功触发，三份线程栈**完全同源**，
+    均卡在 chat.py:_process_conv → tools.py:_handle_consolidate_memories →
+    generate_consolidate_plan → memory_engine._similarity → _shared_text_vectors，
+    即 consolidate 的 O(n²) 相似度比较**同步跑在事件循环线程里**。该根因已于同日修复
+    （3-gram 倒排剪枝 + asyncio.to_thread），原始栈转储保留在 data/watchdog_stack_*.log。
     """
     import urllib.request
     logger = logging.getLogger("zenith.selfwatch")
     fails = 0
-    while True:
-        time.sleep(_SELF_WATCHDOG_INTERVAL)
+    while not stop_event.is_set():
+        # 用 wait 代替 sleep：stop_event.set() 后立即退出（与 _aux_services_watchdog 同款写法）
+        if stop_event.wait(_SELF_WATCHDOG_INTERVAL):
+            break
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=10) as resp:
                 if resp.status == 200:
@@ -767,6 +1085,15 @@ def _self_health_watchdog(port: int):
                 logger.error("主服务假死，线程栈已写入 %s，即将退出", dump_path)
             except Exception:
                 logger.exception("写 watchdog 线程栈失败")
+            # os._exit 不执行 finally，main() 里那段 flush_all_pending_memories()
+            # 会被跳过 —— 退出前必须自己补一次，否则丢最后 1~2 轮对话记忆。
+            logger.warning("self-watchdog: 退出前补一次记忆 flush（最多 10s）")
+            if _flush_pending_memories_sync(timeout=10.0):
+                logger.warning("self-watchdog: flush 已完成，即将强制退出")
+            else:
+                logger.warning("self-watchdog: flush 未完成，仍将强制退出")
+            # 留痕：让下次启动能看出「上次是假死自杀」，而不是无声消失
+            _write_exit_marker(_EXIT_REASON_SUICIDE, f"连续 {fails} 次健康检查失败")
             os._exit(70)
 
 
@@ -833,36 +1160,13 @@ def _first_run_setup():
     return False
 
 
-def _register_shutdown_handlers(lock_fd: Optional[int]):
-    """注册信号处理程序，保证退出时释放锁和 PID 文件。"""
-    def _cleanup(signum=None, frame=None):
-        logger.info("正在关闭 Zenith v2...")
-        try:
-            if lock_fd is not None:
-                try:
-                    if sys.platform == "win32":
-                        import msvcrt
-                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
-                except Exception:
-                    pass
-                try:
-                    os.close(lock_fd)
-                except Exception:
-                    pass
-        finally:
-            _cleanup_lock_and_pid()
-        if signum is not None:
-            sys.exit(0)
-
-    if sys.platform == "win32":
-        try:
-            signal.signal(signal.SIGTERM, _cleanup)
-            signal.signal(signal.SIGINT, _cleanup)
-        except Exception:
-            pass
-    else:
-        signal.signal(signal.SIGTERM, _cleanup)
-        signal.signal(signal.SIGINT, _cleanup)
+# 注（2026-09-10，O-07）：这里原有一个 `_register_shutdown_handlers(lock_fd)`，
+# 内部 `signal.signal(SIGTERM/SIGINT, _cleanup)` 注册了「释放 msvcrt 锁 + 关 fd」的清理。
+# 但随后的 `uvicorn.run()` 会**安装自己的信号处理器并覆盖掉上面注册的**，
+# 因此原 `_cleanup` 实际永不执行 —— 是死代码，且制造了「信号已被优雅处理」的错觉。
+# 优雅退出的唯一真实路径是 main() 末尾的 `finally:` → `_cleanup_lock_and_pid()`；
+# 即使进程被硬杀，msvcrt 文件锁也会随进程消亡由 OS 释放，不会残留。
+# 回滚：`git checkout -- start.py` 或 restoredata/backup/start.py.bak-20260910-171500
 
 
 def main():
@@ -870,9 +1174,13 @@ def main():
     parser.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT, help=f"服务端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--browser-delay", type=int, default=2, help="打开浏览器前的等待秒数（默认 2）")
+    parser.add_argument("--detach", action="store_true",
+                        help="守护化：脱离父进程在后台启动后立即返回（供 shell/脚本/自动化调用）")
     parser.add_argument("--verbose", action="store_true", help="输出 DEBUG 级别日志")
     parser.add_argument("--reset-lock", action="store_true", help="强制清除残留锁和 PID 文件后启动")
     parser.add_argument("--stop", action="store_true", help="停止当前运行的 Zenith 实例")
+    parser.add_argument("--keep-aux", action="store_true",
+                        help="配合 --stop：只停主服务，保留知识库中台(8788)与任务 worker")
     parser.add_argument("--status", action="store_true", help="查看 Zenith 运行状态")
     parser.add_argument("--wait", action="store_true", help="等待服务就绪后打印结果退出（供双击启动反馈）")
     parser.add_argument("--wait-timeout", type=float, default=25, help="--wait 超时秒数（默认 25）")
@@ -892,13 +1200,19 @@ def main():
         return
 
     if args.stop:
-        summary = stop_existing_instance(port)
+        summary = stop_existing_instance(port, keep_aux=args.keep_aux)
         _print_stop_summary(summary)
         return
 
     if args.wait:
         # 供 bat 双击后反馈：阻塞等待健康检查，打印结果后退出
         _print_wait_result(port, args.wait_timeout)
+        return
+
+    if args.detach:
+        # 守护化：本进程只负责把真正的主进程甩到后台，随即返回。
+        # 控制类命令（--stop/--status/--wait）在上面已提前返回，不受影响。
+        _spawn_detached(port)
         return
 
     if args.reset_lock:
@@ -910,13 +1224,16 @@ def main():
 
     if not is_first_instance:
         if _is_port_in_use(port):
-            # 端口确有监听 → 真在运行，打开浏览器
-            if _browser_recently_opened():
+            # 端口确有监听 → 真在运行。是否开浏览器必须尊重 --no-browser，
+            # 否则脚本/自动化入口会莫名弹出浏览器标签页。
+            if args.no_browser:
+                logger.info("Zenith 已在运行（--no-browser 已指定，跳过打开）: %s", url)
+            elif _browser_recently_opened():
                 logger.info("Zenith 已在运行，浏览器冷却期内，跳过打开")
             else:
                 logger.info("Zenith 已在运行，打开浏览器: %s", url)
                 _write_browser_ts()
-                webbrowser.open(url)
+                _open_browser(url)
             return
         # 锁没拿到但端口空闲 → 疑似僵尸锁 / 僵死进程占用锁，必须显式告警而非静默"已在运行"
         lock_exists = _LOCK_FILE.exists()
@@ -936,14 +1253,24 @@ def main():
         owners = _find_processes_by_port(port)
         logger.info("端口 %d 仍被占用(PID=%s)，打开浏览器: %s", port, owners, url)
         _write_browser_ts()
-        webbrowser.open(url)
+        _open_browser(url)
         return
 
     _write_pid_file()
-    _register_shutdown_handlers(lock_fd)
+
+    # 上次是否干净退出？在读「本次 running 标记」之前先自检，否则会覆盖线索。
+    _check_previous_exit()
+    global _SERVICE_STARTED_AT
+    _SERVICE_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_exit_marker(_EXIT_REASON_RUNNING)
 
     # 首次运行配置
-    is_first_run = _first_run_setup()
+    # 注意：`_first_run_setup()` 的返回值（是否首次运行）当前**未被使用** ——
+    # 这里只保留调用，因为它有**副作用**（首次运行时从模板创建 config.yaml）。
+    # ⚠️ 疑似遗漏：该函数内日志写着「设置页面将在浏览器打开」，
+    #    但全仓没有任何地方按这个返回值跳转设置页。若确实该跳，需补上；
+    #    若只是文案残留，可忽略本注。见 _diag_archive 的 lint 记录。
+    _first_run_setup()
 
     logger.info("=" * 60)
     logger.info("  Zenith v2 - Local AI Assistant")
@@ -957,11 +1284,23 @@ def main():
     # 启动 uvicorn
     import uvicorn
 
+    # 启动阶段只做**一次**健康探测，两个消费者（托管辅助服务 / 打开浏览器）共享结果。
+    # 原实现让两个线程各跑一遍 _wait_for_health，启动瞬间会把 /api/health 打两份。
+    health_ready = threading.Event()
+    health_result = {"ok": False}
+
+    def _probe_health_once():
+        health_result["ok"] = _wait_for_health(port, timeout=_HEALTH_TIMEOUT_SECONDS)
+        health_ready.set()
+
+    threading.Thread(target=_probe_health_once, daemon=True, name="health-probe").start()
+
     # 知识库中台与任务 worker 托管 — 独立线程，与是否打开浏览器无关
     aux_stop_event = threading.Event()
     if not args.no_aux:
         def _aux_services_thread():
-            if _wait_for_health(port, timeout=_HEALTH_TIMEOUT_SECONDS):
+            health_ready.wait()
+            if health_result["ok"]:
                 _spawn_aux_services()
                 # 启动 watchdog 监控辅助服务（崩溃自动重启）
                 threading.Thread(
@@ -974,10 +1313,13 @@ def main():
                 logger.warning("健康检查超时，跳过知识库中台与任务 worker 启动")
         threading.Thread(target=_aux_services_thread, daemon=True).start()
 
-    # 主服务自我守护：事件循环卡死时 dump 线程栈并退出，交由外部 supervisor 拉起
+    # 主服务自我守护：事件循环卡死时 dump 线程栈并退出。
+    # 硬退出后**无人自动拉起**（外部 supervisor 未落地），故用退出标记 + 下次启动自检
+    # 补偿，让「上次怎么没的」可见。stop_event 用于让主进程优雅退出时能停掉它（O-03）。
+    self_stop_event = threading.Event()
     threading.Thread(
         target=_self_health_watchdog,
-        args=(port,),
+        args=(port, self_stop_event),
         daemon=True,
         name="self-health-watchdog",
     ).start()
@@ -988,14 +1330,11 @@ def main():
         delay = max(0, args.browser_delay)
         if delay > 0:
             time.sleep(delay)
-        if _wait_for_health(port, timeout=_HEALTH_TIMEOUT_SECONDS):
+        health_ready.wait()
+        if health_result["ok"]:
             if not _browser_recently_opened():
                 _write_browser_ts()
-                try:
-                    webbrowser.open(url)
-                    logger.info("健康检查通过，浏览器已打开: %s", url)
-                except Exception as e:
-                    logger.warning("打开浏览器失败: %s", e)
+                _open_browser(url)
         else:
             logger.warning("健康检查超时，启动可能失败，请查看 %s", _LOG_FILE)
 
@@ -1012,10 +1351,12 @@ def main():
         )
     except Exception as e:
         logger.exception("Uvicorn 启动失败: %s", e)
+        _write_exit_marker(_EXIT_REASON_EXCEPTION, f"uvicorn 启动失败: {e}")
         raise
     finally:
         # 通知 watchdog 退出
         aux_stop_event.set()
+        self_stop_event.set()
         # 优雅关闭：flush 各对话 buffer 中的残余文本（最后 1~2 轮），避免数据丢失。
         # 在独立 event loop 中同步等待 LLM 提取完成（uvicorn 已退出但进程尚存）。
         # 加 15s 总超时，避免 LLM 慢/卡住时无限期阻塞退出。
@@ -1031,6 +1372,8 @@ def main():
         except Exception as e:
             logger.warning("flush pending memories 失败/超时: %s", e)
         _cleanup_lock_and_pid()
+        # 最后一步才标 clean：任何中途异常/硬退出都不会留下这个标记
+        _write_exit_marker(_EXIT_REASON_CLEAN)
 
 
 if __name__ == "__main__":

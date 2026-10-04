@@ -29,3 +29,20 @@ code_execution_enabled: false
 # 市场分析（每日 07:00 自动运行）
 market_analysis_enabled: true
 market_analysis_time: "07:00"
+
+# ── 浏览器（可选，2026-10-03 新增）───────────────────────────────────────
+# Zenith 启动后会自动打开 http://127.0.0.1:8766/。
+# 默认（不配本段）→ 交给「系统默认浏览器」，也就是你双击链接时用的那个。
+# 想固定用某个浏览器（例如 Tabbit）→ 把 enabled 设为 true，path 填可执行文件路径：
+#
+#   browser:
+#     enabled: true
+#     path: "D:/下载文件/Tabbit Browser/Application/Tabbit Browser.exe"
+#     args: []
+#
+# ⚠️ path 用正斜杠（/），避免 YAML 反斜杠转义踩坑。
+# 路径不存在 / 启动失败 / enabled: false → 自动回退系统默认浏览器，不会影响启动。
+browser:
+  enabled: false
+  path: ""
+  args: []

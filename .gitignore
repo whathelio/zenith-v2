@@ -21,6 +21,8 @@ frontend/tsconfig.tsbuildinfo
 # User data
 data/*.db
 data/*.sqlite
+data/memory_buffer.json
+data/memory_buffer.json.tmp
 data/.deps_installed
 data/logs/
 data/distill/
@@ -93,3 +95,35 @@ _archive_cleanup_20260825/
 
 # 运行时外部归档（服务生成的归档输出，不入库）
 data/archive_external/
+
+# ══════════════════════════════════════════════════════════════
+# 2026-10-04 补：以下四类**实测会绕过上面的规则**（见审查报告
+#   知识库-v1.0/日志审查库/zenith/2026-10/Zenith-未提交改动协同审查-20261004.md）
+#
+# 根因：上面的 `*.bak` 要求以 `.bak` **结尾**，配不上 `xxx.bak-20260916-072544`；
+#       上面写的是 `data/*.db.*`（**点号**）而 SQLite 实际用**连字符** `-wal`/`-shm`；
+#       `.env` / `config/config.yaml` 只匹配**无后缀**那一个，配不上各自的 `.bak-*` 副本。
+#
+# 🔴 实测危害：`.env.bak-*` 含 ZENITH_LLM_API_KEY、`config.yaml.bak-*` 含 api_key，
+#    而本仓是 **public** —— 一旦 `git add -A` 就进不可撤回的公开历史。
+# ══════════════════════════════════════════════════════════════
+
+# 1) 带时间戳的备份文件（含源码/脚本/配置的各种形态）
+*.bak-*
+*.py.bak-*
+*.bat.bak-*
+
+# 2) SQLite 伴生文件（连字符，非点号）
+#    注意：`-wal`/`-shm` 是应用运行的**期望稳态，勿删** → 此处是 ignore，不是删除
+data/*.db-wal
+data/*.db-shm
+
+# 3) 运行时退出标记（每次运行都变，会造成噪声 diff）
+data/last_exit.json
+
+# 4) 密钥文件的备份（与上面 `.env` / `config/config.yaml` 两条对齐）
+.env.*
+!/.env.example
+config/config.yaml.*
+!config/config.yaml.example
+

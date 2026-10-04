@@ -32,10 +32,11 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, List, Protocol, Tuple
+from typing import List, Protocol, Tuple
 
 # ------------------------------------------------------------------
 # CONFIG（可用环境变量覆盖）
@@ -44,7 +45,17 @@ ZOTERO_DATA_DIR = Path(os.environ.get("ZOTERO_DATA_DIR", str(Path.home() / "Zote
 ZOTERO_SQLITE = ZOTERO_DATA_DIR / "zotero.sqlite"
 STORAGE_DIR = ZOTERO_DATA_DIR / "storage"
 
-_DEFAULT_RAG_WORK_DIR = Path("./zenith_rag_new")
+# 🔴 RAG 工作目录**必须**落在纯 ASCII 路径。
+# ChromaDB 1.5.x 的 Rust HNSW reader 在含中文的路径下直接读不出索引：
+# `Error loading hnsw index`（**索引字节本身完好**，换个路径就能读）。
+# 决定性实验（2026-10-03）：把**同一份库**从 `D:\dshs\zenith_rag_new` 复制到
+# `D:\下载文件\新建文件夹\` 下 → 立刻 `count()` 抛 InternalError；
+# 留在 `D:\dshs\` 下 → count=13134 / query() 正常。**唯一变量是路径。**
+# 工作区根那份 `zenith_rag_new`（10 篇/8716 chunk）就是这样坏的 —— 建在了中文路径下。
+# 与 start.py:81-84 的既有注释一致（同一结论，两处都要留）。
+_DEFAULT_RAG_WORK_DIR = (
+    Path(r"D:\dshs\zenith_rag_new") if os.name == "nt" else Path("./zenith_rag")
+)
 WORK_DIR = Path(os.environ.get("ZENITH_RAG_WORK_DIR", str(_DEFAULT_RAG_WORK_DIR)))
 CHROMA_PATH = WORK_DIR / "chroma_db"
 PROGRESS_FILE = WORK_DIR / "progress.json"
@@ -61,6 +72,21 @@ TEXT_COVERAGE_THRESHOLD = float(os.environ.get("ZENITH_RAG_COVERAGE", "0.8"))
 MAX_CHUNK_SIZE = int(os.environ.get("ZENITH_RAG_CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("ZENITH_RAG_CHUNK_OVERLAP", "64"))
 TOP_K = int(os.environ.get("ZENITH_RAG_TOP_K", "5"))
+# 问答输出额度。注意 LLM_MODEL 是推理模型，其 reasoning 会占用该额度 —— 见 _chat_once()。
+ANSWER_MAX_TOKENS = int(os.environ.get("ZENITH_RAG_ANSWER_TOKENS", "2048"))
+# 🔴 2026-10-03 新增：向量检索相关性地板（余弦相似度）。
+# 向量检索永远返回 k 个最近近邻，没有"空结果" ⇒ 无关问题也会拿到片段，
+# 模型可能拿无关片段硬答（实测出过自相矛盾输出）。低于此值一律报未命中。
+#
+# 阈值来自实测分布（bge-small-zh-v1.5，cosine，语料=145 篇 CFA/ML 论文，
+# 每类 6~8 条正负样本，**不是拍脑袋估的**）：
+#   正样本 min = 0.5904（neural network backpropagation）
+#   负样本 max = 0.4731（推荐一款口红）
+#   → 可用区间 (0.4731, 0.5904)，取中点 **0.53**
+# ⚠️ 换嵌入模型或换语料**必须重测分布**再改这个值（区间可能重叠，那就别用阈值，
+#    改走别的判据）。此前写的 0.45 是照搬 kb-v2 在另一个语料上的值，
+#    在本语料上会放过「莎士比亚四大悲剧」(0.4582) 这类假命中。
+MIN_SCORE = float(os.environ.get("ZENITH_RAG_MIN_SCORE", "0.53"))
 DEFAULT_WORKERS = int(os.environ.get("ZENITH_RAG_WORKERS", "4"))
 
 
@@ -199,9 +225,29 @@ def get_store() -> VectorStore:
     return ChromaStore(CHROMA_PATH, COLLECTION_NAME)
 
 
+_EMBEDDER = None
+_EMBEDDER_LOCK = threading.Lock()
+
+
 def get_embedder():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(EMBED_MODEL)
+    """返回**进程内复用**的 embedding 模型（懒加载 + 线程安全）。
+
+    ⚠️ 2026-09-11 修复：原实现是 `return SentenceTransformer(EMBED_MODEL)` ——
+    **每次调用都从磁盘重建整个模型**，而它有 4 处调用点（answer / ingest / …），
+    等于每个请求都白付一次模型构造。实测三连调返回的对象 id 各不相同（确证无缓存），
+    第 2、3 次各花 ~80ms（首次 42s 含一次性的 torch 导入）—— 纯浪费。
+
+    FastAPI 的**同步** handler 跑在线程池里，本函数可能被并发进入，
+    故用锁保护懒加载（双重检查，避免并发重复构造出多个模型实例）。
+    """
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        with _EMBEDDER_LOCK:
+            if _EMBEDDER is None:
+                from sentence_transformers import SentenceTransformer
+                print(f"[embedder] 首次加载模型：{EMBED_MODEL}", file=sys.stderr)
+                _EMBEDDER = SentenceTransformer(EMBED_MODEL)
+    return _EMBEDDER
 
 
 # ------------------------------------------------------------------
@@ -499,28 +545,101 @@ def answer(question: str) -> str:
     if not docs:
         return "知识库中未找到相关内容。"
 
+    # 🔴 2026-10-03 补相关性闸门（往期日志 §2 的延长线）。
+    # 向量检索**永远**返回 k 个最近邻，不存在"空结果" —— 所以 `if not docs`
+    # 这道闸门对"问的根本不相关的问题"完全无效。
+    # 后果（实测）：问「用一句话解释什么是方差」，库里全是英文金融/ML 论文，
+    # 模型拿一堆无关片段先答了"方差是…统计量"，末尾又写"知识库中未找到相关内容"
+    # —— **自相矛盾**，且那句"未找到"是模型自己脑补的，不是检索结论。
+    # 处置：低于相似度地板就**不把片段交给模型**，直接如实报未命中。
+    # 地板值 0.53 来自实测正负样本分布（见 MIN_SCORE 处注释）：
+    #   正样本 min 0.5904 / 负样本 max 0.4731 → 区间中点。
+    # ⚠️ 换嵌入模型或换语料**必须重测分布**再改这个值。
+    _dist = (results.get("distances") or [[]])[0]
+    kept = [(d, m, 1.0 - float(_dist[i]))
+            for i, (d, m) in enumerate(zip(docs, metas))
+            if i < len(_dist) and (1.0 - float(_dist[i])) >= MIN_SCORE]
+    if not kept:
+        return "知识库中未找到相关内容。"
+    docs = [k[0] for k in kept]
+    metas = [k[1] for k in kept]
+
     context = "\n\n---\n\n".join(
         f"[来源: {m.get('title')}, 文件: {m.get('source_file')}]\n{d}"
         for d, m in zip(docs, metas)
     )
+    # 🔴 2026-10-03 加两条硬约束（修「自相矛盾」实测缺陷）：
+    # 旧版只说"请仅根据片段回答"+「没有就说未找到」，但**没禁止用通用知识补答**，
+    # 于是模型会先用自己的统计学常识答一遍、末尾再补一句"知识库中未找到相关内容"
+    # —— 两句自相矛盾，且"未找到"那句是脑补的、并非检索结论。
+    # 现在明确：片段没答案就**只**输出未命中声明，**禁止**先答后 disclaim。
     prompt = (
         "你是 Zenith，一个基于本地文献知识库回答问题的助手。\n"
         "请仅根据下面提供的文献片段回答问题，并引用来源。\n"
-        "如果片段中没有答案，请明确说明“知识库中未找到相关内容”。\n\n"
+        "如果片段中没有答案，请明确说明“知识库中未找到相关内容”。\n"
+        "**禁止**先用模型自身的通用知识作答、再补一句“知识库中未找到相关内容”"
+        " —— 这两句自相矛盾，会让调用方无法判断到底有没有查到。\n"
+        "片段里没有就直接答“知识库中未找到相关内容”，一个字都不要多写。\n\n"
         f"---\n{context}\n---\n\n"
         f"用户问题：{question}"
     )
     client = openai.OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": "简洁回答，标注引用来源。"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.5,
-        max_tokens=1024,
-    )
-    return resp.choices[0].message.content
+    messages = [
+        {"role": "system", "content": "简洁回答，标注引用来源。"},
+        {"role": "user", "content": prompt},
+    ]
+    content = _extract_content(_chat_once(client, messages))
+    if content:
+        return content
+    # 不静默返回空串 —— 否则前端显示空白，且调用方无法区分「库中没有」与「模型没答出来」
+    return "（模型未返回正文内容，可能是推理占满了输出额度；请重试或换一种问法。）"
+
+
+def _chat_once(client, messages: list):
+    """单次 LLM 调用 —— **显式关闭思考**。
+
+    ⚠️ 2026-09-11 修复：LLM_MODEL（deepseek-flash）是**推理模型**，其 reasoning 会
+    消耗 max_tokens 的额度。实测 max_tokens=1024 时 reasoning_tokens 达 1024，
+    导致 finish_reason="length" 且 message.content 为**空字符串** —— 表现为
+    「知识库检索间歇性返回空答案」（推理长度随问题难度浮动，故时好时坏）。
+
+    对策：显式关闭思考（RAG 摘录式问答不需要长推理）。若 provider 不认该参数，
+    则降级为不带该参数重试一次，保证跨 provider 可用。
+
+    ⚠️ 必须用 `extra_body=` 传该参数：openai Python SDK 会**校验**入参，
+    直接写 `thinking=...` 会抛 `unexpected keyword argument`（实测踩过），
+    结果是"看起来关了思考、实际每次都降级"。
+    """
+    kw = dict(model=LLM_MODEL, messages=messages, temperature=0.5,
+              max_tokens=ANSWER_MAX_TOKENS)
+    try:
+        return client.chat.completions.create(
+            **kw, extra_body={"thinking": {"type": "disabled"}})
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[llm] 关闭思考失败（provider 可能不支持该参数），改为常规调用: {e}",
+              file=sys.stderr)
+        return client.chat.completions.create(**kw)
+
+
+def _extract_content(resp) -> str:
+    """取正文；正文为空时**显式告警**，而不是静默返回空串。
+
+    静默失败比报错更危险 —— 调用方无法区分「知识库中确实没有」与「模型没答出来」。
+    """
+    try:
+        choice = resp.choices[0]
+        msg = choice.message
+    except (AttributeError, IndexError) as e:                # noqa: BLE001
+        print(f"[llm] 响应结构异常: {e}", file=sys.stderr)
+        return ""
+    content = (msg.content or "").strip()
+    if content:
+        return content
+    reason = getattr(choice, "finish_reason", "?")
+    rc = getattr(msg, "reasoning_content", None) or ""
+    print(f"[llm] 正文为空：finish_reason={reason}, reasoning={len(rc)} 字, "
+          f"max_tokens={ANSWER_MAX_TOKENS} —— 多为推理占满额度所致。", file=sys.stderr)
+    return ""
 
 
 # ------------------------------------------------------------------
@@ -638,7 +757,6 @@ def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
 
     store = get_store()
     embedder = get_embedder()
-    import time as _t
     item_id = abs(hash(p.name + str(p.stat().st_mtime))) % 1000000
     title = title or p.stem
     ids = [f"{item_id}_{i}" for i in range(len(chunks))]
