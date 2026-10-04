@@ -1,8 +1,8 @@
-/* ThinkingBlock — 模型思考过程折叠块（对齐 WorkBuddy 的 thinking 展示）
+/* ThinkingBlock — 模型思考过程（对齐 dsh ReasoningRow 的「Think」折叠行）
  *
- * - 流式期间：展开显示 + spinner + 实时累计的"已思考 Ns"
- * - 完成后：可折叠/展开，标题行显示耗时
- * - 内容超出时内部滚动（不撑爆消息流）
+ * - 单行 disclosure：图标 + "Think" 标题 + 单行摘要（流式中取末行、完成取首行）
+ * - 展开后 22px 缩进、灰字、14px/24px
+ * - 流式 running 态带扫光动画（由 CSS 实现）
  */
 import { useEffect, useRef, useState } from 'react'
 
@@ -10,66 +10,62 @@ interface ThinkingBlockProps {
   content: string
   /** 思考是否已结束（流式结束 / 完成） */
   done?: boolean
-  /** 思考开始时间戳（ms），用于显示已思考时长 */
-  startTime?: number
 }
 
-export default function ThinkingBlock({ content, done = false, startTime }: ThinkingBlockProps) {
-  // 思考过程默认展开（历史消息也能直接查看），点击标题行可折叠。
-  // 注：曾改为 done 时默认折叠，但用户反馈"思考过程看不到了"——折叠后无提示，改为默认展开。
-  const [collapsed, setCollapsed] = useState(false)
-  const [elapsed, setElapsed] = useState(0)
-  const bodyRef = useRef<HTMLDivElement>(null)
+function firstLine(text: string): string {
+  const newline = text.indexOf('\n')
+  return newline === -1 ? text : text.slice(0, newline)
+}
 
-  // 流式期间每秒刷新"已思考 Ns"
+function latestLine(text: string): string {
+  const visible = text.trimEnd()
+  const newline = visible.lastIndexOf('\n')
+  return newline === -1 ? visible : visible.slice(newline + 1)
+}
+
+export default function ThinkingBlock({ content, done = false }: ThinkingBlockProps) {
+  const [expanded, setExpanded] = useState(false)
+  const summaryRef = useRef<HTMLSpanElement>(null)
+  const running = !done
+
+  const summary = running ? latestLine(content) : firstLine(content)
+
+  // 流式中让摘要末尾跟随最新内容（右对齐到可见区）
   useEffect(() => {
-    if (done) return
-    if (!startTime) return
-    const timer = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - startTime) / 1000))
-    }, 500)
-    return () => clearInterval(timer)
-  }, [done, startTime])
-
-  // 新内容到达时自动滚动到底部
-  useEffect(() => {
-    if (!collapsed && bodyRef.current) {
-      bodyRef.current.scrollTop = bodyRef.current.scrollHeight
-    }
-  }, [content, collapsed])
-
-  const displayElapsed = startTime
-    ? (done ? (elapsed || Math.max(1, Math.floor((Date.now() - startTime) / 1000))) : elapsed)
-    : 0
+    const el = summaryRef.current
+    if (!el) return
+    el.scrollLeft = running ? el.scrollWidth - el.clientWidth : 0
+  }, [summary, running])
 
   return (
-    <div className={`thinking-block ${done ? 'thinking-block-done' : 'thinking-block-running'}`}>
-      <div
-        className="thinking-header"
-        onClick={() => setCollapsed(!collapsed)}
-        role="button"
-        tabIndex={0}
+    <div className="thinking-block" data-state={running ? 'running' : 'ok'}>
+      <button
+        type="button"
+        className="thinking-row"
+        onClick={() => setExpanded(v => !v)}
+        aria-expanded={expanded}
       >
-        <span className="thinking-indicator">
-          {!done && (
-            <svg width="12" height="12" viewBox="0 0 12 12" className="thinking-spinner">
-              <circle cx="6" cy="6" r="5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 10" />
-            </svg>
-          )}
-          {done && <span className="thinking-done-mark">✓</span>}
+        <span className="thinking-leading">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2">
+            <circle cx="7" cy="7" r="5.5" />
+            <path d="M7 4.5v3l2 1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
         </span>
-        <span className="thinking-title">思考过程</span>
-        {startTime && (
-          <span className="thinking-elapsed">已思考 {displayElapsed}s</span>
-        )}
-        <span className={`thinking-arrow ${collapsed ? '' : 'open'}`}>▾</span>
-      </div>
-      {!collapsed && content && (
-        <div ref={bodyRef} className="thinking-body">
-          {content}
-        </div>
+        <span className="thinking-title">Think</span>
+        <span className="thinking-separator" aria-hidden="true" />
+        <span ref={summaryRef} className="thinking-summary" data-follow-end={running || undefined}>
+          {summary}
+        </span>
+        <span className={`thinking-chevron ${expanded ? 'open' : ''}`} aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <path d="M4 2.5L8 6L4 9.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </span>
+      </button>
+      {expanded && content && (
+        <div className="thinking-body">{content}</div>
       )}
-      {!collapsed && !content && (
+      {expanded && !content && (
         <div className="thinking-body thinking-empty">正在思考…</div>
       )}
     </div>

@@ -478,6 +478,8 @@ code {
 .chat-messages {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
+  max-width: 100%;
   padding: var(--space-4) var(--space-6);
   display: flex;
   flex-direction: column;
@@ -489,6 +491,10 @@ code {
   gap: var(--space-3);
   max-width: 85%;
   animation: messageIn 0.3s ease;
+}
+
+.message-ai {
+  max-width: 100%;
 }
 
 @keyframes messageIn {
@@ -523,28 +529,33 @@ code {
   color: var(--color-accent-primary);
 }
 
+/* dsh 对齐：AI 无气泡（透明纵向流），仅 user 有气泡 */
 .message-bubble {
-  padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius-lg);
-  font-size: var(--font-size-md);
-  line-height: 1.65;
+  font-size: 16px;
+  line-height: 28px;
   word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .message-user .message-bubble {
-  background: linear-gradient(135deg, rgba(189, 147, 249, 0.3), rgba(255, 121, 198, 0.2));
-  border: 1px solid rgba(189, 147, 249, 0.2);
-  border-bottom-right-radius: var(--radius-sm);
+  background: var(--color-chat-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 22px;
+  padding: 10px 16px;
+  max-width: min(525px, 82%);
+  line-height: 24px;
 }
 
 .message-ai .message-bubble {
-  background: var(--color-chat-surface);
-  border: 1px solid var(--color-border);
-  border-bottom-left-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  padding: 0;
+  border-radius: 0;
 }
 
 .message-bubble p {
-  margin-bottom: var(--space-2);
+  margin-bottom: 16px;
 }
 
 .message-bubble p:last-child {
@@ -552,14 +563,14 @@ code {
 }
 
 .message-bubble pre {
-  margin: var(--space-2) 0;
+  margin: 16px 0;
 }
 
 .message-bubble blockquote {
   border-left: 2px solid var(--color-accent-primary);
   padding-left: var(--space-3);
   color: var(--color-text-secondary);
-  margin: var(--space-2) 0;
+  margin: 16px 0;
 }
 
 .message-time {
@@ -792,13 +803,13 @@ code {
   border: 1px solid var(--color-border);
   border-radius: 4px;
   padding: 4px 8px;
-  color: var(--color-text);
+  color: var(--color-text-primary);
   font-size: var(--font-size-sm);
   font-family: inherit;
   outline: none;
 }
 .proposal-input:focus {
-  border-color: var(--color-accent);
+  border-color: var(--color-accent-primary);
 }
 
 /* ──────────────────────────────────────────
@@ -1099,8 +1110,8 @@ textarea.form-input {
 .message-bubble h1,
 .message-bubble h2,
 .message-bubble h3 {
-  margin-top: var(--space-4);
-  margin-bottom: var(--space-2);
+  margin-top: 24px;
+  margin-bottom: 12px;
   color: var(--color-accent-primary);
 }
 
@@ -1111,22 +1122,22 @@ textarea.form-input {
 .message-bubble ul,
 .message-bubble ol {
   padding-left: var(--space-6);
-  margin: var(--space-2) 0;
+  margin: 16px 0;
 }
 
 .message-bubble li {
-  margin-bottom: var(--space-1);
+  margin-bottom: 8px;
 }
 
 .message-bubble hr {
   border: none;
   border-top: 1px solid var(--color-border);
-  margin: var(--space-3) 0;
+  margin: 16px 0;
 }
 
 .message-bubble table {
   border-collapse: collapse;
-  margin: var(--space-2) 0;
+  margin: 16px 0;
   font-size: var(--font-size-sm);
 }
 

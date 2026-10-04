@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, type Schedule, type CalendarTemplate, type Goal, type GoalStats } from '../shared/api'
 import { TransformButton } from '../components/TransformButton'
@@ -31,6 +31,12 @@ export default function CalendarView() {
   const [events, setEvents] = useState<Schedule[]>([])
   const [selectedDate, setSelectedDate] = useState(getToday())
   const [loading, setLoading] = useState(false)
+  // B-11 / B-12（2026-09-11）两个同源缺陷：
+  //  · B-12：loadEvents 原先 `catch { /* silent */ }` —— 失败时 events 保持旧值/空，
+  //    界面照常渲染「当日暂无提醒」，把「加载失败」伪装成「没有数据」；
+  //  · B-11：无请求守卫 —— 快速翻周时，先发出的慢响应会覆盖后发出的快响应。
+  const [loadError, setLoadError] = useState('')
+  const weekSeqRef = useRef(0)        // 周视图请求序号：只采纳最新一次的结果
   const [templates, setTemplates] = useState<CalendarTemplate[]>([])
   const [showCreate, setShowCreate] = useState(false)
   const [editingEvent, setEditingEvent] = useState<Schedule | null>(null)
@@ -124,12 +130,21 @@ export default function CalendarView() {
 
   // Load events for the week
   const loadEvents = async () => {
+    const seq = ++weekSeqRef.current          // 请求序号（B-11）
     setLoading(true)
     try {
       const data = await api.getCalendarWeek(mondayStr)
+      if (seq !== weekSeqRef.current) return  // 已有更新的请求发出 → 丢弃本次，防乱序覆盖
       setEvents(data.events || [])
-    } catch { /* silent */ }
-    finally { setLoading(false) }
+      setLoadError('')
+    } catch (e: any) {
+      if (seq !== weekSeqRef.current) return
+      // B-12：不再静默 —— 失败必须与「真的没有日程」区分开
+      setLoadError(e?.message || '加载失败')
+      setEvents([])
+    } finally {
+      if (seq === weekSeqRef.current) setLoading(false)
+    }
   }
 
   const loadTemplates = async () => {
@@ -267,7 +282,7 @@ export default function CalendarView() {
         setAllSchedules(prev => prev.map(s => s.id === id ? { ...s, status } : s))
       }
       showToast(`${STATUS_NAMES[status] || status}`)
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const handleListConfirm = (id: number) => handleListStatusChange(id, 'confirmed')
@@ -287,7 +302,7 @@ export default function CalendarView() {
       setListEditingId(null)
       setListEditForm({})
       showToast('已保存')
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const cancelListEdit = () => { setListEditingId(null); setListEditForm({}) }
@@ -299,7 +314,7 @@ export default function CalendarView() {
       setAllSchedules(prev => prev.filter(s => s.id !== showListDelete.id))
       setShowListDelete(null)
       showToast('已删除')
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   // 批量操作
@@ -326,7 +341,7 @@ export default function CalendarView() {
       setSelectedIds(new Set())
       setBatchMode(false)
       showToast(`已删除 ${ids.length} 条`)
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const handleBatchStatus = async (status: string) => {
@@ -341,7 +356,7 @@ export default function CalendarView() {
       }
       setSelectedIds(new Set())
       showToast(`已设为${STATUS_NAMES[status] || status} ${ids.length} 条`)
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const handleBatchConfirm = () => handleBatchStatus('confirmed')
@@ -476,11 +491,26 @@ export default function CalendarView() {
                   }}
                 />
                 {loading && <span className="cal-loading">加载中...</span>}
+                {/* B-12：加载失败必须显式可见，且带重试 —— 不能与「真的没有日程」混为一谈 */}
+                {loadError && !loading && (
+                  <span style={{ color: 'var(--color-accent-danger)', fontSize: 12 }}>
+                    ⚠ 加载失败：{loadError}
+                    <button
+                      onClick={() => loadEvents()}
+                      style={{
+                        marginLeft: 8, background: 'none', border: 'none', cursor: 'pointer',
+                        color: 'var(--color-accent-primary)', fontSize: 'inherit',
+                        padding: 0, textDecoration: 'underline',
+                      }}
+                    >重试</button>
+                  </span>
+                )}
               </div>
 
               {/* Event list */}
               <div className="cal-event-list">
-                {displayEvents.length === 0 ? (
+                {/* B-12：出错时不显示「暂无提醒」—— 不知道有没有，别说没有 */}
+                {displayEvents.length === 0 && !loadError ? (
                   <div className="cal-empty">
                     <span style={{ fontSize: 32 }}>📅</span>
                     <span>当日暂无提醒</span>
@@ -915,7 +945,7 @@ export default function CalendarView() {
             try {
               const g = await api.getGoal(detailGoal.id)
               setDetailGoal(g)
-            } catch {}
+            } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
           }}
         />
       )}

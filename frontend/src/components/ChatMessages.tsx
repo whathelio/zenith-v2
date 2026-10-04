@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from 'react'
+import { Fragment, useCallback, useRef, useEffect, useState } from 'react'
 import type { Message } from '../shared/api'
 import { api } from '../shared/api'
 import { lookupPlaceholder } from '../shared/security'
@@ -15,7 +15,6 @@ interface ChatMessagesProps {
   toolCallBubbles?: TraceEntry[]
   thinkingText?: string
   thinkingDone?: boolean
-  thinkingStartTime?: number
   onRegenerate?: (msgId: number) => void
   onEditMessage?: (msgId: number, newContent: string) => void
   onDeleteMessage?: (msgId: number) => void
@@ -23,17 +22,35 @@ interface ChatMessagesProps {
 
 export default function ChatMessages({
   messages, streamingText, isLoading, onSend,
-  toolCallBubbles, thinkingText, thinkingDone, thinkingStartTime,
+  toolCallBubbles, thinkingText, thinkingDone,
   onRegenerate, onEditMessage, onDeleteMessage,
 }: ChatMessagesProps) {
-  const bottomRef = useRef<HTMLDivElement>(null)
+  // 滚动容器自身 ref + 「是否贴底」状态：用户离开底部即停止自动跟随（流式不再抢占上翻）
+  const chatScrollRef = useRef<HTMLDivElement | null>(null)
+  const stickRef = useRef(true)          // true=用户贴底，程序自动跟随到底
+  const prevMsgLenRef = useRef(0)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [editText, setEditText] = useState('')
   // 工具痕迹统一折叠控制：null=各自默认, true=全部展开, false=全部收起
   const [traceExpand, setTraceExpand] = useState<boolean | null>(null)
 
+  const handleScroll = useCallback(() => {
+    const el = chatScrollRef.current
+    if (!el) return
+    // 距底 < 80px 视为“贴底”（可视区高度差或少量 padding 容差）
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }, [])
+
+  // 用 scrollTop 直接赋值（非 smooth），避免多条 scrollIntoView 动画互相打断抢占；
+  // messages 变长（发消息/回读/落库）强制到底，流式增长仅在用户贴底时跟随。
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = chatScrollRef.current
+    if (!el) return
+    const msgsGrew = messages.length > prevMsgLenRef.current
+    prevMsgLenRef.current = messages.length
+    if (msgsGrew || stickRef.current) {
+      el.scrollTop = el.scrollHeight
+    }
   }, [messages, streamingText, thinkingText, toolCallBubbles])
 
   const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -122,7 +139,12 @@ export default function ChatMessages({
   }
 
   return (
-    <div className="chat-messages" onClick={handleContainerClick}>
+    <div
+      className="chat-messages"
+      ref={chatScrollRef}
+      onScroll={handleScroll}
+      onClick={handleContainerClick}
+    >
       {messages.filter(m => m.role !== 'system').map(msg => {
         const isUser = msg.role === 'user'
         const card = !isUser ? extractConfirmCard(msg.content) : null
@@ -131,8 +153,8 @@ export default function ChatMessages({
         const isEditing = editingId === msg.id
 
         return (
-          <>
-          <div key={msg.id} className={`message message-${isUser ? 'user' : 'ai'} message-group`}>
+          <Fragment key={msg.id}>
+          <div className={`message message-${isUser ? 'user' : 'ai'} message-group`}>
             <div className="message-avatar">
               {isUser ? 'I' : 'Z'}
             </div>
@@ -213,7 +235,7 @@ export default function ChatMessages({
               ))}
             </div>
           )}
-          </>
+          </Fragment>
         )
       })}
 
@@ -261,7 +283,6 @@ export default function ChatMessages({
               <ThinkingBlock
                 content={thinkingText}
                 done={thinkingDone}
-                startTime={thinkingStartTime}
               />
             )}
             {streamingText && (
@@ -281,8 +302,6 @@ export default function ChatMessages({
           </div>
         </div>
       )}
-
-      <div ref={bottomRef} />
     </div>
   )
 }

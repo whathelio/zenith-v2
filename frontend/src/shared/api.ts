@@ -385,6 +385,32 @@ interface McpServer {
   disabled?: boolean
 }
 
+/** 单个 MCP 服务的真实握手结果（区别于配置里的 enabled 开关） */
+interface McpHealthResult {
+  name: string
+  transport: 'stdio' | 'http' | 'unknown'
+  enabled: boolean
+  ok: boolean
+  /** ok=握手成功 / error=不可达 / disabled=开关关闭未检测 / unknown=配置不全 */
+  state: string
+  latency_ms: number
+  tool_count: number
+  tools: string[]
+  error: string
+  cached?: boolean
+}
+
+interface McpHealthSnapshot {
+  servers: McpHealthResult[]
+  count: number
+  ok: number
+  error: number
+  disabled: number
+  cached_count: number
+  timeout: number
+  ttl: number
+}
+
 interface ImportSkillResult extends Partial<ModuleSkill> {
   success: boolean
   id: number
@@ -434,6 +460,20 @@ interface ModuleSkill {
   content: string
 }
 
+/**
+ * LLM 前缀缓存命中统计（后端 `cache_stats_summary()` 聚合 cache_stats 表）。
+ * `hit_rate` = prompt_cache_hit_tokens / prompt_tokens，由后端算好返回（0~1）。
+ * `by_kind` 按调用类别（chat / tool / ...）分桶，用于定位是哪类调用吃掉了前缀。
+ */
+interface CacheStats {
+  calls: number
+  prompt_tokens: number
+  hit_tokens: number
+  completion_tokens: number
+  hit_rate: number
+  by_kind: { kind: string; calls: number; hit: number; prompt: number }[]
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, {
     headers: { 'Content-Type': 'application/json' },
@@ -441,7 +481,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || err.detail || 'Request failed')
+    // 把 HTTP 状态码挂在 Error 上：调用方需要区分「403 目录外需二次确认」这类
+    // 可恢复失败与真失败，只有 message 文本无法可靠判断（后端文案会改）。
+    const e: any = new Error(err.error || err.detail || 'Request failed')
+    e.status = res.status
+    throw e
   }
   return res.json()
 }
@@ -684,6 +728,15 @@ export const api = {
     document.body.removeChild(link)
   },
 
+  // Cache Stats — LLM 前缀缓存命中率（后端 GET /api/cache/stats，唯一反馈回路入口）
+  getCacheStats: (hours = 24) =>
+    request<CacheStats>(`/cache/stats?hours=${hours}`),
+
+  // Process Monitor — 本机进程/端口地图（后端 GET /api/processes/snapshot，15s TTL）
+  // 泛型让调用方自带类型：ProcessView 的 Snapshot 结构较大，不宜在此重复定义一份。
+  getProcessSnapshot: <T = unknown>(force = false) =>
+    request<T>(`/processes/snapshot${force ? '?force=true' : ''}`),
+
   // Settings
   getSettings: () => request<Settings>('/settings'),
   updateSettings: (data: Partial<Settings>) =>
@@ -740,39 +793,8 @@ export const api = {
     document.body.removeChild(link)
   },
 
-  // Market Analysis
-  getMarketStatus: () =>
-    request<{ indicators: MarketIndicator[]; latest_report: { id: number | null; report_date: string | null; gold_price: string; daily_advice: string } | null }>('/market/status'),
-
-  getCFTCData: () =>
-    request<{ data: CFTCPosition[]; report_date: string; freshness: string }>('/market/cftc'),
-
-  getCFTCGold: () =>
-    request<any>('/market/cftc/gold'),
-
-  getMarketReports: (limit = 30) =>
-    request<MarketReport[]>(`/market/reports?limit=${limit}`),
-
-  getLatestReport: () =>
-    request<MarketReport>('/market/reports/latest'),
-
-  getMarketReport: (id: number) =>
-    request<MarketReport>(`/market/reports/${id}`),
-
-  runAnalysis: () =>
-    request<{ success: boolean; report_id: number; report_date: string }>('/market/run-analysis', { method: 'POST' }),
-
-  refreshMarketData: () =>
-    request<{ success: boolean; cftc: any; macro_count: number }>('/market/refresh-data'),
-
-  getPredictions: (date = '', verified = '') =>
-    request<MarketPrediction[]>(`/market/predictions?date=${date}&verified=${verified}`),
-
-  getHitRate: (days = 30) =>
-    request<HitRateResult>(`/market/predictions/hit-rate?days=${days}`),
-
-  verifyPredictions: () =>
-    request<{ success: boolean; total: number; hit: number; miss: number; hit_rate: number; details: any[] }>('/market/predictions/verify', { method: 'POST' }),
+  // Market Analysis 域 → 已归档。见本文件末尾「已归档：市场分析域」区块。
+  // 前端全仓零引用（连视图都没有），对应后端已 410 Gone / 表冻结 / 配置关闭。
 
   // Skills (from memories via /api/modules/skills)
   listSkills: (search = '') =>
@@ -788,8 +810,10 @@ export const api = {
     request<{ skills_dir: string; count: number; skills: SkillFileEntry[] }>(
       `/modules/skills/files${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`
     ),
+  // 2026-09-28 D9：imported 已收紧为「真正落库数」；skipped（去重拦截）/
+  // rejected（明文密钥守卫拒绝）均未写入，必须单独展示，不能再并进 imported。
   importSkillsFromDir: (dir = '') =>
-    request<{ scanned: number; imported: number; errors: number }>('/modules/skills/import', {
+    request<{ scanned: number; imported: number; skipped: number; rejected: number; errors: number }>('/modules/skills/import', {
       method: 'POST',
       body: JSON.stringify({ dir }),
     }),
@@ -806,11 +830,28 @@ export const api = {
     }),
   deleteMcpServer: (name: string) =>
     request<{ success: boolean }>(`/modules/mcp/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-  importMcpFile: (filePath: string, options?: { name?: string; args?: string[]; description?: string; disabled?: boolean }) =>
+  importMcpFile: (filePath: string, options?: { name?: string; args?: string[]; description?: string; disabled?: boolean; confirm_outside?: boolean }) =>
     request<ImportMcpResult>('/modules/mcp/import-file', {
       method: 'POST',
       body: JSON.stringify({ file_path: filePath, ...options }),
     }),
+
+  // MCP 真实健康检查：配置里 enabled 只代表开关，这里回答「实际能不能连上」
+  mcpHealth: (opts?: { refresh?: boolean; timeout?: number; ttl?: number }) => {
+    const q = new URLSearchParams()
+    if (opts?.refresh) q.set('refresh', '1')
+    if (opts?.timeout) q.set('timeout', String(opts.timeout))
+    if (opts?.ttl !== undefined) q.set('ttl', String(opts.ttl))
+    const qs = q.toString()
+    return request<McpHealthSnapshot>(`/modules/mcp/health${qs ? `?${qs}` : ''}`)
+  },
+  mcpHealthOne: (name: string, opts?: { refresh?: boolean; timeout?: number }) => {
+    const q = new URLSearchParams()
+    if (opts?.refresh) q.set('refresh', '1')
+    if (opts?.timeout) q.set('timeout', String(opts.timeout))
+    const qs = q.toString()
+    return request<McpHealthResult>(`/modules/mcp/health/${encodeURIComponent(name)}${qs ? `?${qs}` : ''}`)
+  },
 
   // Modules Stats (for dashboard)
   getModulesStats: () =>
@@ -853,4 +894,60 @@ export const api = {
   },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, PeriodicSummary, Skill, SkillSuggestion, ModuleSkill, McpServer, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, PeriodicSummary, Skill, SkillSuggestion, ModuleSkill, McpServer, McpHealthResult, McpHealthSnapshot, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats, CacheStats }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   已归档：市场分析域（2026-09-16）
+   ───────────────────────────────────────────────────────────────────────────
+   为什么归档（三条独立证据，均已在后端侧确认）：
+     1. 后端主动封存 —— `backend/routers/market.py` 自述已封存：
+        `getCFTCData` / `getCFTCGold` 直接返回 HTTP 410 Gone，其余端点硬编码
+        返回 `{"success": false}` / `[]` / `{hit_rate: 0}`，全是墓碑不是实现。
+     2. 底层实现已移走 —— `market_analyzer.py` / `cftc_service.py` / `macro_data.py`
+        已在 `backend/_archived/`；数据侧 `cftc_cache` 表 0 行、
+        `market_reports` 冻结在 2026-07-17。
+     3. 配置关闭 —— `config.yaml: market_analysis_enabled: false`。
+     4. 前端零引用 —— 全仓 grep `market|Market|CFTC` 零命中，没有任何视图会调这些方法。
+
+   归档形式：方法体**原样保留**（本项目红线是零删除），但从 `api` 对象移出，
+   落到本文件末尾的 `apiArchive`，不再出现在 `api.*` 的主 API 面上。
+   没有模块 import `apiArchive`，`vite build` 会把它 tree-shake 掉，不进产物。
+
+   如何恢复：把下面 11 个方法整体复制回 `api` 对象里（放回原来
+   `// Market Analysis` 注释处即可），然后删除本区块与 `apiArchive` 导出。
+   ═══════════════════════════════════════════════════════════════════════════ */
+export const apiArchive = {
+  // Market Analysis（原属 api 对象，2026-09-16 归档）
+  getMarketStatus: () =>
+    request<{ indicators: MarketIndicator[]; latest_report: { id: number | null; report_date: string | null; gold_price: string; daily_advice: string } | null }>('/market/status'),
+
+  getCFTCData: () =>
+    request<{ data: CFTCPosition[]; report_date: string; freshness: string }>('/market/cftc'),
+
+  getCFTCGold: () =>
+    request<any>('/market/cftc/gold'),
+
+  getMarketReports: (limit = 30) =>
+    request<MarketReport[]>(`/market/reports?limit=${limit}`),
+
+  getLatestReport: () =>
+    request<MarketReport>('/market/reports/latest'),
+
+  getMarketReport: (id: number) =>
+    request<MarketReport>(`/market/reports/${id}`),
+
+  runAnalysis: () =>
+    request<{ success: boolean; report_id: number; report_date: string }>('/market/run-analysis', { method: 'POST' }),
+
+  refreshMarketData: () =>
+    request<{ success: boolean; cftc: any; macro_count: number }>('/market/refresh-data'),
+
+  getPredictions: (date = '', verified = '') =>
+    request<MarketPrediction[]>(`/market/predictions?date=${date}&verified=${verified}`),
+
+  getHitRate: (days = 30) =>
+    request<HitRateResult>(`/market/predictions/hit-rate?days=${days}`),
+
+  verifyPredictions: () =>
+    request<{ success: boolean; total: number; hit: number; miss: number; hit_rate: number; details: any[] }>('/market/predictions/verify', { method: 'POST' }),
+}

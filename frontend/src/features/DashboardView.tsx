@@ -62,6 +62,9 @@ export default function DashboardView() {
     { key: 'skills', name: '技能卡片', path: '/skills', color: '#ff79c6', icon: 'skill', badge: String(stats.skills), desc: '可复用操作流程，AI 自动匹配场景' },
     { key: 'mcp', name: 'MCP 服务', path: '/library?tab=mcp', color: '#8be9fd', icon: 'knowledge', badge: `${stats.mcp} 在线`, desc: '外部 MCP 工具服务配置与状态' },
     { key: 'knowledge', name: '知识库', path: '/knowledge', color: '#f1fa8c', icon: 'knowledge', badge: stats.kb, desc: 'PDF 入库 + 向量检索 + 上下文增强' },
+    // badge 用静态文案而非计数：数据源 /api/processes/snapshot 是重量级操作
+    // （全机枚举进程+端口，15s TTL + force 参数），不宜随主页面每次加载触发。
+    { key: 'processes', name: '进程监控', path: '/processes', color: '#ff5555', icon: 'goal', badge: '实时', desc: '本机进程与监听端口采集，支持分组检索' },
   ]
 
   return (

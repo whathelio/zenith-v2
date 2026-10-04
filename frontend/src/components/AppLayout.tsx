@@ -362,6 +362,7 @@ export default function AppLayout() {
             <Link to="/calendar" className="btn btn-sm">📋 日程</Link>
             <Link to="/library" className="btn btn-sm">📚 知识库</Link>
             <Link to="/summary" className="btn btn-sm">📊 总结</Link>
+            <Link to="/processes" className="btn btn-sm">🖥 进程</Link>
             {kbAvailable && <Link to="/knowledge" className="btn btn-sm">🔗 外部知识</Link>}
             <Link to="/settings" className="btn btn-sm">⚙ 设置</Link>
           </div>

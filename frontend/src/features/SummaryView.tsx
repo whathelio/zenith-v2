@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api, type PeriodicSummary } from '../shared/api'
 import Markdown from '../components/Markdown'
 
@@ -17,17 +17,26 @@ export default function SummaryView() {
   const [selected, setSelected] = useState<PeriodicSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [generating, setGenerating] = useState(false)
+  // B-12 / B-11（2026-09-11）：原先失败只在 console.error —— 界面毫无反馈，
+  // 用户看到的是「空列表」，会以为「这段时间没有总结」，实为加载失败。
+  // 另：切换 日/周/月/年 会并发多个请求，加序号守卫防乱序覆盖。
+  const [error, setError] = useState('')
+  const seqRef = useRef(0)
 
   const loadList = useCallback(async (type: PeriodType) => {
+    const seq = ++seqRef.current
     setLoading(true)
     try {
       const items = await api.listSummaries(type)
+      if (seq !== seqRef.current) return          // 已有更新的请求 → 丢弃本次（B-11）
       setList(items)
       setSelected(items.length > 0 ? items[0] : null)
-    } catch (e) {
-      console.error('加载总结列表失败', e)
+      setError('')
+    } catch (e: any) {
+      if (seq !== seqRef.current) return
+      setError(e?.message || '加载总结列表失败')   // B-12：显式可见
     } finally {
-      setLoading(false)
+      if (seq === seqRef.current) setLoading(false)
     }
   }, [])
 
@@ -41,8 +50,8 @@ export default function SummaryView() {
     try {
       await api.generateSummary(selected.period_type, selected.period_key)
       await loadList(periodType)
-    } catch (e) {
-      console.error('重新生成失败', e)
+    } catch (e: any) {
+      setError(`重新生成失败：${e?.message || e}`)   // B-12：原先只有 console.error
     } finally {
       setGenerating(false)
     }
@@ -81,6 +90,24 @@ export default function SummaryView() {
           {generating ? '生成中...' : '重新生成'}
         </button>
       </div>
+      {/* B-12：失败必须显式可见，并与「真的没有总结」区分开 */}
+      {error && (
+        <div style={{
+          marginBottom: 10, padding: '6px 10px', borderRadius: 6, fontSize: 12,
+          background: 'rgba(224,85,85,0.08)', border: '1px solid rgba(224,85,85,0.35)',
+          color: 'var(--color-accent-danger, #e05555)',
+          display: 'flex', alignItems: 'flex-start', gap: 8,
+        }}>
+          <span style={{ flex: 1 }}>⚠ {error}</span>
+          <button
+            onClick={() => loadList(periodType)}
+            style={{
+              background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+              color: 'var(--color-accent-primary)', fontSize: 'inherit', textDecoration: 'underline',
+            }}
+          >重试</button>
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 12, flex: 1, minHeight: 0 }}>
         {/* 左侧列表 */}

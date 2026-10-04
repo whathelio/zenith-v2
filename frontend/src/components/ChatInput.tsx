@@ -117,8 +117,22 @@ export default function ChatInput({ onSend, isLoading, onStop }: ChatInputProps)
             <h3 style={{ margin: '0 0 8px', color: 'var(--color-accent-warning, #f0a030)', fontSize: 16 }}>
               ⚠ 检测到 {sanitizeDialog.matches.length} 处疑似敏感内容
             </h3>
-            <p style={{ fontSize: 13, color: 'var(--color-text-muted)', margin: '0 0 16px' }}>
+            <p style={{ fontSize: 13, color: 'var(--color-text-muted)', margin: '0 0 8px' }}>
               粘贴内容中包含 API Key / Token / 密钥。建议脱敏后发送，Zenith 只会看到占位符 {'{{SEC_xxx}}'}，不会存储原文。
+            </p>
+            {/* ⚠️ 2026-09-11：知情同意补全。
+                「拒绝脱敏」是**用户的权利**（策略已定：尊重用户意愿，原文可以发送并入库），
+                但原先该选项只写「直接发送原文」，**没有说明代价** ——
+                用户无从得知这意味着敏感值会明文交给 LLM 服务方、并永久写入本地数据库。
+                这里把代价写在**选择点之前**，让选择建立在知情之上。
+                注意：本改动**不改变任何行为**，只是把已有事实说清楚。 */}
+            <p style={{
+              fontSize: 12, color: 'var(--color-accent-danger, #e05555)',
+              background: 'rgba(224,85,85,0.08)', border: '1px solid rgba(224,85,85,0.35)',
+              borderRadius: 6, padding: '8px 10px', margin: '0 0 16px', lineHeight: 1.6,
+            }}>
+              选「仍发送原文」的后果：这些敏感值会 <b>明文发送给 LLM 服务方</b>，并 <b>存入本地数据库</b>，
+              不经过脱敏与还原流程，事后无法自动回收。
             </p>
             <div style={{
               maxHeight: 160, overflow: 'auto', marginBottom: 16,
@@ -141,11 +155,11 @@ export default function ChatInput({ onSend, isLoading, onStop }: ChatInputProps)
                 onClick={handleSanitizeReject}
                 style={{
                   padding: '8px 18px', borderRadius: 6, border: '1px solid var(--color-border)',
-                  background: 'transparent', color: 'var(--color-text)', cursor: 'pointer',
+                  background: 'transparent', color: 'var(--color-text-primary)', cursor: 'pointer',
                   fontSize: 13,
                 }}
               >
-                直接发送原文
+                仍发送原文（不脱敏）
               </button>
               <button
                 onClick={handleSanitizeConfirm}

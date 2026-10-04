@@ -5,10 +5,24 @@ import ChatMessages from '../components/ChatMessages'
 import ChatInput from '../components/ChatInput'
 import ProposalsBar from '../components/ProposalsBar'
 import { toTraceEntry, type TraceEntry } from '../components/TraceCard'
-import { api, type Message, type Proposal, type ConversationSummary } from '../shared/api'
+import { api, type Message, type Proposal, type ConversationSummary, type DistillResult } from '../shared/api'
 import { takePendingMessage } from '../shared/pendingMessage'
 
 let _msgIdCounter = 0
+
+/**
+ * HTML 转义 —— 凡进 dangerouslySetInnerHTML 的文本都必须先过这一层。
+ * reminder 的正文来自后端 check_reminders()，其中含日程 title（用户可写 / LLM 可生成），
+ * 原实现直接 replace('**'→'<strong>') 而不转义，等于给出了一条可注入的路径。
+ */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
 
 export default function ChatView() {
   const { convId } = useParams<{ convId: string }>()
@@ -28,12 +42,18 @@ export default function ChatView() {
   const [reminder, setReminder] = useState('')
   const [reminderDismissed, setReminderDismissed] = useState(false)
   const [error, setError] = useState('')
+  // B-13① 2026-09-11：校验警告原先被**完全丢弃** —— `warning` 分支只有一句注释没有代码，
+  // 于是后端发来的 L3 输出校验（绝对化表述/高风险领域/记忆矛盾）与工具结果校验警告
+  // 用户永远看不到。现收集后渲染（带去重 + 可关闭）。
+  const [warnings, setWarnings] = useState<string[]>([])
   const [summarizing, setSummarizing] = useState(false)
   const [summaryResult, setSummaryResult] = useState<ConversationSummary | null>(null)
+  // 蒸馏独立于总结：蒸馏会额外把经验/知识点落库并写 txt 产物，不能与总结共用一份结果 state
+  const [distilling, setDistilling] = useState(false)
+  const [distillResult, setDistillResult] = useState<DistillResult | null>(null)
   const [convCollapsed, setConvCollapsed] = useState(false)
   const [toolCallBubbles, setToolCallBubbles] = useState<TraceEntry[]>([])
   const [thinkingText, setThinkingText] = useState('')
-  const [thinkingStart, setThinkingStart] = useState<number | undefined>(undefined)
   const [thinkingDone, setThinkingDone] = useState(false)
   const [selectedProvider, setSelectedProvider] = useState('')
   const [providers, setProviders] = useState<{ name: string; model: string }[]>([])
@@ -44,7 +64,6 @@ export default function ChatView() {
   const [backgroundModal, setBackgroundModal] = useState(false)
   const [convBgImage, setConvBgImage] = useState('')
 
-  const chatEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
   // 组件卸载时取消正在进行的 SSE 流（后端后台任务继续处理不受影响）
@@ -70,7 +89,6 @@ export default function ChatView() {
       // 清空流式残留状态（思考/文本/工具气泡），切换到新对话时先展示干净，再由 loadConversation 拉取该对话数据
       setThinkingText('')
       setThinkingDone(false)
-      setThinkingStart(undefined)
       setStreamingText('')
       setToolCallBubbles([])
 
@@ -86,9 +104,10 @@ export default function ChatView() {
       // 回读历史执行痕迹（conversation_traces 表）— 切换模块回来不丢失工具气泡
       try {
         const traces = await api.getConvTraces(id)
-        // 后端返回 id DESC（最新在前），反转为正序（旧→新）让历史痕迹按时间顺序展示
+        // 只保留有 message_id 的痕迹：无归属的（所属轮次消息已删）丢弃，
+        // 否则会落入 unboundTraces 堆在消息列表底部挡住结论
         const bubbles = traces
-          .filter((t: any) => t.trace_type === 'tool_call')
+          .filter((t: any) => t.trace_type === 'tool_call' && t.message_id != null)
           .reverse()
           .map((t: any) => {
             let data: any = {}
@@ -155,10 +174,6 @@ export default function ChatView() {
     if (p) handleSend(p)
   }, [activeConv])
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingText])
-
   const handleNewChat = async () => {
     try {
       const conv = await api.createConversation(undefined, selectedPersona)
@@ -202,12 +217,12 @@ export default function ChatView() {
   /** 重置一轮对话的临时状态（发送/重新生成/编辑前调用） */
   const resetRoundState = () => {
     setError('')
+    setWarnings([])
     setReminder('')
     setProposals([])
     setToolCallBubbles([])
     setStreamingText('')
     setThinkingText('')
-    setThinkingStart(undefined)
     setThinkingDone(false)
   }
 
@@ -249,7 +264,6 @@ export default function ChatView() {
               assistantText += data.content
               setStreamingText(assistantText)
             } else if (data.type === 'thinking') {
-              setThinkingStart(prev => prev || Date.now())
               setThinkingText(prev => prev + (data.content || ''))
             } else if (data.type === 'full_text') {
               if (data.conversation_id && data.conversation_id !== convIdRef) {
@@ -288,7 +302,14 @@ export default function ChatView() {
                 } : b
               ))
             } else if (data.type === 'warning') {
-              // 校验警告 — 暂以静默方式展示在痕迹中
+              // B-13①：原先此处是空分支（只有一行注释），警告被静默丢弃。
+              // 后端字段：工具结果校验发 {level, message, tool}，L3 输出校验发 {level, message}
+              // —— 兼容读取 message/content 两种历史写法，避免任一漏显示。
+              const wText = String(data.message || data.content || '').trim()
+              if (wText) {
+                const line = `${data.tool ? `[${data.tool}] ` : ''}${wText}`
+                setWarnings(prev => (prev.includes(line) ? prev : [...prev, line]))
+              }
             } else if (data.type === 'error') {
               setError(data.message || '生成出错')
             } else if (data.type === 'done') {
@@ -310,18 +331,6 @@ export default function ChatView() {
     }
     return assistantText
   }, [activeConv, navigate])
-
-  const appendAssistant = useCallback((convId: string, text: string) => {
-    if (!text.trim()) return
-    const assistantMsg: Message = {
-      id: ++_msgIdCounter,
-      conversation_id: convId,
-      role: 'assistant',
-      content: text,
-      created_at: new Date().toISOString(),
-    }
-    setMessages(prev => [...prev, assistantMsg])
-  }, [])
 
   const handleSend = async (text: string) => {
     if (!text.trim() || isLoading) return
@@ -360,8 +369,10 @@ export default function ChatView() {
         const err = await res.json().catch(() => ({ error: res.statusText }))
         throw new Error(err.error || '请求失败')
       }
-      const assistantText = await consumeSSE(res)
-      appendAssistant(convId, assistantText)
+      await consumeSSE(res)
+      // 流式结束后重新拉取完整对话：assistant 结论 + 工具痕迹从数据库回读，
+      // 痕迹归位到 user 消息下方（结论之上），同时清空流式残留的 unboundTraces
+      await loadConversation(convId)
     } catch (e: any) {
       setError(e.message)
     } finally {
@@ -383,10 +394,9 @@ export default function ChatView() {
         const err = await res.json().catch(() => ({ error: res.statusText }))
         throw new Error(err.error || '重新生成失败')
       }
-      const assistantText = await consumeSSE(res)
-      // 后端已删除旧的 assistant 消息，重新拉取完整对话
+      await consumeSSE(res)
+      // 后端已删除旧的 assistant 消息，重新拉取完整对话（含新结论 + 归位后的工具痕迹）
       await loadConversation(activeConv.id)
-      appendAssistant(activeConv.id, assistantText)
     } catch (e: any) {
       setError(e.message)
       await loadConversation(activeConv.id)
@@ -410,9 +420,8 @@ export default function ChatView() {
       }
       const ctype = res.headers.get('content-type') || ''
       if (ctype.includes('text/event-stream')) {
-        const assistantText = await consumeSSE(res)
+        await consumeSSE(res)
         await loadConversation(activeConv.id)
-        appendAssistant(activeConv.id, assistantText)
       } else {
         // assistant 消息编辑 — 仅保存，刷新列表
         await loadConversation(activeConv.id)
@@ -597,6 +606,30 @@ export default function ChatView() {
     }
   }
 
+  /**
+   * 蒸馏当前对话 —— 后端 `POST /api/distill/conversation/{id}` 本来就是活接口
+   * （LLM 工具通道调用过 7 次、data/distill/ 已积压 119 份 txt 产物），
+   * 但前端一直没有入口，每次都得绕道让模型自己去调工具。此处补上。
+   */
+  const handleDistill = async () => {
+    if (!activeConv?.id || distilling) return
+    if (messages.length < 2) {
+      setError('对话至少需要2条消息才能蒸馏')
+      return
+    }
+    setDistilling(true)
+    setDistillResult(null)
+    setError('')
+    try {
+      const result = await api.distillConversation(activeConv.id)
+      setDistillResult(result)
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setDistilling(false)
+    }
+  }
+
   return (
     <div className="chat-layout">
       {/* 会话列表 — 瘦身可折叠 */}
@@ -641,7 +674,7 @@ export default function ChatView() {
                 onChange={(e) => setSelectedProvider(e.target.value)}
                 style={{
                   background: 'var(--color-bg-input)',
-                  color: 'var(--color-text)',
+                  color: 'var(--color-text-primary)',
                   border: '1px solid var(--color-border)',
                   borderRadius: '6px',
                   padding: '4px 8px',
@@ -671,7 +704,7 @@ export default function ChatView() {
                 }}
                 style={{
                   background: 'var(--color-bg-input)',
-                  color: 'var(--color-text)',
+                  color: 'var(--color-text-primary)',
                   border: '1px solid var(--color-border)',
                   borderRadius: '6px',
                   padding: '4px 8px',
@@ -750,6 +783,21 @@ export default function ChatView() {
                 {summarizing ? '⏳ 总结中...' : '🧪 总结对话'}
               </button>
             )}
+            {activeConv && messages.length >= 2 && (
+              <button
+                className="btn btn-sm"
+                title="蒸馏 = 总结 + 知识提取 + 经验入库 + 生成 txt 产物（data/distill/）"
+                style={{
+                  background: distilling ? 'var(--color-bg-muted)' : 'var(--color-accent-secondary)',
+                  color: '#fff',
+                  cursor: distilling ? 'wait' : 'pointer',
+                }}
+                onClick={handleDistill}
+                disabled={distilling}
+              >
+                {distilling ? '⏳ 蒸馏中...' : '⚗️ 蒸馏本对话'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -768,7 +816,7 @@ export default function ChatView() {
           }}>
             <div style={{ flex: 1, whiteSpace: 'pre-line' }}
               dangerouslySetInnerHTML={{
-                __html: reminder
+                __html: escapeHtml(reminder)
                   .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
                   .replace(/\*(.+?)\*/g, '<em>$1</em>')
               }}
@@ -795,7 +843,6 @@ export default function ChatView() {
             toolCallBubbles={toolCallBubbles}
             thinkingText={thinkingText}
             thinkingDone={thinkingDone}
-            thinkingStartTime={thinkingStart}
             onRegenerate={handleRegenerate}
             onEditMessage={handleEditMessage}
             onDeleteMessage={handleDeleteMessage}
@@ -805,7 +852,27 @@ export default function ChatView() {
               ⚠ {error}
             </div>
           )}
-          <div ref={chatEndRef} />
+          {warnings.length > 0 && (
+            <div style={{
+              margin: '0 24px 8px', padding: '8px 12px', borderRadius: 6,
+              background: 'rgba(240,160,48,0.10)', border: '1px solid rgba(240,160,48,0.35)',
+              color: 'var(--color-accent-warning, #f0a030)', fontSize: 'var(--font-size-sm)',
+              display: 'flex', alignItems: 'flex-start', gap: 8,
+            }}>
+              <div style={{ flex: 1, whiteSpace: 'pre-line', lineHeight: 1.6 }}>
+                {warnings.map(w => `⚠ ${w}`).join('\n')}
+              </div>
+              <button
+                onClick={() => setWarnings([])}
+                title="关闭校验提示"
+                aria-label="关闭校验提示"
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: 'var(--color-text-muted)', fontSize: 15, lineHeight: 1, padding: 0, flex: 'none',
+                }}
+              >×</button>
+            </div>
+          )}
         </div>
 
         {proposals.length > 0 && (
@@ -830,24 +897,33 @@ export default function ChatView() {
             alignItems: 'center',
             justifyContent: 'center',
             zIndex: 1000,
+            padding: 16,
           }}
           onClick={() => setSummaryResult(null)}
         >
+          {/* 三段式布局：头部固定 / 内容区唯一滚动 / 底部按钮固定。
+              原先 overflow:auto 挂在整个卡片上、按钮排在内容末尾 —— 总结内容一长
+              按钮就被推到滚动区底部，看起来像「溢出屏幕、点不到」。 */}
           <div
             style={{
               background: 'var(--color-bg-panel)',
               border: '1px solid var(--color-border)',
               borderRadius: 12,
-              padding: 24,
               maxWidth: 700,
               width: '90%',
-              maxHeight: '80vh',
-              overflow: 'auto',
+              maxHeight: '85vh',
+              display: 'flex',
+              flexDirection: 'column',
+              overflow: 'hidden',
               boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
             }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '16px 24px 12px', flexShrink: 0,
+              borderBottom: '1px solid var(--color-border)',
+            }}>
               <h3 style={{ fontSize: 18, fontWeight: 600 }}>🧪 对话总结与经验蒸馏</h3>
               <button
                 className="btn-icon"
@@ -857,6 +933,13 @@ export default function ChatView() {
                 ×
               </button>
             </div>
+
+            <div style={{
+              flex: 1, minHeight: 0,
+              overflowY: 'auto', overflowX: 'hidden',
+              padding: '12px 24px',
+              wordBreak: 'break-word', overflowWrap: 'anywhere',
+            }}>
 
             <div style={{ marginBottom: 12, fontSize: 12, color: 'var(--color-text-muted)' }}>
               对话: {summaryResult.title} | 消息数: {summaryResult.message_count}
@@ -935,13 +1018,97 @@ export default function ChatView() {
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
+            </div>
+
+            <div style={{
+              display: 'flex', gap: 12, padding: '12px 24px 16px', flexShrink: 0,
+              borderTop: '1px solid var(--color-border)',
+            }}>
               <Link to="/library?tab=memories" className="btn btn-sm" style={{ background: '#ff6e40', color: '#fff' }}>
                 🧠 查看知识库
               </Link>
               <button className="btn btn-sm" onClick={() => setSummaryResult(null)}>
                 关闭
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 蒸馏结果模态框 — 比总结模态框薄：蒸馏的额外产出是「落了哪些库 + txt 落盘路径」，
+          逐条清单已经在总结里看得到，这里只需要告诉用户产物在哪、去哪儿查 */}
+      {distillResult && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+            padding: 16,
+          }}
+          onClick={() => setDistillResult(null)}
+        >
+          {/* 同总结弹窗：三段式，保证底部按钮始终可见 */}
+          <div
+            style={{
+              background: 'var(--color-bg-panel)', border: '1px solid var(--color-accent-secondary)',
+              borderRadius: 12, maxWidth: 620, width: '90%', maxHeight: '85vh',
+              display: 'flex', flexDirection: 'column', overflow: 'hidden',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '16px 24px 12px', flexShrink: 0,
+              borderBottom: '1px solid var(--color-border)',
+            }}>
+              <h3 style={{ fontSize: 17, fontWeight: 600, color: 'var(--color-accent-secondary)' }}>⚗️ 对话蒸馏完成</h3>
+              <button className="btn-icon" style={{ width: 32, height: 32, fontSize: 18 }} onClick={() => setDistillResult(null)}>×</button>
+            </div>
+
+            <div style={{
+              flex: 1, minHeight: 0,
+              overflowY: 'auto', overflowX: 'hidden',
+              padding: '12px 24px',
+              wordBreak: 'break-word', overflowWrap: 'anywhere',
+            }}>
+
+            {distillResult.title && (
+              <div style={{ marginBottom: 10, fontSize: 12, color: 'var(--color-text-muted)' }}>对话: {distillResult.title}</div>
+            )}
+
+            {distillResult.summary && (
+              <div style={{ marginBottom: 14, padding: 12, background: 'var(--color-bg-primary)', borderRadius: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-accent-primary)', marginBottom: 6 }}>📝 概要</div>
+                <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--color-text-primary)' }}>{distillResult.summary}</div>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 14, fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              <span>🔥 经验 {distillResult.experiences?.length ?? 0} 条</span>
+              <span>💡 知识点 {distillResult.knowledge?.length ?? 0} 条</span>
+              {!!distillResult.saved_count && <span>✅ 新入库 {distillResult.saved_count} 条</span>}
+              {!!distillResult.skip_count && <span style={{ color: 'var(--color-text-muted)' }}>↩︎ 已存在跳过 {distillResult.skip_count} 条</span>}
+            </div>
+
+            {distillResult.txt_path && (
+              <div style={{ marginBottom: 14, padding: 10, background: 'var(--color-bg-muted)', borderRadius: 6 }}>
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 4 }}>txt 产物已落盘</div>
+                <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--color-text-secondary)', wordBreak: 'break-all' }}>
+                  {distillResult.txt_path}
+                </div>
+              </div>
+            )}
+
+            </div>
+
+            <div style={{
+              display: 'flex', gap: 12, padding: '12px 24px 16px', flexShrink: 0,
+              borderTop: '1px solid var(--color-border)',
+            }}>
+              <Link to="/library?tab=memories" className="btn btn-sm" style={{ background: 'var(--color-accent-secondary)', color: '#000' }}>
+                🧠 查看知识库
+              </Link>
+              <button className="btn btn-sm" onClick={() => setDistillResult(null)}>关闭</button>
             </div>
           </div>
         </div>

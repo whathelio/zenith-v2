@@ -4,9 +4,9 @@ import { api, type Settings } from '../shared/api'
 import GlobalBackground from '../components/GlobalBackground'
 
 const defaultSettings: Settings = {
-  api_base: 'https://open.bigmodel.cn/api/paas/v4',
+  api_base: 'https://api.deepseek.com/v1',
   api_key: '',
-  model: 'glm-5.2',
+  model: 'deepseek-flash',
   temperature: 0.7,
   max_tokens: 8192,
   system_prompt: '',
@@ -28,8 +28,8 @@ const PRESETS = [
   },
   {
     id: 'deepseek', name: 'DeepSeek 官方', icon: '🐋', color: '#4d6bfe',
-    api_base: 'https://api.deepseek.com/v1', suggestModel: 'deepseek-v4-pro', max_tokens: 16384,
-    desc: 'platform.deepseek.com | deepseek-v4-pro / deepseek-chat',
+    api_base: 'https://api.deepseek.com/v1', suggestModel: 'deepseek-flash', max_tokens: 16384,
+    desc: 'platform.deepseek.com | deepseek-flash（V4.1 Flash）',
   },
   {
     id: 'siliconflow', name: '硅基流动', icon: '🌊', color: '#ff79c6',

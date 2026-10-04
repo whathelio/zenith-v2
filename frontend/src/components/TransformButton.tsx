@@ -137,20 +137,36 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
           position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
           background: 'rgba(0,0,0,0.5)', zIndex: 1000,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: 16,
         }} onClick={handleCancel}>
+          {/* 三段式布局：头部固定 / 内容区唯一滚动 / 底部按钮固定。
+              原先 overflow-y 挂在整个卡片上、按钮排在内容末尾 —— 笔记内容一长
+              「✓ 确认保留」就被推到滚动区底部，看起来像「溢出屏幕、点不到」。 */}
           <div style={{
-            maxWidth: 500, width: '90%', maxHeight: '80vh', overflowY: 'auto',
-            padding: 20, borderRadius: 10, background: 'var(--color-bg-panel)',
+            maxWidth: 500, width: '90%', maxHeight: '85vh',
+            display: 'flex', flexDirection: 'column', overflow: 'hidden',
+            borderRadius: 10, background: 'var(--color-bg-panel)',
             border: '1px solid var(--color-accent-primary)',
           }} onClick={e => e.stopPropagation()}>
-            <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--color-accent-primary)', marginBottom: 12 }}>
-              {typeIcons[preview.target_type]} 转化为{typeLabels[preview.target_type]}
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
-              从 {typeLabels[preview.source_type]} #{preview.source_id} 转化而来 · 待确认
+            <div style={{
+              padding: '16px 20px 12px', flexShrink: 0,
+              borderBottom: '1px solid var(--color-border)',
+            }}>
+              <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--color-accent-primary)', marginBottom: 6 }}>
+                {typeIcons[preview.target_type]} 转化为{typeLabels[preview.target_type]}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                从 {typeLabels[preview.source_type]} #{preview.source_id} 转化而来 · 待确认
+              </div>
             </div>
 
-            {/* 预览内容 */}
+            {/* 预览内容 — 唯一滚动区 */}
+            <div style={{
+              flex: 1, minHeight: 0,
+              overflowY: 'auto', overflowX: 'hidden',
+              padding: '12px 20px',
+              wordBreak: 'break-word', overflowWrap: 'anywhere',
+            }}>
             <div style={{
               padding: 14, borderRadius: 8, background: 'var(--color-bg-input)',
               border: '1px solid var(--color-border)', fontSize: 13, lineHeight: 1.6,
@@ -211,8 +227,14 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
               )}
             </div>
 
-            {/* 操作按钮 */}
-            <div style={{ display: 'flex', gap: 8, marginTop: 16, justifyContent: 'flex-end' }}>
+            </div>
+
+            {/* 操作按钮 — 固定在底部，始终可见可点 */}
+            <div style={{
+              display: 'flex', gap: 8, justifyContent: 'flex-end',
+              padding: '12px 20px 16px', flexShrink: 0,
+              borderTop: '1px solid var(--color-border)',
+            }}>
               <button className="btn btn-sm btn-danger" onClick={handleCancel}>取消删除</button>
               <button className="btn btn-sm"
                 style={{ background: 'var(--color-accent-primary)', color: '#fff', fontWeight: 600 }}

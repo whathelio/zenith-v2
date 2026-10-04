@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { api, type Note, type Memory, type ModuleSkill, type McpServer } from '../shared/api'
+import { api, type Note, type Memory, type ModuleSkill, type McpServer, type McpHealthResult, type CacheStats } from '../shared/api'
 import { TransformButton } from '../components/TransformButton'
 import { lookupPlaceholder } from '../shared/security'
 
@@ -53,6 +53,45 @@ const SKILL_CONFIRMED_COLORS: Record<number, { bg: string; text: string; label: 
 }
 
 type Tab = 'notes' | 'memories' | 'skills' | 'mcp' | 'traces'
+
+/** token 数紧凑显示：12345 → 12.3k（统计条宽度有限，六七位数会把它撑爆） */
+function fmtTokens(n: number): string {
+  if (!n) return '0'
+  if (n < 1000) return String(n)
+  if (n < 1000000) return (n / 1000).toFixed(1) + 'k'
+  return (n / 1000000).toFixed(2) + 'M'
+}
+
+/**
+ * MCP 服务指示灯。
+ * 关键区别：配置里的 `enabled` 只是开关，不代表服务真的能连上。
+ * 未体检过（health 为空）一律显示灰色「未检测」，绝不用绿色假装可用。
+ */
+type McpLamp = { color: string; label: string }
+function mcpLamp(health: McpHealthResult | undefined): McpLamp {
+  if (!health) return { color: '#6272a4', label: '未检测（点「🔍 检查」体检）' }
+  switch (health.state) {
+    case 'ok': return { color: '#50fa7b', label: '握手正常' }
+    case 'error': return { color: '#ff5555', label: '不可达' }
+    case 'disabled': return { color: '#f1fa8c', label: '已禁用（未检测）' }
+    case 'unknown': return { color: '#ffb86c', label: '配置不完整' }
+    default: return { color: '#6272a4', label: health.state || '未知' }
+  }
+}
+
+/** 拼接指示灯的悬浮详情：状态 + 延迟 + 工具数 + 错误原因 */
+function mcpLampTip(health: McpHealthResult | undefined, lamp: McpLamp): string {
+  if (!health) return lamp.label
+  const parts = [lamp.label]
+  if (health.state === 'ok') {
+    parts.push(`延迟 ${Math.round(health.latency_ms)}ms`)
+    parts.push(`${health.tool_count} 个工具`)
+    if (health.tools?.length) parts.push(`工具: ${health.tools.slice(0, 8).join(', ')}${health.tools.length > 8 ? ' …' : ''}`)
+  }
+  if (health.error) parts.push(`错误: ${health.error}`)
+  if (health.cached) parts.push('（缓存结果）')
+  return parts.join('\n')
+}
 
 export default function LibraryView() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -117,6 +156,10 @@ export default function LibraryView() {
   const [mcpLoading, setMcpLoading] = useState(true)
   const [showMcpAdd, setShowMcpAdd] = useState(false)
   const [newMcp, setNewMcp] = useState({ name: '', url: '', enabled: true })
+  // MCP 真实健康状态（key = 服务名）。空 = 尚未检测，不臆测。
+  const [mcpHealth, setMcpHealth] = useState<Record<string, McpHealthResult>>({})
+  const [mcpChecking, setMcpChecking] = useState(false)
+  const [mcpCheckedAt, setMcpCheckedAt] = useState<string | null>(null)
 
   // Skill 导入
   const [showSkillImport, setShowSkillImport] = useState(false)
@@ -128,15 +171,40 @@ export default function LibraryView() {
   const [mcpFileImportName, setMcpFileImportName] = useState('')
   const [mcpFileImportArgs, setMcpFileImportArgs] = useState('')
   const [mcpFileImportLoading, setMcpFileImportLoading] = useState(false)
+  // 目录白名单之外被后端 403 拒绝的路径。存下来是为了让用户显式二次确认
+  // （本机手工导入第三方 server 是真实需求，不该被静默挡掉，但也不能自动放行）。
+  const [mcpOutsideConfirm, setMcpOutsideConfirm] = useState('')
+
+  // LLM 前缀缓存命中统计（cache_stats 表聚合）
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null)
+  const [cacheStatsLoading, setCacheStatsLoading] = useState(false)
+  const [cacheHours, setCacheHours] = useState(24)
 
   const [toast, setToast] = useState<string | null>(null)
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2500) }
 
+  // B-11 / B-12（2026-09-11）：本组件四个 loader 原先都是 `catch {}`（静默）且**无请求守卫**。
+  //   · B-12 静默 → 失败时列表保持旧值或空，用户以为「就这些」，实为加载失败；
+  //   · B-11 无守卫 → 搜索框连续输入会并发多个请求，先发的慢响应覆盖后发的快响应（乱序）。
+  // 方案：每个 loader 一个请求序号，只采纳最新一次的结果；失败复用既有 toast 明确提示。
+  const seqNotes = useRef(0)
+  const seqMem = useRef(0)
+  const seqSkills = useRef(0)
+  const seqMcp = useRef(0)
+
   // Load notes
   const loadNotes = useCallback(async () => {
+    const seq = ++seqNotes.current
     setNotesLoading(true)
-    try { const list = await api.listNotes(noteSearch); setNotes(list) } catch {} finally { setNotesLoading(false) }
+    try {
+      const list = await api.listNotes(noteSearch)
+      if (seq !== seqNotes.current) return          // 已有更新的请求 → 丢弃本次（B-11）
+      setNotes(list)
+    } catch (e: any) {
+      if (seq !== seqNotes.current) return
+      showToast(`笔记加载失败：${e?.message || e}`)   // B-12：不再静默
+    } finally { if (seq === seqNotes.current) setNotesLoading(false) }
   }, [noteSearch])
 
   useEffect(() => { loadNotes() }, [loadNotes])
@@ -148,12 +216,12 @@ export default function LibraryView() {
       setNotes(prev => [created, ...prev])
       setNewNote({ title: '', content: '', tags: '' })
       setShowNoteCreate(false)
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const handleDeleteNote = async (id: number) => {
     if (!confirm('删除此笔记？')) return
-    try { await api.deleteNote(id); setNotes(prev => prev.filter(n => n.id !== id)) } catch {}
+    try { await api.deleteNote(id); setNotes(prev => prev.filter(n => n.id !== id)) } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const startNoteEdit = (n: Note) => {
@@ -167,7 +235,7 @@ export default function LibraryView() {
       await api.updateNote(noteEditingId, noteEditForm)
       setNotes(prev => prev.map(n => n.id === noteEditingId ? { ...n, ...noteEditForm } : n))
       setNoteEditingId(null); setNoteEditForm({})
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const toggleNoteExpand = (id: number) => {
@@ -180,15 +248,23 @@ export default function LibraryView() {
 
   // Load memories
   const loadMemories = useCallback(async () => {
+    const seq = ++seqMem.current
     setMemoriesLoading(true)
-    try { const ms = await api.listMemories(memoryFilter, memorySearch); setMemories(ms) } catch {} finally { setMemoriesLoading(false) }
+    try {
+      const ms = await api.listMemories(memoryFilter, memorySearch)
+      if (seq !== seqMem.current) return            // B-11 防乱序覆盖
+      setMemories(ms)
+    } catch (e: any) {
+      if (seq !== seqMem.current) return
+      showToast(`记忆加载失败：${e?.message || e}`)   // B-12
+    } finally { if (seq === seqMem.current) setMemoriesLoading(false) }
   }, [memoryFilter, memorySearch])
 
   useEffect(() => { loadMemories() }, [loadMemories])
 
   const handleDeleteMemory = async (id: number) => {
     if (!confirm('删除此记忆？')) return
-    try { await api.deleteMemory(id); setMemories(prev => prev.filter(m => m.id !== id)) } catch {}
+    try { await api.deleteMemory(id); setMemories(prev => prev.filter(m => m.id !== id)) } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const startMemoryEdit = (m: Memory) => {
@@ -215,36 +291,86 @@ export default function LibraryView() {
 
   // Load skills
   const loadSkills = useCallback(async () => {
+    const seq = ++seqSkills.current
     setSkillsLoading(true)
-    try { setSkills(await api.listSkills(skillSearch)) } catch {} finally { setSkillsLoading(false) }
+    try {
+      const list = await api.listSkills(skillSearch)
+      if (seq !== seqSkills.current) return         // B-11 防乱序覆盖
+      setSkills(list)
+    } catch (e: any) {
+      if (seq !== seqSkills.current) return
+      showToast(`技能加载失败：${e?.message || e}`)   // B-12
+    } finally { if (seq === seqSkills.current) setSkillsLoading(false) }
   }, [skillSearch])
 
   useEffect(() => { loadSkills() }, [loadSkills])
 
-  const handleDeleteSkill = async (id: number) => { try { await api.deleteSkill(id); setExpandedSkillId(null); loadSkills() } catch {} }
+  const handleDeleteSkill = async (id: number) => { try { await api.deleteSkill(id); setExpandedSkillId(null); loadSkills() } catch (e: any) { showToast(`操作失败：${e?.message || e}`) } }
 
   // MCP
   const loadMcpServers = useCallback(async () => {
+    const seq = ++seqMcp.current
     setMcpLoading(true)
-    try { const result = await api.listMcpServers(); setMcpServers(result.servers) } catch {} finally { setMcpLoading(false) }
+    try {
+      const result = await api.listMcpServers()
+      if (seq !== seqMcp.current) return            // B-11 防乱序覆盖
+      setMcpServers(result.servers)
+    } catch (e: any) {
+      if (seq !== seqMcp.current) return
+      showToast(`MCP 列表加载失败：${e?.message || e}`)   // B-12
+    } finally { if (seq === seqMcp.current) setMcpLoading(false) }
   }, [])
   useEffect(() => { if (activeTab === 'mcp') loadMcpServers() }, [activeTab])
 
   const handleAddMcp = async () => {
     if (!newMcp.name.trim() || !newMcp.url.trim()) return
-    try { await api.addMcpServer(newMcp); setNewMcp({ name: '', url: '', enabled: true }); setShowMcpAdd(false); loadMcpServers(); showToast('MCP 已添加 ✓') } catch {}
+    try { await api.addMcpServer(newMcp); setNewMcp({ name: '', url: '', enabled: true }); setShowMcpAdd(false); loadMcpServers(); showToast('MCP 已添加 ✓') } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
   const handleDeleteMcp = async (name: string) => {
     if (!confirm(`删除 MCP 服务器 "${name}"？`)) return
-    try { await api.deleteMcpServer(name); loadMcpServers(); showToast('已删除') } catch {}
+    try { await api.deleteMcpServer(name); loadMcpServers(); showToast('已删除') } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
   }
 
   const handleToggleMcp = async (name: string, enabled: boolean) => {
     try {
       await api.updateMcpServer(name, { enabled: !enabled })
       loadMcpServers()
+      // 开关变了，旧的握手结果立即作废，避免面板继续显示陈旧状态
+      setMcpHealth(prev => {
+        if (!(name in prev)) return prev
+        const next = { ...prev }
+        delete next[name]
+        return next
+      })
       showToast(enabled ? '已禁用' : '已启用')
-    } catch {}
+    } catch (e: any) { showToast(`操作失败：${e?.message || e}`) }
+  }
+
+  /** 真实握手体检：对每个服务实际跑一遍 initialize + tools/list */
+  const runMcpHealthCheck = useCallback(async () => {
+    setMcpChecking(true)
+    try {
+      const snap = await api.mcpHealth({ refresh: true })
+      const map: Record<string, McpHealthResult> = {}
+      for (const s of snap.servers || []) map[s.name] = s
+      setMcpHealth(map)
+      setMcpCheckedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
+      showToast(`体检完成：${snap.ok} 正常 / ${snap.error} 不可达 / ${snap.disabled} 已禁用`)
+    } catch {
+      showToast('体检失败：后端不可达')
+    } finally {
+      setMcpChecking(false)
+    }
+  }, [])
+
+  /** 单个服务复检（不重建整表，便于定位单个故障） */
+  const checkOneMcp = async (name: string) => {
+    try {
+      const r = await api.mcpHealthOne(name, { refresh: true })
+      setMcpHealth(prev => ({ ...prev, [name]: r }))
+    } catch {
+      showToast(`检测失败：${name}`)
+    }
   }
 
   // ===== 执行痕迹（工具调用历史查询）=====
@@ -253,8 +379,10 @@ export default function LibraryView() {
   const [traceSearch, setTraceSearch] = useState('')
   const [traceType, setTraceType] = useState('')
   const [expandedTraceId, setExpandedTraceId] = useState<number | null>(null)
+  const seqTraces = useRef(0)   // B-11：审计痕迹 loader 的请求序号
 
   const loadTraces = useCallback(async () => {
+    const seq = ++seqTraces.current
     setTracesLoading(true)
     try {
       const list = await api.getTraceHistory({
@@ -262,11 +390,29 @@ export default function LibraryView() {
         trace_type: traceType || undefined,
         limit: 100,
       })
+      if (seq !== seqTraces.current) return          // B-11 防乱序覆盖
       setTraces(list)
-    } catch {} finally { setTracesLoading(false) }
+    } catch (e: any) {
+      if (seq !== seqTraces.current) return
+      showToast(`审计痕迹加载失败：${e?.message || e}`)   // B-12
+    } finally { if (seq === seqTraces.current) setTracesLoading(false) }
   }, [traceSearch, traceType])
 
   useEffect(() => { if (activeTab === 'traces') loadTraces() }, [activeTab, loadTraces])
+
+  // ===== LLM 前缀缓存命中率（后端 GET /api/cache/stats 聚合 cache_stats 表）=====
+  // 放在「执行痕迹」Tab：这里本来就是 LLM 调用（llm_call trace）的观测面，是同一件事。
+  // 用户正在做前缀缓存命中率优化，此前前端连 api 方法都没有 —— 等于没有反馈回路。
+  const loadCacheStats = useCallback(async (hours: number) => {
+    setCacheStatsLoading(true)
+    try {
+      setCacheStats(await api.getCacheStats(hours))
+    } catch (e: any) {
+      showToast(`缓存统计加载失败：${e?.message || e}`)
+    } finally { setCacheStatsLoading(false) }
+  }, [])
+
+  useEffect(() => { if (activeTab === 'traces') loadCacheStats(cacheHours) }, [activeTab, cacheHours, loadCacheStats])
 
   const parseTraceData = (t: any): { name: string; args: any; result: string; duration?: number } => {
     let d: any = {}
@@ -300,7 +446,15 @@ export default function LibraryView() {
     setSkillImportLoading(true)
     try {
       const result = await api.importSkillsFromDir()
-      showToast(`扫描 ${result.scanned} 个, 导入 ${result.imported} 个, 错误 ${result.errors} 个 ✓`)
+      // D9（2026-09-28）：skipped/rejected 属「未写入」，此前被后端并进 imported，
+      // 这里就显示成「导入 N 个 ✓」。现分开列出，有未落库项时不给 ✓。
+      const lost = [
+        result.skipped ? `去重拦截 ${result.skipped}` : '',
+        result.rejected ? `守卫拒绝 ${result.rejected}` : '',
+      ].filter(Boolean).join(', ')
+      showToast(
+        `扫描 ${result.scanned} 个, 落库 ${result.imported} 个${lost ? `, ${lost}` : ''}, 错误 ${result.errors} 个 ${lost ? '⚠️' : '✓'}`
+      )
       setShowSkillImport(false)
       loadSkills()
     } catch (e: any) {
@@ -309,21 +463,30 @@ export default function LibraryView() {
   }
 
   // MCP 文件导入
-  const handleImportMcpFile = async () => {
+  const handleImportMcpFile = async (confirmOutside = false) => {
     const path = mcpFileImportPath.trim()
     if (!path) { showToast('请输入脚本路径'); return }
     setMcpFileImportLoading(true)
     try {
-      const opts: any = {}
+      const opts: { name?: string; args?: string[]; confirm_outside?: boolean } = {}
       if (mcpFileImportName.trim()) opts.name = mcpFileImportName.trim()
       if (mcpFileImportArgs.trim()) opts.args = mcpFileImportArgs.split(/\s+/).filter(Boolean)
+      if (confirmOutside) opts.confirm_outside = true
       const result = await api.importMcpFile(path, opts)
       showToast(`已注册 MCP: ${result.server.name} (${result.detection.type}) ${result.replaced ? '已更新' : ''} ✓`)
       setMcpFileImportPath(''); setMcpFileImportName(''); setMcpFileImportArgs('')
+      setMcpOutsideConfirm('')
       setShowMcpFileImport(false)
       loadMcpServers()
     } catch (e: any) {
-      showToast(`注册失败: ${e?.message || e}`)
+      // 403 = 脚本在允许目录之外（后端 2026-09-16 加的目录白名单）。
+      // 此前前端不传 confirm_outside，用户只会拿到一句莫名的 403 文案；
+      // 现在改为：明确告知「目录外」并给一个二次确认按钮，确认后带 confirm_outside 重试。
+      if (e?.status === 403) {
+        setMcpOutsideConfirm(path)
+      } else {
+        showToast(`注册失败: ${e?.message || e}`)
+      }
     } finally { setMcpFileImportLoading(false) }
   }
 
@@ -705,12 +868,23 @@ export default function LibraryView() {
                               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                                 {skill.mcp_required.map(dep => {
                                   const srv = mcpServers.find(m => m.name === dep)
-                                  const status = !srv ? 'missing' : (srv.enabled ? 'ok' : 'disabled')
-                                  const c = status === 'ok' ? '#50fa7b' : status === 'disabled' ? '#f1fa8c' : '#ff5555'
-                                  const label = status === 'ok' ? '已启用' : status === 'disabled' ? '已禁用' : '未安装'
+                                  if (!srv) {
+                                    return (
+                                      <span key={dep} title="未安装" style={{ fontSize: 10, padding: '2px 8px', borderRadius: 4, background: 'rgba(255,255,255,0.04)', border: '1px solid #ff5555', color: '#ff5555', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                        <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ff5555' }} />
+                                        {dep}
+                                      </span>
+                                    )
+                                  }
+                                  // 体检过就用真实状态；没体检过退回配置态，并在 title 里说清是配置而非实测
+                                  const h = mcpHealth[dep]
+                                  const lamp = mcpLamp(h)
+                                  const tip = h
+                                    ? mcpLampTip(h, lamp)
+                                    : `${srv.enabled ? '配置已启用' : '配置已禁用'}（未体检，不代表实际可用）`
                                   return (
-                                    <span key={dep} title={label} style={{ fontSize: 10, padding: '2px 8px', borderRadius: 4, background: 'rgba(255,255,255,0.04)', border: `1px solid ${c}`, color: c, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: c }} />
+                                    <span key={dep} title={tip} style={{ fontSize: 10, padding: '2px 8px', borderRadius: 4, background: 'rgba(255,255,255,0.04)', border: `1px solid ${lamp.color}`, color: lamp.color, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: lamp.color }} />
                                       {dep}
                                     </span>
                                   )
@@ -738,6 +912,15 @@ export default function LibraryView() {
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <button className="btn btn-sm" style={{ background: 'var(--color-accent-primary)', color: '#000' }} onClick={() => { setShowMcpAdd(!showMcpAdd); if (showMcpFileImport) setShowMcpFileImport(false) }}>{showMcpAdd ? '取消' : '+ 手动添加'}</button>
               <button className="btn btn-sm" style={{ background: '#bd93f9', color: '#000' }} onClick={() => { setShowMcpFileImport(!showMcpFileImport); if (showMcpAdd) setShowMcpAdd(false); setMcpFileImportPath(''); setMcpFileImportName(''); setMcpFileImportArgs('') }}>{showMcpFileImport ? '取消' : '📥 导入本地脚本'}</button>
+              <button
+                className="btn btn-sm"
+                style={{ background: mcpChecking ? 'var(--color-bg-input)' : '#ffb86c', color: '#000', opacity: mcpChecking ? 0.7 : 1 }}
+                onClick={runMcpHealthCheck}
+                disabled={mcpChecking}
+                title="对每个服务实际跑一遍 initialize + tools/list 握手，验证「配置说启用」是否等于「真的能连上」"
+              >
+                {mcpChecking ? '体检中...' : '🔍 检查'}
+              </button>
             </div>
 
             {/* 手动添加弹窗 */}
@@ -759,7 +942,7 @@ export default function LibraryView() {
                 <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>自动检测运行时 (.py→Python, .js→Node.js, .sh→Bash) 并识别 stdio/HTTP 类型</div>
                 <input
                   value={mcpFileImportPath}
-                  onChange={e => setMcpFileImportPath(e.target.value)}
+                  onChange={e => { setMcpFileImportPath(e.target.value); if (mcpOutsideConfirm) setMcpOutsideConfirm('') }}
                   placeholder="脚本路径，如 ~/.workbuddy/skills/zenith-auditor/scripts/fact_check_mcp.py"
                   style={{ fontSize: 12, padding: '6px 10px', background: 'var(--color-bg-input)', border: '1px solid var(--color-border)', borderRadius: 6, color: 'var(--color-text-primary)', outline: 'none' }}
                 />
@@ -780,16 +963,53 @@ export default function LibraryView() {
                 <button
                   className="btn btn-sm"
                   style={{ background: '#50fa7b', color: '#000', alignSelf: 'flex-start' }}
-                  onClick={handleImportMcpFile}
+                  onClick={() => handleImportMcpFile()}
                   disabled={mcpFileImportLoading}
                 >
                   {mcpFileImportLoading ? '注册中...' : '注册'}
                 </button>
+
+                {/* 后端返回 403（脚本在允许目录之外）时才出现：说清原因 + 显式二次确认 */}
+                {mcpOutsideConfirm && (
+                  <div style={{
+                    padding: 10, background: 'rgba(255,85,85,0.08)',
+                    border: '1px solid var(--color-accent-danger)', borderRadius: 6,
+                    display: 'flex', flexDirection: 'column', gap: 8,
+                  }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-accent-danger)' }}>⚠️ 这个脚本在允许目录之外</div>
+                    <div style={{ fontSize: 11, lineHeight: 1.7, color: 'var(--color-text-secondary)' }}>
+                      <span style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>{mcpOutsideConfirm}</span>
+                      <br />
+                      后端默认只允许注册 PROJECT_DIR、技能目录、$WORKBUDDY_CONFIG_DIR、~/.workbuddy 下的脚本。
+                      确认这是你自己信任的脚本吗？确认后将以 <code>confirm_outside=true</code> 重试注册。
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button
+                        className="btn btn-sm"
+                        style={{ background: 'var(--color-accent-danger)', color: '#fff' }}
+                        onClick={() => handleImportMcpFile(true)}
+                        disabled={mcpFileImportLoading}
+                      >
+                        {mcpFileImportLoading ? '注册中...' : '确认导入（目录外）'}
+                      </button>
+                      <button className="btn btn-sm" onClick={() => setMcpOutsideConfirm('')}>取消</button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
             <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
-              <span>总计 {mcpServers.length} 个服务 | 已启用 {mcpServers.filter(s => s.enabled).length} 个</span>
+              <span>
+                总计 {mcpServers.length} 个服务 | 配置已启用 {mcpServers.filter(s => s.enabled).length} 个
+                {Object.keys(mcpHealth).length > 0 && (
+                  <> | 体检结果 {Object.values(mcpHealth).filter(h => h.state === 'ok').length} 正常 / {Object.values(mcpHealth).filter(h => h.state === 'error').length} 不可达</>
+                )}
+                {mcpCheckedAt && <> | 检测于 {mcpCheckedAt}</>}
+              </span>
+              <div style={{ marginTop: 2, fontSize: 10, color: '#8b8b8b' }}>
+                指示灯含义：绿=握手成功 · 红=不可达 · 黄=已禁用 · 橙=配置不完整 · 灰=尚未检测
+              </div>
             </div>
             {mcpLoading ? (
               <div className="spinner"><div className="spinner-dot" /><div className="spinner-dot" /><div className="spinner-dot" /></div>
@@ -799,14 +1019,34 @@ export default function LibraryView() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {mcpServers.map(s => {
                   const addr = s.serverUrl || s.url || (s.command ? `${s.command}${s.args && s.args.length ? ' ' + s.args.join(' ') : ''}` : '(未配置地址)')
+                  const h = mcpHealth[s.name]
+                  const lamp = mcpLamp(h)
                   return (
                   <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', background: 'var(--color-bg-panel)', borderRadius: 8, border: '1px solid var(--color-border)' }}>
-                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: s.enabled ? '#50fa7b' : '#ff5555', flexShrink: 0 }} />
+                    <span
+                      title={mcpLampTip(h, lamp)}
+                      style={{ width: 8, height: 8, borderRadius: '50%', background: lamp.color, flexShrink: 0, cursor: 'help' }}
+                    />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)' }}>{s.name}</div>
                       <div style={{ fontSize: 10, color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={addr}>{addr}</div>
+                      {h && h.state === 'error' && h.error && (
+                        <div style={{ fontSize: 10, color: '#ff5555', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={h.error}>{h.error}</div>
+                      )}
                     </div>
-                    <span style={{ fontSize: 10, color: s.enabled ? '#50fa7b' : '#ff5555' }}>{s.enabled ? '已启用' : '已禁用'}</span>
+                    <span
+                      title={mcpLampTip(h, lamp)}
+                      style={{ fontSize: 10, color: lamp.color, cursor: 'help', flexShrink: 0 }}
+                    >
+                      {h
+                        ? (h.state === 'ok' ? `正常 · ${Math.round(h.latency_ms)}ms · ${h.tool_count}工具` : lamp.label)
+                        : (s.enabled ? '已启用' : '已禁用')}
+                    </span>
+                    <button
+                      onClick={() => checkOneMcp(s.name)}
+                      title={`单独复检 ${s.name}`}
+                      style={{ fontSize: 10, color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', flexShrink: 0 }}
+                    >🔍</button>
                     <label title="启用 / 禁用" style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--color-text-muted)', cursor: 'pointer' }}>
                       <input
                         type="checkbox"
@@ -844,6 +1084,51 @@ export default function LibraryView() {
               </select>
               <button className="btn btn-sm" onClick={loadTraces}>🔍 查询</button>
               <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>共 {traces.length} 条</span>
+            </div>
+
+            {/* LLM 前缀缓存命中率 — 单行小条，只回答「省了多少 / 命中多少」 */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap',
+              padding: '8px 12px', background: 'var(--color-bg-panel)',
+              border: '1px solid var(--color-border)', borderRadius: 6, fontSize: 11,
+            }}>
+              <span style={{ fontWeight: 600, color: 'var(--color-text-primary)' }}>⚡ 前缀缓存</span>
+              {cacheStatsLoading ? (
+                <span style={{ color: 'var(--color-text-muted)' }}>统计中...</span>
+              ) : !cacheStats || !cacheStats.calls ? (
+                <span style={{ color: 'var(--color-text-muted)' }}>近 {cacheHours}h 无 LLM 调用记录</span>
+              ) : (
+                <>
+                  <span style={{ color: 'var(--color-accent-success)', fontWeight: 600 }}>
+                    命中率 {(cacheStats.hit_rate * 100).toFixed(1)}%
+                  </span>
+                  <span style={{ color: 'var(--color-text-secondary)' }}>
+                    命中 {fmtTokens(cacheStats.hit_tokens)} / 提示 {fmtTokens(cacheStats.prompt_tokens)} tokens
+                    <span style={{ color: 'var(--color-text-muted)' }}>（命中量 = 省掉的重复前缀）</span>
+                  </span>
+                  <span style={{ color: 'var(--color-text-muted)' }}>
+                    调用 {cacheStats.calls} 次 · 输出 {fmtTokens(cacheStats.completion_tokens)} tokens
+                  </span>
+                  {cacheStats.by_kind?.length > 0 && (
+                    <span style={{ color: 'var(--color-text-muted)' }}>
+                      {cacheStats.by_kind.map(k => `${k.kind} ${(k.prompt ? (k.hit / k.prompt * 100) : 0).toFixed(0)}%`).join(' · ')}
+                    </span>
+                  )}
+                </>
+              )}
+              <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+                <select
+                  className="form-select"
+                  style={{ width: 100, fontSize: 11 }}
+                  value={cacheHours}
+                  onChange={e => setCacheHours(Number(e.target.value))}
+                >
+                  <option value={24}>近 24 小时</option>
+                  <option value={168}>近 7 天</option>
+                  <option value={720}>近 30 天</option>
+                </select>
+                <button className="btn btn-sm" title="重新统计" onClick={() => loadCacheStats(cacheHours)}>↻</button>
+              </span>
             </div>
 
             {tracesLoading ? (

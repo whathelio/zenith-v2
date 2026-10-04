@@ -1,11 +1,7 @@
-/* TraceCard — 对话执行痕迹统一卡片（对齐 WorkBuddy 工具调用/代码痕迹）
+/* TraceCard — 对话执行痕迹（对齐 dsh GenericCommandCard 的内联 disclosure 行）
  *
- * 分类渲染：
- * - kind=code      代码执行：语言标签 + 退出码 + stdout/stderr + 耗时
- * - kind=file_edit 文件编辑（预留）：文件路径 + diff 视图
- * - kind=tool      通用工具调用：参数 + 结果摘要折叠
- *
- * 状态：pending（spinner 执行中）/ done ✓ / failed ✗
+ * 单行形态：状态点(StateDot) + 图标 + 标题 + 分隔点 + 摘要，点击展开代码框 body。
+ * 状态：pending（扫光执行中）/ done（成功）/ failed（红字 error）
  */
 import { useState } from 'react'
 
@@ -21,14 +17,11 @@ export interface TraceEntry {
   durationMs?: number
   success?: boolean
   round?: number
-  // 关联的 user 消息 id（用于前端交错渲染）
   messageId?: number | null
-  // 代码执行
   stdout?: string
   stderr?: string
   exitCode?: number | null
   lang?: string
-  // 文件编辑（预留）
   filePath?: string
   oldText?: string
   newText?: string
@@ -36,11 +29,8 @@ export interface TraceEntry {
 
 interface TraceCardProps {
   entry: TraceEntry
-  /** 强制展开/折叠：true=全部展开, false=全部折叠, null/undefined=各自默认状态 */
   forceExpand?: boolean | null
 }
-
-/* ── 工具分类 ── */
 
 export function classifyTool(name: string): TraceKind {
   const n = name.toLowerCase()
@@ -55,18 +45,16 @@ export function classifyTool(name: string): TraceKind {
 }
 
 const KIND_META: Record<TraceKind, { icon: string; label: string; color: string }> = {
-  code:      { icon: '▶', label: '执行代码',   color: '#1ae865' },
-  file_edit: { icon: '✎', label: '编辑文件',   color: '#ffab40' },
-  schedule:  { icon: '📅', label: '日程',       color: '#ffab40' },
-  note:      { icon: '📝', label: '笔记',       color: '#f1fa8c' },
-  memory:    { icon: '🧠', label: '记忆',       color: '#c792ea' },
-  classify:  { icon: '🔀', label: '智能分类',   color: '#c792ea' },
-  web:       { icon: '🌐', label: '搜索',       color: '#4fc3f7' },
-  mcp:       { icon: '🔌', label: 'MCP 工具',   color: '#8be9fd' },
-  tool:      { icon: '🛠', label: '工具',       color: '#888888' },
+  code:      { icon: '▶', label: '代码',     color: '#1ae865' },
+  file_edit: { icon: '✎', label: '文件',     color: '#ffab40' },
+  schedule:  { icon: '📅', label: '日程',     color: '#ffab40' },
+  note:      { icon: '📝', label: '笔记',     color: '#f1fa8c' },
+  memory:    { icon: '🧠', label: '记忆',     color: '#c792ea' },
+  classify:  { icon: '🔀', label: '分类',     color: '#c792ea' },
+  web:       { icon: '🌐', label: '搜索',     color: '#4fc3f7' },
+  mcp:       { icon: '🔌', label: 'MCP',      color: '#8be9fd' },
+  tool:      { icon: '🛠', label: '工具',     color: '#888888' },
 }
-
-/* ── 工具辅助 ── */
 
 function formatArgs(args: Record<string, any>, maxLen = 600): string {
   if (!args || Object.keys(args).length === 0) return '无参数'
@@ -87,170 +75,90 @@ function fmtDuration(ms?: number): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
-function ToolBadge({ name }: { name: string }) {
-  return <span className="trace-tool-badge">{name}</span>
-}
-
-/* ── 代码执行卡片 ── */
-
-function CodeTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
-  const [showArgs, setShowArgs] = useState(false)
-  const [showOutput, setShowOutput] = useState(false)
-  // 受控模式：forceExpand 覆盖局部状态（null 时不干预）
-  const effArgs = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showArgs
-  const effOutput = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : showOutput
-  const code = typeof entry.args?.code === 'string' ? entry.args.code : ''
-  const isFail = entry.success === false
-
+/** 状态点：running 灰/成功绿/失败红 */
+function StateDot({ state }: { state: 'running' | 'ok' | 'error' }) {
+  const color = state === 'ok' ? '#50fa7b' : state === 'error' ? '#ff5555' : '#717e95'
   return (
-    <div className={`trace-card trace-code ${isFail ? 'trace-fail' : ''}`}>
-      {/* header */}
-      <div className="trace-header">
-        <span className="trace-icon" style={{ color: isFail ? '#ff5555' : '#1ae865' }}>{isFail ? '✗' : '✓'}</span>
-        <span className="trace-label" style={{ color: '#1ae865' }}>执行代码</span>
-        {entry.lang && <span className="trace-lang">{entry.lang}</span>}
-        <span className="trace-name">{entry.name}</span>
-        <span className="trace-spacer" />
-        {entry.exitCode !== undefined && entry.exitCode !== null && (
-          <span className={`trace-exit ${entry.exitCode === 0 ? 'ok' : 'err'}`}>exit {entry.exitCode}</span>
-        )}
-        <span className="trace-duration">{fmtDuration(entry.durationMs)}</span>
-      </div>
-
-      {/* 代码（折叠） */}
-      {code && (
-        <div className="trace-section">
-          <button className="trace-section-toggle" onClick={() => setShowArgs(!showArgs)}>
-            <span className={`trace-caret ${effArgs ? 'open' : ''}`}>▸</span> 代码
-          </button>
-          {effArgs && (
-            <pre className="trace-code-args">{code.split('\n').slice(0, 25).join('\n')}{code.split('\n').length > 25 ? '\n…' : ''}</pre>
-          )}
-        </div>
-      )}
-
-      {/* 输出 */}
-      {(entry.stdout || entry.stderr || entry.resultSummary) && (
-        <div className="trace-section">
-          <button className="trace-section-toggle" onClick={() => setShowOutput(!showOutput)}>
-            <span className={`trace-caret ${effOutput ? 'open' : ''}`}>▸</span> 输出
-            {entry.stdout?.length ? <span className="trace-count">{entry.stdout.length} 字符</span> : null}
-          </button>
-          {effOutput && (
-            <div className="trace-output">
-              {entry.stdout ? <pre className="trace-stdout">{entry.stdout}</pre> : null}
-              {entry.stderr ? <pre className="trace-stderr">{entry.stderr}</pre> : null}
-              {!entry.stdout && !entry.stderr && entry.resultSummary
-                ? <pre className={`trace-stdout ${isFail ? 'trace-stderr' : ''}`}>{entry.resultSummary}</pre>
-                : null}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
+    <span className="trace-dot" style={{ background: color }}>
+      {state === 'running' && <span className="trace-dot-pulse" style={{ background: color }} />}
+    </span>
   )
 }
 
-/* ── 文件编辑卡片（预留，diff 视图）── */
-
-function FileEditTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
-  const [expanded, setExpanded] = useState(false)
-  const effExpanded = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : expanded
-  return (
-    <div className="trace-card trace-file">
-      <div className="trace-header">
-        <span className="trace-icon" style={{ color: '#ffab40' }}>✎</span>
-        <span className="trace-label" style={{ color: '#ffab40' }}>编辑文件</span>
-        <span className="trace-filepath">{entry.filePath || entry.name}</span>
-        <span className="trace-spacer" />
-        <span className="trace-duration">{fmtDuration(entry.durationMs)}</span>
-      </div>
-      <div className="trace-section">
-        <button className="trace-section-toggle" onClick={() => setExpanded(!expanded)}>
-          <span className={`trace-caret ${effExpanded ? 'open' : ''}`}>▸</span> 变更
-        </button>
-        {effExpanded && (entry.oldText || entry.newText) && (
-          <div className="trace-diff">
-            {entry.oldText?.split('\n').map((l, i) => (
-              <div key={`-${i}`} className="trace-diff-line del"><span className="trace-diff-marker">-</span><span>{l || ' '}</span></div>
-            ))}
-            {entry.newText?.split('\n').map((l, i) => (
-              <div key={`+${i}`} className="trace-diff-line add"><span className="trace-diff-marker">+</span><span>{l || ' '}</span></div>
-            ))}
-          </div>
-        )}
-        {effExpanded && !entry.oldText && !entry.newText && (
-          <pre className="trace-argbox">{entry.resultSummary || entry.args?.file_path || ''}</pre>
-        )}
-      </div>
-    </div>
-  )
+/** 组装展开 body 的文本（代码/参数/结果/输出） */
+function buildBody(entry: TraceEntry): { body: string; hasBody: boolean } {
+  if (entry.kind === 'code') {
+    const parts: string[] = []
+    if (typeof entry.args?.code === 'string') parts.push(entry.args.code)
+    if (entry.stdout) parts.push(entry.stdout)
+    if (entry.stderr) parts.push(`[stderr]\n${entry.stderr}`)
+    if (!parts.length && entry.resultSummary) parts.push(entry.resultSummary)
+    return { body: parts.join('\n\n'), hasBody: parts.length > 0 }
+  }
+  if (entry.kind === 'file_edit') {
+    const diff: string[] = []
+    entry.oldText?.split('\n').forEach(l => diff.push(`- ${l}`))
+    entry.newText?.split('\n').forEach(l => diff.push(`+ ${l}`))
+    if (diff.length) return { body: diff.join('\n'), hasBody: true }
+    const fp = entry.filePath || entry.resultSummary || ''
+    return { body: fp, hasBody: !!fp }
+  }
+  const parts: string[] = []
+  if (entry.args && Object.keys(entry.args).length > 0) parts.push(formatArgs(entry.args))
+  if (entry.resultSummary) parts.push(entry.resultSummary)
+  return { body: parts.join('\n\n'), hasBody: parts.length > 0 }
 }
 
-/* ── 通用工具卡片 ── */
-
-function ToolTrace({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
+function TraceRow({ entry, forceExpand }: { entry: TraceEntry; forceExpand?: boolean | null }) {
   const [expanded, setExpanded] = useState(false)
   const effExpanded = forceExpand !== null && forceExpand !== undefined ? !!forceExpand : expanded
   const meta = KIND_META[entry.kind] || KIND_META.tool
   const isPending = entry.status === 'pending'
   const isFail = !isPending && entry.success === false
+  const state: 'running' | 'ok' | 'error' = isPending ? 'running' : isFail ? 'error' : 'ok'
+  const { body, hasBody } = buildBody(entry)
+  const hasDetail = hasBody && body.includes('\n')
+
+  // 折叠态摘要：代码执行用退出码/耗时，工具用名称，失败用错误
+  const summary = isFail
+    ? (entry.resultSummary || '执行失败')
+    : entry.kind === 'code'
+      ? `${entry.name}${entry.exitCode !== undefined && entry.exitCode !== null ? ` · exit ${entry.exitCode}` : ''}${entry.durationMs !== undefined ? ` · ${fmtDuration(entry.durationMs)}` : ''}`
+      : `${entry.name}${entry.durationMs !== undefined ? ` · ${fmtDuration(entry.durationMs)}` : ''}`
+
+  const title = entry.kind === 'code' ? '代码' : meta.label
 
   return (
     <div
-      className={`trace-card trace-tool ${isPending ? 'trace-pending' : ''} ${isFail ? 'trace-fail' : ''}`}
-      onClick={() => !isPending && setExpanded(!expanded)}
-      role="button"
+      className="trace-card"
+      data-state={state}
+      onClick={() => { if (hasDetail && !isPending) setExpanded(v => !v) }}
     >
-      <div className="trace-header">
-        {isPending ? (
-          <span className="trace-icon trace-spin" style={{ color: meta.color }}>
-            <svg width="12" height="12" viewBox="0 0 12 12">
-              <circle cx="6" cy="6" r="5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 10" />
+      <div className="trace-row">
+        <span className="trace-leading">
+          <StateDot state={state} />
+        </span>
+        <span className="trace-title">{title}</span>
+        <span className="trace-badge">{entry.name}</span>
+        <span className="trace-separator" aria-hidden="true" />
+        <span className="trace-summary" data-error={isFail || undefined}>{summary}</span>
+        {hasDetail && !isPending && (
+          <span className={`trace-chevron ${effExpanded ? 'open' : ''}`} aria-hidden="true">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M4 2.5L8 6L4 9.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </span>
-        ) : (
-          <span className="trace-icon" style={{ color: isFail ? '#ff5555' : '#1ae865' }}>{isFail ? '✗' : '✓'}</span>
-        )}
-        <span className="trace-label" style={{ color: meta.color }}>{meta.icon} {meta.label}</span>
-        <ToolBadge name={entry.name} />
-        <span className="trace-spacer" />
-        {isPending ? (
-          <span className="trace-pending-text">执行中…</span>
-        ) : (
-          <>
-            <span className="trace-duration">{fmtDuration(entry.durationMs)}</span>
-            <span className={`trace-caret ${effExpanded ? 'open' : ''}`}>▾</span>
-          </>
         )}
       </div>
-
-      {effExpanded && !isPending && (
-        <div className="trace-detail">
-          {entry.args && Object.keys(entry.args).length > 0 && (
-            <div className="trace-block">
-              <div className="trace-block-title">参数</div>
-              <pre className="trace-argbox">{formatArgs(entry.args)}</pre>
-            </div>
-          )}
-          {entry.resultSummary && (
-            <div className="trace-block">
-              <div className="trace-block-title">结果</div>
-              <pre className={`trace-argbox ${isFail ? 'trace-fail-text' : ''}`}>{entry.resultSummary}</pre>
-            </div>
-          )}
-        </div>
+      {effExpanded && hasDetail && !isPending && (
+        <pre className="trace-body" data-error={isFail || undefined}>{body}</pre>
       )}
     </div>
   )
 }
 
-/* ── 主组件 ── */
-
 export default function TraceCard({ entry, forceExpand }: TraceCardProps) {
-  if (entry.kind === 'code') return <CodeTrace entry={entry} forceExpand={forceExpand} />
-  if (entry.kind === 'file_edit') return <FileEditTrace entry={entry} forceExpand={forceExpand} />
-  return <ToolTrace entry={entry} forceExpand={forceExpand} />
+  return <TraceRow entry={entry} forceExpand={forceExpand} />
 }
 
 /** 从旧版 ToolCallEntry 迁移辅助（ChatView 使用） */
