@@ -23,7 +23,7 @@ sys.path.insert(0, str(PROJECT_DIR))
 
 # 触发 .env 加载（config.py 模块级执行 _load_dotenv，注入 ZENITH_JIN10_API_TOKEN）
 from backend import config  # noqa: E402,F401
-from backend._archived.jin10_service import Jin10Service  # noqa: E402
+from backend.jin10_service import Jin10Service  # noqa: E402
 
 import httpx  # noqa: E402
 

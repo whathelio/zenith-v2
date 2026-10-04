@@ -1,10 +1,28 @@
 # 代码质量门禁（pre-commit）
-# 首次使用：pip install pre-commit && pre-commit install
+# 首次使用：.venv/Scripts/python.exe -m pre_commit install
 # 只跑 ruff lint（报告真正的错误），不自动 format，避免大规模格式化存量代码。
+#
+# 2026-09-11 修订：由远端 hook 改为 local hook
+#   原因：原配置用 `repo: https://github.com/astral-sh/ruff-pre-commit`，
+#   首次运行需联网 clone 该仓库；本机 GitHub 被代理拦截
+#   （fatal: unable to access ... Failed to connect to github.com:443 over proxy 127.0.0.1），
+#   结果门禁"装上了却跑不起来" = 未真正激活。
+#   改用 .venv 内已安装的 ruff（本地已有，实测 0.16.2），完全离线可用。
+#   规则集仍由 pyproject.toml 的 [tool.ruff] 决定，lint 行为与修订前一致。
+# 回滚：还原为
+#   repos:
+#     - repo: https://github.com/astral-sh/ruff-pre-commit
+#       rev: v0.11.0
+#       hooks:
+#         - id: ruff
+# 备份见 data/backup/.pre-commit-config.yaml.bak-20260911-185403
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.0
+  - repo: local
     hooks:
       - id: ruff
         name: ruff-lint
+        entry: .venv/Scripts/ruff.exe check
+        language: system
+        types: [python]
         args: [--fix]
+

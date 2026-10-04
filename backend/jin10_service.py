@@ -1,7 +1,20 @@
-"""Zenith v2 — 金十数据 MCP 客户端服务 — 已封存 (SEALED)
+"""Zenith v2 — 金十数据 MCP 客户端服务
 
-本模块随 market_analyzer.py 一起封存。金十 MCP 本身工作正常，但市场行情分析功能已禁用。
-所有工具方法保留，供未来恢复市场分析时直接复用。"""
+⚠️ **本模块是活代码，不是归档模块**（2026-09-28 更正）。
+
+此前首行写的是「已封存 (SEALED) / 随 market_analyzer.py 一起封存」—— **与事实不符**。
+实测它有三条活调用路径，且每日定时运行：
+  - `calendar_sync.py:14` → `get_jin10_service()`，`sync_calendar_events()` 是**每日定时任务**
+    （`scheduler._calendar_sync_loop` + 启动即同步）
+  - `routers/news.py:60` → `/api/news/*` 端点
+  - `tools.py` 侧的 LLM 工具入口
+
+**行情/分析类方法**（`fetch_quote_indicators` / `get_kline` / `get_quote` / `search_news` /
+`list_news` / `get_news` / `QUOTE_CODE_MAP` 等）**确为幽灵**（零引用或仅被
+`_archived/macro_data.py` 引用），但**方法存在 ≠ 模块封存** —— 请以调用方为准。
+幽灵清单登记见 `知识库-v1.0/日志审查库/zenith/2026-09/Zenith-D8立项审计-金十链路-20260928.md` §4。
+所有工具方法保留，供未来恢复市场分析时直接复用。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +23,7 @@ import logging
 import yaml
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -71,6 +84,19 @@ class Jin10Service:
         self._initialized = False
         self._session_id: Optional[str] = None
         self._req_id = 0
+        # 2026-09-28 D8-b：最近一次失败的**可读原因**。
+        # 此前 `_mcp_post` 把 5 类失败全部折叠成 `{}`（token 未配置甚至只记 debug），
+        # 调用方只能拿到 None，无法区分 401 / 超时 / 协议错 ——
+        # 前序会话因此被迫另写一次性探针（见 backend/_archived/probe_jin10.py:4-6 自述）。
+        self._last_error: str = ""
+
+    def last_error(self) -> str:
+        """返回最近一次失败的原因（空串 = 上一次调用未失败）。
+
+        与 `_mcp_post` 同一生命周期：每次调用**入口先清空**，失败时写入。
+        设计对齐 `mcp_client.MCPClient.last_error()`（Z2，2026-09-28）。
+        """
+        return self._last_error
 
     # -- Session Management --------------------------------------------------
 
@@ -82,9 +108,19 @@ class Jin10Service:
         return self._client
 
     async def _mcp_post(self, payload: dict, is_notification: bool = False) -> dict:
-        """发送 MCP JSON-RPC POST 请求，支持 SSE 响应格式"""
+        """发送 MCP JSON-RPC POST 请求，支持 SSE 响应格式。
+
+        **返回契约（2026-09-28 D8-b）**：失败一律返回 `{}`，但**必定**在
+        `self._last_error` 留下可读原因。调用方判断失败后应先读 `last_error()`
+        再决定如何上报 —— 不要只报「返回空」。
+        """
+        self._last_error = ""          # 入口清空：与 last_error() 共享同一生命周期
+
         if not self._token:
-            logger.debug("金十 API Token 未配置，跳过 MCP 请求")
+            self._last_error = ("金十 API Token 未配置：文件 .env 的 ZENITH_JIN10_API_TOKEN "
+                                "与 config.yaml 的 jin10.api_token 均为空")
+            # 原为 logger.debug —— 默认日志级别下完全静默，故提升到 warning（D8-b N1）
+            logger.warning("金十 API Token 未配置，跳过 MCP 请求")
             return {}
 
         headers = {
@@ -104,11 +140,13 @@ class Jin10Service:
                 self._session_id = new_sid
 
             if is_notification:
-                # 通知不期望响应（SSE 可能返回空流或直接关闭）
+                # 通知不期望响应（SSE 可能返回空流或直接关闭；实测服务端返回 HTTP 202 空体）
                 return {}
 
             if resp.status_code != 200:
-                logger.warning(f"金十 MCP HTTP {resp.status_code}")
+                self._last_error = (f"金十 MCP HTTP {resp.status_code} "
+                                    f"(url={self._url}, body[:200]={(resp.text or '')[:200]!r})")
+                logger.warning("金十 MCP HTTP %s", resp.status_code)
                 self._initialized = False
                 return {}
 
@@ -120,37 +158,63 @@ class Jin10Service:
 
             if "text/event-stream" in content_type:
                 # SSE 格式: event: message\ndata: {json}\n\n
-                json_body = self._parse_sse_body(body_text)
+                # 2026-09-28 D8-c：把本次请求的 id 传进去，让选帧按 id 匹配而非盲取末帧。
+                json_body = self._parse_sse_body(body_text, want_id=payload.get("id"))
             else:
                 # 普通 JSON
                 try:
                     json_body = json.loads(body_text)
-                except Exception:
+                except Exception as e:
                     json_body = {}
+                    self._last_error = (f"金十 MCP 非 SSE 响应 JSON 解析失败: {type(e).__name__}: {e} "
+                                        f"(ct={content_type}, body[:300]={body_text[:300]!r})")
 
             if not json_body:
-                logger.warning(f"金十 MCP 响应解析失败, body_len={len(body_text)}")
+                # 走到这里 = 帧存在但一个都没解析成 / 解析成了空 —— 区分于上面的 JSON 解析失败
+                if not self._last_error:
+                    self._last_error = (f"金十 MCP 响应无可用 JSON-RPC 帧 "
+                                        f"(ct={content_type}, body_len={len(body_text)}, "
+                                        f"body[:300]={body_text[:300]!r})")
+                    logger.warning("金十 MCP 响应解析失败, body_len=%s", len(body_text))
                 return {}
 
             if "error" in json_body:
+                self._last_error = f"金十 MCP JSON-RPC 错误: {str(json_body['error'])[:300]}"
                 logger.warning(f"金十 MCP 错误: {json_body['error']}")
+                return {}
+            if "result" not in json_body:
+                # 2026-09-28 D8-c：拿到帧却既无 result 也无 error —— JSON-RPC 2.0 要求
+                # 两者必有其一，属协议违规。选帧规则已保证「只有通知帧」的情形会被这里逮到
+                # （此前盲取末帧时，通知帧会被当成合法响应静默返回空）。
+                # 判定与 `mcp_client.py:241` 逐字对齐（Z12 已修的那一份）。
+                self._last_error = (f"金十 MCP JSON-RPC 响应既无 result 也无 error: "
+                                    f"{str(json_body)[:300]}")
                 return {}
             return json_body.get("result", {})
 
         except Exception as e:
+            self._last_error = f"金十 MCP 请求异常: {type(e).__name__}: {e} (url={self._url})"
             logger.warning(f"金十 MCP 请求失败: {e}")
             self._initialized = False
             return {}
 
     @staticmethod
-    def _parse_sse_body(body_text: str) -> dict:
-        """解析 SSE 响应体，提取 JSON-RPC 消息
+    def _parse_sse_body(body_text: str, want_id: Any = None) -> dict:
+        """从 SSE 响应体里选出「最像本次响应」的那一帧。
 
-        SSE 格式:
-            event: message
-            data: {"jsonrpc":"2.0","id":1,"result":{...}}
+        2026-09-28 D8-c：本方法此前与 `mcp_client._parse_sse` **逐行等价**
+        （盲取 `data_lines[-1]` + `"".join` 兜底），而 Z12 只修了 `mcp_client` 那一份
+        —— 这正是「同缺陷副本」的典型：修一处等于没修。现按 Z12 的选帧规则逐字对齐。
 
-        可能有多个事件，取最后一个 message 事件。
+        选帧规则（按形状选，不盲取末帧）：
+        ① 给出了 ``want_id`` 时，优先返回 id 匹配的帧（`str()` 比较，兼容字符串/数字 id）；
+        ② 否则返回 cands 中最后一个含 ``result`` 或 ``error`` 键的帧 —— 通知帧
+           这两个键都没有，因此**不可能**再被选中（堵死根因）；
+        ③ 都没有则退回 cands 末帧，保持既有语义；cands 为空返回 ``{}``。
+
+        职责边界：本方法只负责“选帧”，**不写 `_last_error`、不做失败判定**
+        —— **调用方必须自行判定失败**（③ 可能返回不含 `result`/`error` 的帧，
+        该判定在 `_mcp_post` 的 `if "result" not in json_body` 分支）。
         """
         data_lines = []
         for line in body_text.split("\n"):
@@ -160,16 +224,32 @@ class Jin10Service:
         if not data_lines:
             return {}
 
-        # 取最后一个 data 行（通常只有一个）
-        try:
-            return json.loads(data_lines[-1])
-        except Exception:
-            # 如果单行解析失败，尝试合并所有 data 行
-            combined = "".join(data_lines)
+        cands: list[dict] = []
+        for raw in data_lines:
             try:
-                return json.loads(combined)
+                frame = json.loads(raw)
             except Exception:
-                return {}
+                continue
+            if isinstance(frame, dict):
+                cands.append(frame)
+        # 整段兜底（保留既有行为）：单行都不是完整 JSON 时（帧被折行等）
+        try:
+            combined = json.loads("".join(data_lines))
+        except Exception:
+            combined = None
+        if isinstance(combined, dict):
+            cands.append(combined)
+
+        if not cands:
+            return {}
+        if want_id is not None:
+            for frame in cands:
+                if str(frame.get("id")) == str(want_id):
+                    return frame
+        for frame in reversed(cands):
+            if "result" in frame or "error" in frame:
+                return frame
+        return cands[-1]
 
     async def _initialize(self) -> bool:
         """初始化 MCP 连接 (initialize → notifications/initialized)"""
@@ -203,8 +283,13 @@ class Jin10Service:
         return True
 
     async def _call_tool(self, tool_name: str, arguments: dict = None) -> Optional[dict]:
-        """调用 MCP 工具，优先读取 structuredContent"""
+        """调用 MCP 工具，优先读取 structuredContent。
+
+        失败返回 `None`，原因见 `last_error()`（含握手失败、传输失败与**工具级**失败）。
+        """
         if not await self._initialize():
+            if not self._last_error:
+                self._last_error = f"金十 MCP 初始化失败（工具 {tool_name} 未发起调用）"
             return None
 
         self._req_id += 1
@@ -221,6 +306,8 @@ class Jin10Service:
 
         result = await self._mcp_post(payload)
         if not result:
+            if not self._last_error:
+                self._last_error = f"金十工具 {tool_name} 未取到结果（_mcp_post 返回空且未记录原因）"
             return None
 
         # 优先 structuredContent
@@ -229,23 +316,29 @@ class Jin10Service:
             status = structured.get("status", 0)
             if status == 200:
                 return structured.get("data", {})
-            else:
-                logger.warning(f"金十工具 {tool_name} 返回状态 {status}: {structured.get('message', '')}")
-                return None
+            # 工具级失败（服务端明确告知原因），与传输层错误是两层
+            self._last_error = f"金十工具 {tool_name} 返回状态 {status}: {structured.get('message', '')}"
+            logger.warning("金十工具 %s 返回状态 %s", tool_name, status)
+            return None
 
         # 回退到 content 文本
-        content_list = result.get("content", [])
-        if content_list:
-            for item in content_list:
-                if item.get("type") == "text":
-                    try:
-                        import json
-                        parsed = json.loads(item["text"])
-                        if parsed.get("status") == 200:
-                            return parsed.get("data", {})
-                    except Exception:
-                        pass
+        content_items = result.get("content", []) or []
+        for item in content_items:
+            if item.get("type") == "text":
+                try:
+                    parsed = json.loads(item["text"])
+                except Exception:
+                    continue
+                if isinstance(parsed, dict) and parsed.get("status") == 200:
+                    return parsed.get("data", {})
+                if isinstance(parsed, dict):
+                    self._last_error = (f"金十工具 {tool_name} 文本结果状态 "
+                                        f"{parsed.get('status')}: {parsed.get('message', '')}")
+                    return None
 
+        self._last_error = (f"金十工具 {tool_name} 响应既无可用 structuredContent，"
+                            f"也无状态为 200 的文本结果（result_keys={sorted(result.keys())}）")
+        logger.warning("金十工具 %s 响应无法解析出结果", tool_name)
         return None
 
     # -- Business Methods (金十工具封装) --------------------------------------

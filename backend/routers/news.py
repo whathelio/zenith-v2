@@ -55,9 +55,9 @@ def _set_cache(key: str, payload: dict, ttl: float) -> None:
 
 
 def _make_svc():
-    """惰性导入金十服务（_archived 封存模块）。"""
+    """惰性导入金十服务。"""
     try:
-        from .._archived.jin10_service import Jin10Service
+        from ..jin10_service import Jin10Service
         return Jin10Service()
     except Exception as e:  # noqa: BLE001
         logger.warning("金十服务初始化失败: %s", e)
