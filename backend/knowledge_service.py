@@ -45,12 +45,25 @@ async def search(question: str, top_k: int = 5) -> dict:
 
 
 async def wiki_query(question: str) -> dict:
-    r = await get_client().post(
-        f"{KNOWLEDGE_API_BASE}/wiki",
-        headers=_headers(),
-        json={"question": question},
-        timeout=TIMEOUT,
-    )
+    """转发《史记》wiki 问答到 api_gateway /wiki。
+
+    2026-09-11：补网关不可用时的捕获。原 search() 未捕获 ConnectError，
+    网关未启动会裸抛异常 → 路由无守卫 → 500。此处沿用 ingest_file 的失败语义，
+    返回 {error, code}，由前端展示友好提示而非裸 500。
+    """
+    try:
+        r = await get_client().post(
+            f"{KNOWLEDGE_API_BASE}/wiki",
+            headers=_headers(),
+            json={"question": question},
+            timeout=TIMEOUT,
+        )
+    except httpx.ConnectError as e:
+        logger.warning("knowledge wiki gateway down: %s", e)
+        return {"error": "知识库服务未启动", "code": "GATEWAY_DOWN"}
+    except httpx.TimeoutException as e:
+        logger.warning("knowledge wiki timeout: %s", e)
+        return {"error": "知识库服务响应超时", "code": "GATEWAY_TIMEOUT"}
     if r.status_code >= 400:
         return {"error": r.text, "code": f"HTTP_{r.status_code}"}
     return r.json()

@@ -9,6 +9,7 @@ import contextvars
 from .database import sch_add, sch_list, sch_update, note_add, note_list, note_get, mem_search, mem_add, mem_del, mem_get, mem_list, MEMORY_TYPES, msg_list, conv_update_learning_progress
 from . import knowledge_service
 from .config import is_code_execution_enabled
+from .validators.sanitize_guard import GUIDE_PLACEHOLDER, refusal_text
 
 logger = logging.getLogger("zenith.tools")
 
@@ -52,6 +53,24 @@ TOOLS_SCHEMA = [
                     "tags": {"type": "string", "description": "标签，逗号分隔（可选）"}
                 },
                 "required": ["title", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_duplicate",
+            "description": "入库前查重：给定标题/正文，检查是否已有相似的笔记或记忆。"
+                           "复用本地 n-gram/TF-IDF 联想召回，返回命中的笔记与记忆及其相似度。"
+                           "在 add_note / distill_note 之前调用，可避免重复记录同一内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "待检查的标题"},
+                    "content": {"type": "string", "description": "待检查的正文（可选，提供后判定更准）"},
+                    "top_k": {"type": "integer", "description": "返回条数，默认 5"}
+                },
+                "required": ["title"]
             }
         }
     },
@@ -454,6 +473,60 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "mt5_account",
+            "description": "获取MT5账户完整详情：余额/净值/可用保证金/杠杆/保证金水平/强平线/账户名/服务器/公司等。用户问账户余额/净值/杠杆/保证金/爆仓线/账户情况时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mt5_trade_history",
+            "description": "获取MT5历史成交记录(deals)：每笔开仓/平仓的时间、品种、方向、手数、成交价、盈亏、手续费、库存费，并给出区间累计盈亏。用户问交易记录/历史成交/交易明细/最近赚了多少/亏损多少/交易流水时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-365"},
+                    "limit": {"type": "integer", "description": "最多返回条数，默认200"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mt5_order_history",
+            "description": "获取MT5历史订单(orders=委托指令，含开仓/平仓请求与改单记录)。注意：要查「成交与盈亏」应改用 mt5_trade_history；本工具用于委托层面的记录与止损止盈设置。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-365"},
+                    "limit": {"type": "integer", "description": "最多返回条数，默认200"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mt5_pending_orders",
+            "description": "获取MT5当前挂单(尚未成交的委托)。用户问挂单/未成交委托/限价单/挂单情况时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "distill_note",
             "description": "蒸馏一条 raw 便签：根据记忆模块的偏好/方法，将其分流为整理后的笔记、日程或记忆。",
             "parameters": {
@@ -729,13 +802,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "call_mcp",
-            "description": "调用已配置的 MCP 服务中的某个工具。例如事实核查(fact-check-mcp 的 verify_claim/check_groundedness/scan_contradictions/check_memory_conflict)、代码验证(code-verify-mcp 的 verify_execution/check_imports)、执行门控(guard-mcp)、缓存调度(cache-scheduler)、金十财经数据(jin10)。当用户要求严格验证/核查/硬性检查，或命中需要 MCP 工具的技能（如 zenith-auditor）时调用。不填 tool_name 则返回该服务可用工具列表。",
+            "description": "调用已配置的 MCP 服务中的某个工具。例如事实核查(fact-check-mcp 的 verify_claim/check_groundedness/scan_contradictions/check_memory_conflict)、代码验证(code-verify-mcp 的 verify_execution/check_imports)、执行门控(guard-mcp)、缓存调度(cache-scheduler)。当用户要求严格验证/核查/硬性检查，或命中需要 MCP 工具的技能（如 zenith-auditor）时调用。不填 tool_name 则返回该服务可用工具列表。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mcp_name": {
                         "type": "string",
-                        "description": "MCP 服务名称，如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler / jin10"
+                        "description": "MCP 服务名称，如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler。不确定有哪些服务时，先只填 mcp_name 调一次即可列出"
                     },
                     "tool_name": {
                         "type": "string",
@@ -891,6 +964,30 @@ TOOLS_SCHEMA = [
 ]
 
 
+# ⚠️ 暂不可用的工具 —— **从暴露给 LLM 的列表里移除，但保留全部代码**。
+#
+# 这里**只过滤暴露给模型的那一份**（`routers/chat.py` 用它构造 `tools=` 参数），
+# `_TOOL_HANDLERS` 中的处理器**原样保留**，于是：
+#   · 直接 `execute_tool(...)` 仍可用（脚本 / 手动排查）；
+#   · **恢复只需把名字从这里删掉**（一行可逆）。
+#
+# 为什么不直接删代码：代码本身是完整的，「是否保留这项能力」属**产品决策**，
+# 与「当前环境不可用」是两件事（见 backlog §10.3）。
+#
+# ✅ **mt5 那 4 个工具已于 2026-09-22 恢复**（原禁用依据两条均已失效）：
+#    当初的理由是「MCP `mt5-terminal` 返回 401 + 终端未启动」—— 实测都不成立：
+#    终端在跑（PID 14840 / build 6182 / Exness-MT5Real5），且这 4 个 handler 走的是
+#    `mt5_service` 的 **TCP 直连 IPC**，**根本不经过 MCP** → 属**因果链错位**造成的误禁。
+#    实测依据：`/api/mt5/{status,tick,rates,positions}` 全 200；三个 handler 全 success。
+_DISABLED_TOOLS = {
+    # query_wiki（2026-09-15 加入）：依赖 8788 的 `llm_wiki_compiler` 模块，
+    # 该模块已归档、密钥未配 → `/wiki` 端点必然 500，全历史调用成功率 0%。
+    # 保留处理器（`_handle_query_wiki` 未删），配好模块后把名字从这里删掉即可恢复。
+    "query_wiki",
+}
+TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t["function"]["name"] not in _DISABLED_TOOLS]
+
+
 # ── 工具处理器注册表 ──
 # 当前执行对话 ID（上下文变量：每个异步任务独立，多对话并发不串号）
 # 由 execute_tool 在当前 task 上下文里 set，供 update_background 等工具读取
@@ -917,6 +1014,10 @@ _TOOL_HANDLERS = {
     "mt5_rates":          lambda a: _handle_mt5_rates(a),
     "mt5_volume_profile":  lambda a: _handle_mt5_volume_profile(a),
     "mt5_positions":       lambda a: _handle_mt5_positions(),
+    "mt5_account":         lambda a: _handle_mt5_account(),
+    "mt5_trade_history":   lambda a: _handle_mt5_trade_history(a),
+    "mt5_order_history":   lambda a: _handle_mt5_order_history(a),
+    "mt5_pending_orders":  lambda a: _handle_mt5_pending_orders(),
     "distill_conversation": lambda a: _handle_distill_conv(a),
     "distill_schedules":   lambda a: _handle_distill_schedules(a),
     "distill_memories":    lambda a: _handle_distill_memories(a),
@@ -929,6 +1030,7 @@ _TOOL_HANDLERS = {
     "sync_calendar":       lambda a: _handle_sync_calendar(a),
     "smart_classify":      lambda a: _handle_smart_classify(a),
     "distill_note":        lambda a: _handle_distill_note(a),
+    "check_duplicate":     lambda a: _handle_check_duplicate(a),
     "retrieve_docs":       lambda a: _handle_retrieve_docs(a),
     "query_wiki":          lambda a: _handle_query_wiki(a),
     "kb_stats":            lambda a: _handle_kb_stats(a),
@@ -1071,6 +1173,13 @@ async def _handle_add_schedule(args: dict) -> dict:
         "status": "proposed",
         "priority": priority,
     })
+    if sid < 0:
+        # -1 = sch_add 内的明文密钥守卫拒绝（2026-09-16 门禁下沉后，本 handler 直调也会被拦）。
+        # 必须显式回绝：否则模型拿到 "提议已生成 (ID:-1)" 会误以为写成功而向用户复述。
+        return {
+            "success": False,
+            "result": refusal_text("日程提议", guide=GUIDE_PLACEHOLDER),
+        }
     return {
         "success": True,
         "result": f"日程提议已生成 (ID:{sid})：[{priority}] {title} @ {start_time or raw_time}",
@@ -1088,6 +1197,12 @@ def _handle_add_note(args: dict) -> dict:
         "source": "ai_detect",
         "status": "proposed",
     })
+    if nid < 0:
+        # -1 = note_add 内的明文密钥守卫拒绝（同 add_schedule：直调路径不经路由层守卫）
+        return {
+            "success": False,
+            "result": refusal_text("笔记提议", guide=GUIDE_PLACEHOLDER),
+        }
     return {
         "success": True,
         "result": f"笔记提议已生成 (ID:{nid})：{args['title']}",
@@ -1095,6 +1210,114 @@ def _handle_add_note(args: dict) -> dict:
         "confirm_type": "note",
         "confirm_id": nid,
     }
+
+
+# 查重阈值（2026-09-15）— 与 memory_engine._is_duplicate 的 0.75 刻意不同：
+# 0.75 用于「同长度内容」互比（记忆 vs 记忆）；此处是「短查询 vs 长条目」，
+# 文本长度不对称会稀释 Jaccard 相似度。实测同一主题仅 0.59、无关主题 0.03–0.06，
+# 区分度有 10 倍，故取 0.5。另加「标题归一化包含」作为无歧义强信号。
+_DUP_THRESHOLD = 0.5
+
+
+def _norm_title(s: str) -> str:
+    """标题归一化：去空白 / 标点 / 编号分隔符，便于判重比较。"""
+    return re.sub(r"[\s\-—_（）()【】\[\]:：、,，.。]+", "", (s or "")).lower()
+
+
+def _handle_check_duplicate(args: dict) -> dict:
+    """入库前查重 — 复用 search_related_items（记忆 n-gram + 笔记 TF-IDF 联想召回）。
+
+    2026-09-15 新增：此前查重完全依赖模型回忆（实测会话 f00f2185 靠「我印象里存过」
+    才发现重复）。底层打分早已存在（memory_engine._similarity / _score_query_overlap），
+    只是没暴露成工具。此处只做暴露与格式化，不新造算法。
+    """
+    title = (args.get("title") or "").strip()
+    if not title:
+        return {"success": False, "result": "title 不能为空"}
+    content = (args.get("content") or "").strip()
+    query = f"{title}\n{content}".strip() if content else title
+    try:
+        top_k = int(args.get("top_k") or 5)
+    except (TypeError, ValueError):
+        top_k = 5
+    top_k = max(1, min(top_k, 20))
+
+    try:
+        from .memory_engine import search_related_items, _similarity
+        mems, notes = search_related_items(query, limit=top_k, include_notes=True)
+    except Exception as e:
+        return {"success": False, "result": f"查重失败: {e}"}
+
+    hit_notes, hit_mems = [], []
+    for n in (notes or [])[:top_k]:
+        try:
+            s = _similarity(query, f"{n.get('title', '')}\n{n.get('content', '')}")
+        except Exception:
+            s = 0.0
+        hit_notes.append((s, n))
+    for m in (mems or [])[:top_k]:
+        try:
+            s = _similarity(query, m.get("content", ""))
+        except Exception:
+            s = 0.0
+        hit_mems.append((s, m))
+    hit_notes.sort(key=lambda x: -x[0])
+    hit_mems.sort(key=lambda x: -x[0])
+
+    lines = []
+    if hit_notes:
+        lines.append("📄 相似笔记：")
+        for s, n in hit_notes:
+            lines.append(f"  [ID:{n['id']}] 相似度{s:.2f} {n.get('title', '')}")
+    if hit_mems:
+        lines.append("🧠 相似记忆：")
+        for s, m in hit_mems:
+            lines.append(f"  [ID:{m['id']}] 相似度{s:.2f} {(m.get('content') or '')[:80]}")
+
+    if not lines:
+        return {"success": True, "result": "未发现相似笔记或记忆，可放心入库。", "duplicate": False}
+
+    top = max([s for s, _ in hit_notes] + [s for s, _ in hit_mems])
+    nt = _norm_title(title)
+
+    def _title_match(other: str) -> str:
+        """返回匹配类型：'exact' / 'partial' / ''。
+
+        ⚠️ 子串互含加**最短长度门槛（4 字）**：否则短标题（如「国债」）会被长查询
+        文本包含而误判为重复。完全相同不受门槛限制。
+        """
+        o = _norm_title(other)
+        if not nt or not o:
+            return ""
+        if nt == o:
+            return "exact"
+        shorter = nt if len(nt) <= len(o) else o
+        if len(shorter) >= 4 and (nt in o or o in nt):
+            return "partial"
+        return ""
+
+    matched = [(n, _title_match(n.get("title", ""))) for _, n in hit_notes]
+    matched = [(n, k) for n, k in matched if k]
+    title_hit = bool(matched)
+    duplicate = title_hit or top >= _DUP_THRESHOLD
+
+    # ⚠️ 输出必须带**判据 + 证据**，不能只给结论（2026-09-15 实测教训）：
+    # 首版在 title_hit 时只输出「高度重复（标题重合）」而不带任何数字，使用者在
+    # 相似度仅 0.14 时看到该结论，判定为"静态模板文案"并决定弃用本工具。
+    # 真相是：标题完全一致时正文重叠本就可能很低（同一主题的极简版 vs 展开版），
+    # 属正常现象。现把命中条目 ID/标题与相似度一并给出，让使用者自行判断。
+    if duplicate:
+        if title_hit:
+            n0, kind = matched[0]
+            whose = f"[ID:{n0['id']}]「{n0.get('title', '')}」"
+            label = "标题完全一致" if kind == "exact" else "标题高度重合"
+            why = f"{label}：{whose}；正文相似度 {top:.2f}"
+        else:
+            why = f"正文相似度 {top:.2f} ≥ 阈值 {_DUP_THRESHOLD}（标题无匹配）"
+        lines.append(f"判定：高度重复 —— {why}。建议用 edit_note 更新已有条目，勿重复入库")
+    else:
+        lines.append(f"判定：存在部分重叠（最高相似度 {top:.2f}，未达阈值 {_DUP_THRESHOLD}）→ 入库前请先比对")
+    return {"success": True, "result": "\n".join(lines), "duplicate": duplicate}
 
 
 def _handle_list_schedule(args: dict) -> dict:
@@ -1240,6 +1463,12 @@ def _handle_create_plan_schedule(args: dict) -> dict:
         "status": "confirmed",
         "priority": priority,
     })
+    if sid < 0:
+        # -1 = sch_add 内的明文密钥守卫拒绝（文件分析提取的文本同样可能含密钥，故一并拦住）
+        return {
+            "success": False,
+            "result": refusal_text("日程创建", guide=GUIDE_PLACEHOLDER),
+        }
     return {
         "success": True,
         "result": f"日程已创建 (ID:{sid})：[{priority}] {title} @ {args.get('start_time','')}",
@@ -1487,6 +1716,124 @@ def _handle_mt5_positions() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MT5 账户 / 交易记录 Handler（2026-09-22 新增）
+# ⚠️ 这几个 handler **故意不 `**r`** —— deals/orders 数组可能上百条，
+#    原样塞回对话会显著膨胀上下文。文本摘要已足够模型作答，明细走 HTTP 接口取。
+# ---------------------------------------------------------------------------
+
+def _handle_mt5_account() -> dict:
+    """获取 MT5 账户完整详情"""
+    from .mt5_service import get_account_info
+
+    r = get_account_info()
+    if not r.get("success"):
+        return r
+
+    ml = r.get("margin_level") or 0
+    lines = [
+        f"💼 账户 {r.get('login')}（{r.get('name')}）",
+        f"  服务器: {r.get('server')} / {r.get('company')}",
+        f"  币种: {r.get('currency')}   杠杆: 1:{r.get('leverage')}",
+        f"  余额: {r.get('balance')}   信用: {r.get('credit')}",
+        f"  净值: {r.get('equity')}   浮动盈亏: {r.get('profit')}",
+        f"  已用保证金: {r.get('margin')}   可用保证金: {r.get('margin_free')}",
+        f"  保证金水平: {ml}%" + (f"（{r.get('margin_level_note')}）" if r.get("margin_level_note") else ""),
+        f"  强平预警线: {r.get('margin_so_call')}%   强平执行线: {r.get('margin_so_so')}%",
+        f"  允许交易: {r.get('trade_allowed')}   允许 EA: {r.get('trade_expert')}",
+    ]
+    return {"success": True, "result": "\n".join(lines), **r}
+
+
+def _handle_mt5_trade_history(args: dict) -> dict:
+    """获取 MT5 历史成交记录"""
+    from .mt5_service import get_trade_history
+
+    days = int(args.get("days") or 7)
+    limit = int(args.get("limit") or 200)
+    r = get_trade_history(days, limit)
+    if not r.get("success"):
+        return r
+
+    if r["count"] == 0:
+        return {"success": True, "result": f"最近 {days} 天没有成交记录", "count": 0, "days": days}
+
+    lines = [
+        f"📊 最近 {days} 天成交记录（共 {r['count']} 条，显示 {r['returned']} 条）:",
+        f"  平仓盈亏合计: {r['closed_profit']}（{r['closed_count']} 笔平仓）",
+        f"  扣手续费/库存费后净额: {r['net_after_costs']}",
+    ]
+    for d in r["deals"][:60]:
+        action = {"in": "开仓", "out": "平仓", "inout": "反向", "out_by": "对冲平仓"}.get(d["entry"], d["entry"])
+        seg = f"  {d['time']}  {d['symbol']} {d['type']} {d['volume']}手 @ {d['price']}  [{action}]"
+        if d["profit"]:
+            seg += f"  盈亏={d['profit']}"
+        if d["commission"]:
+            seg += f"  手续费={d['commission']}"
+        if d["swap"]:
+            seg += f"  库存费={d['swap']}"
+        lines.append(seg)
+    if r["count"] > 60:
+        lines.append(f"  ...（其余 {r['count'] - 60} 条已省略）")
+
+    return {
+        "success": True,
+        "result": "\n".join(lines),
+        "days": days,
+        "count": r["count"],
+        "truncated": r["truncated"],
+        "total_profit": r["total_profit"],
+        "closed_profit": r["closed_profit"],
+        "closed_count": r["closed_count"],
+        "net_after_costs": r["net_after_costs"],
+    }
+
+
+def _handle_mt5_order_history(args: dict) -> dict:
+    """获取 MT5 历史订单"""
+    from .mt5_service import get_order_history
+
+    days = int(args.get("days") or 7)
+    limit = int(args.get("limit") or 200)
+    r = get_order_history(days, limit)
+    if not r.get("success"):
+        return r
+
+    if r["count"] == 0:
+        return {"success": True, "result": f"最近 {days} 天没有历史订单", "count": 0, "days": days}
+
+    lines = [f"📑 最近 {days} 天订单记录（共 {r['count']} 条，显示 {r['returned']} 条）:"]
+    for o in r["orders"][:60]:
+        lines.append(
+            f"  {o['time_setup']}  {o['symbol']} type={o['type']} state={o['state']} "
+            f"vol={o['volume_initial']} @ {o['price_open']} SL={o['sl']} TP={o['tp']}"
+        )
+    if r["count"] > 60:
+        lines.append(f"  ...（其余 {r['count'] - 60} 条已省略）")
+
+    return {"success": True, "result": "\n".join(lines), "days": days, "count": r["count"], "truncated": r["truncated"]}
+
+
+def _handle_mt5_pending_orders() -> dict:
+    """获取 MT5 当前挂单"""
+    from .mt5_service import get_pending_orders
+
+    r = get_pending_orders()
+    if not r.get("success"):
+        return r
+
+    if r["count"] == 0:
+        return {"success": True, "result": "当前无挂单", "count": 0}
+
+    lines = [f"📌 当前挂单（{r['count']} 个）:"]
+    for o in r["orders"]:
+        lines.append(
+            f"  #{o['ticket']} {o['symbol']} type={o['type']} {o['volume']}手 "
+            f"@ {o['price_open']}（当前 {o['price_current']}）SL={o['sl']} TP={o['tp']}"
+        )
+    return {"success": True, "result": "\n".join(lines), "count": r["count"]}
+
+
+# ---------------------------------------------------------------------------
 # 统一蒸馏工具处理
 # ---------------------------------------------------------------------------
 
@@ -1680,7 +2027,7 @@ is_thought=true 且 isn_plan=false 时，若需要保存整理后的笔记则输
 → skill_card 描述复盘步骤
 
 不需要的字段填 null，不要填空对象。
-只输出JSON，不要��任何解释文字。"""
+只输出JSON，不要加任何解释文字。"""
 
 
 def _rule_preclassify(text: str) -> dict:
@@ -2033,7 +2380,11 @@ async def _distill_raw_note(
     # 2. 创建整理后的笔记
     note_part = decision.get("note", {})
     if note_part.get("should_refine"):
-        note_update(note_id, {
+        # note_update 返回 False = title/content 命中明文密钥守卫（未写入）。
+        # 2026-09-16 修复：此前忽略返回值、无条件 append 成功消息 —— 命中守卫时
+        # raw note 原样保留，却向模型/用户报「整理笔记 (ID:x)」，即谎报成功。
+        # 措辞参照同文件 _handle_add_note（:1137）与 _handle_smart_classify（:2532）。
+        refined = note_update(note_id, {
             "title": note_part.get("title", text[:30]),
             "content": note_part.get("content", text),
             "tags": ",".join(note_part.get("tags", [])),
@@ -2041,7 +2392,10 @@ async def _distill_raw_note(
             "stage": "refined",
             "distilled_at": now_iso,
         })
-        actions.append(f"整理笔记 (ID:{note_id})")
+        if not refined:
+            actions.append(refusal_text("笔记整理", action="原笔记未改动", guide=""))
+        else:
+            actions.append(f"整理笔记 (ID:{note_id})")
 
     # 3. 创建日程
     schedule_part = decision.get("schedule", {})
@@ -2088,25 +2442,31 @@ async def _distill_raw_note(
             "status": "proposed",
             "priority": priority,
         })
-        actions.append(f"日程提议 (ID:{sid})")
-        created_ids["schedule_id"] = sid
-
-        # 把日程 ID 关联回原 note
-        distilled_into = []
-        import json as _json
-        try:
-            distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
-        except Exception:
-            distilled_into = []
-        if isinstance(distilled_into, list):
-            distilled_into.append({"type": "schedule", "id": sid})
+        if sid < 0:
+            # -1 = sch_add 内的明文密钥守卫拒绝（门禁下沉后本路径同样被拦）。
+            # 关键：不能把 -1 当日程 ID 写进 note 的 distilled_into —— 那会污染溯源数据，
+            # 让 -1 在后续「已蒸馏」判断里冒充一个真实日程。
+            actions.append(refusal_text("日程提议", action="未写入", guide=""))
         else:
-            distilled_into = [{"type": "schedule", "id": sid}]
-        note_update(note_id, {
-            "stage": "distilled",
-            "distilled_at": now_iso,
-            "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
-        })
+            actions.append(f"日程提议 (ID:{sid})")
+            created_ids["schedule_id"] = sid
+
+            # 把日程 ID 关联回原 note
+            distilled_into = []
+            import json as _json
+            try:
+                distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
+            except Exception:
+                distilled_into = []
+            if isinstance(distilled_into, list):
+                distilled_into.append({"type": "schedule", "id": sid})
+            else:
+                distilled_into = [{"type": "schedule", "id": sid}]
+            note_update(note_id, {
+                "stage": "distilled",
+                "distilled_at": now_iso,
+                "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+            })
 
     # 4. 创建记忆（带录入时去重检查 — 不删除已有）
     memory_part = decision.get("memory", {})
@@ -2164,24 +2524,32 @@ async def _distill_raw_note(
                 recorded_at=recorded_at or now_iso,
                 distilled_from=note_id,
             )
-            actions.append(f"记忆 (ID:{mem_id})")
-            created_ids["memory_id"] = mem_id
-
-            # 把记忆 ID 关联回原 note
-            import json as _json
-            try:
-                distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
-            except Exception:
-                distilled_into = []
-            if isinstance(distilled_into, list):
-                distilled_into.append({"type": "memory", "id": mem_id})
+            if mem_id < 0:
+                # 负值 = 未写入（-1 守卫拒绝 / -2 去重拦截）：
+                # 不能把 -1 当记忆 ID 写进 note 的 distilled_into（会让 -1 冒充真实条目）
+                actions.append(
+                    refusal_text("记忆", action="未写入", guide="") if mem_id == -1
+                    else "记忆去重拦截（未写入）"
+                )
             else:
-                distilled_into = [{"type": "memory", "id": mem_id}]
-            note_update(note_id, {
-                "stage": "distilled",
-                "distilled_at": now_iso,
-                "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
-            })
+                actions.append(f"记忆 (ID:{mem_id})")
+                created_ids["memory_id"] = mem_id
+
+                # 把记忆 ID 关联回原 note
+                import json as _json
+                try:
+                    distilled_into = _json.loads(note_get(note_id).get("distilled_into", "[]") or "[]")
+                except Exception:
+                    distilled_into = []
+                if isinstance(distilled_into, list):
+                    distilled_into.append({"type": "memory", "id": mem_id})
+                else:
+                    distilled_into = [{"type": "memory", "id": mem_id}]
+                note_update(note_id, {
+                    "stage": "distilled",
+                    "distilled_at": now_iso,
+                    "distilled_into": _json.dumps(distilled_into, ensure_ascii=False),
+                })
 
     return {"actions": actions, "created_ids": created_ids}
 
@@ -2255,9 +2623,17 @@ async def _handle_smart_classify(args: dict) -> dict:
             source_conv_id=conv_id,
             recorded_at=recorded_at,
         )
-        actions.append(f"技能记忆 (ID:{mem_id})")
-        created_ids["skill_memory_id"] = mem_id
-        created_ids["memory_id"] = mem_id
+        # mem_add 的负值是「未写入」：-1 明文密钥守卫拒绝、-2 相似度去重拦截。
+        # 原先无条件报 "(ID:-1)"，模型会据此向用户复述「已记住这个技能」，属误报成功。
+        if mem_id < 0:
+            actions.append(
+                refusal_text("技能记忆", action="未写入", guide="") if mem_id == -1
+                else "技能记忆去重拦截（未写入）"
+            )
+        else:
+            actions.append(f"技能记忆 (ID:{mem_id})")
+            created_ids["skill_memory_id"] = mem_id
+            created_ids["memory_id"] = mem_id
 
     # 2. is_memory → 直接入记忆库（带去重）
     elif classification.get("is_memory") and memory_info:
@@ -2286,8 +2662,15 @@ async def _handle_smart_classify(args: dict) -> dict:
                 source_conv_id=conv_id,
                 recorded_at=recorded_at,
             )
-            actions.append(f"记忆 (ID:{mem_id})")
-            created_ids["memory_id"] = mem_id
+            if mem_id < 0:
+                # 同上：负值代表未写入（-1 守卫拒绝 / -2 去重拦截）
+                actions.append(
+                    refusal_text("记忆", action="未写入", guide="") if mem_id == -1
+                    else "记忆去重拦截（未写入）"
+                )
+            else:
+                actions.append(f"记忆 (ID:{mem_id})")
+                created_ids["memory_id"] = mem_id
 
     # 3. is_plan → 直接创建日程（来自 LLM 的统一输出，不再二次蒸馏）
     if classification.get("is_plan") and schedule_info:
@@ -2313,8 +2696,12 @@ async def _handle_smart_classify(args: dict) -> dict:
             "status": "proposed",
             "source": "ai_detect",
         })
-        actions.append(f"日程 (ID:{sid})")
-        created_ids["schedule_id"] = sid
+        if sid < 0:
+            # -1 = 明文密钥守卫拒绝（本 handler 直调 sch_add，不经路由层）
+            actions.append(refusal_text("日程", action="未写入", guide=""))
+        else:
+            actions.append(f"日程 (ID:{sid})")
+            created_ids["schedule_id"] = sid
 
     # 4. is_thought → 若 LLM 输出需要创建笔记则直接建 refined note
     if classification.get("is_thought") and not classification.get("is_plan"):
@@ -2336,8 +2723,12 @@ async def _handle_smart_classify(args: dict) -> dict:
                     "stage": "refined",
                     "recorded_at": recorded_at,
                 })
-                actions.append(f"笔记 (ID:{nid})")
-                created_ids["note_id"] = nid
+                if nid < 0:
+                    # -1 = 明文密钥守卫拒绝（smart_classify 是 SYSTEM_PROMPT 第 13 条引导的主路径）
+                    actions.append(refusal_text("笔记", action="未写入", guide=""))
+                else:
+                    actions.append(f"笔记 (ID:{nid})")
+                    created_ids["note_id"] = nid
 
     # 构建返回结果
     result_lines = [
@@ -2587,7 +2978,6 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
     # O1+O2+O3 优化（2026-08-25）：相似度分组收敛到 memory_engine.find_similar_memory_groups，
     # 3-gram 倒排候选召回（O(n·k) 非 O(n²)）、支持全量、无 500 上限；通过 to_thread
     # 把 CPU 密集段移出事件循环，对话请求不阻塞。
-    from .memory_engine import find_similar_memory_groups
     merge_groups = await asyncio.to_thread(find_similar_memory_groups, all_mems)
 
     # 已被相似度合并命中的 ID（keep + delete），不再进入过时/重复候选
@@ -2620,7 +3010,13 @@ async def generate_consolidate_plan(type_: str = "", search: str = "") -> dict:
             response = await call_llm(
                 messages=[{"role": "system", "content": prompt}],
                 temperature=0.1,
-                max_tokens=1024,
+                # 2026-09-16: 原为 1024，太小 —— 本任务要给最多 100 条记忆出整理计划
+                # （merge_groups + outdated 两个数组），实测 2026-09-15 23:22 输出被截断，
+                # 报「无法从响应中提取 JSON: {」→ 计划降级为「仅自动相似度结果」，
+                # 用户因此拒绝执行该清单。
+                # ⚠️ 这是与「reasoning 吃光额度」**不同**的第二种额度不足：content 非空
+                # 但不完整，故 call_llm 的空正文重试兜底覆盖不到，必须在此处给足额度。
+                max_tokens=4096,
                 response_format={"type": "json_object"},
             )
             text = response.get("content", "") if isinstance(response, dict) else str(response)
@@ -2792,6 +3188,41 @@ async def _handle_sync_calendar(args: dict) -> dict:
         return {"success": False, "result": f"同步失败: {e}"}
 
 
+# consolidate「生成计划」阶段的超时上限（秒）。
+# 2026-08-20 实测一次 consolidate_memories 耗时 3972 秒（66.2 分钟）且全程无心跳，
+# SSE 对话被拖死 → 在此加硬超时闸门。需要调参时只改这一处。
+CONSOLIDATE_TIMEOUT_SEC = 120
+
+
+async def _generate_consolidate_plan_guarded(type_: str, search: str) -> dict:
+    """带超时保护的 generate_consolidate_plan 包装（Z9）。
+
+    超时**返回明确失败 dict 而非抛异常**：上游 tools.py 的 `except Exception`
+    会把异常压成裸 `str(e)`，LLM/用户看不到可行动的原因。
+
+    ⚠️ 已知边界：`asyncio.wait_for` 只能中断「让出事件循环」的等待（本次主要是
+    `call_llm` 的网络请求）。若 `mem_list()` 这类同步阻塞调用自身卡住，事件循环
+    被占死，超时无法生效 —— 这属于另一类问题（需从 DB 侧治理），不在本次范围。
+    """
+    try:
+        return await asyncio.wait_for(
+            generate_consolidate_plan(type_=type_, search=search),
+            timeout=CONSOLIDATE_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "consolidate 计划生成超时（%ss），已中止", CONSOLIDATE_TIMEOUT_SEC
+        )
+        return {
+            "success": False,
+            "result": (
+                f"记忆整理计划生成超时（{CONSOLIDATE_TIMEOUT_SEC}s），已中止；"
+                "可缩小范围后重试。"
+            ),
+            "timeout": True,
+        }
+
+
 async def _handle_consolidate_memories(args: dict) -> dict:
     """工具入口：生成或执行记忆整理计划。"""
     type_ = args.get("type_", "")
@@ -2800,7 +3231,9 @@ async def _handle_consolidate_memories(args: dict) -> dict:
 
     if auto_apply:
         # 直接执行模式：基于默认策略生成计划并执行
-        plan = await generate_consolidate_plan(type_=type_, search=search)
+        plan = await _generate_consolidate_plan_guarded(type_, search)
+        if plan.get("success") is False:
+            return plan
         result = await apply_consolidate_plan(plan)
         return {
             "success": True,
@@ -2810,7 +3243,9 @@ async def _handle_consolidate_memories(args: dict) -> dict:
         }
 
     # 默认：只生成计划，等待用户确认
-    plan = await generate_consolidate_plan(type_=type_, search=search)
+    plan = await _generate_consolidate_plan_guarded(type_, search)
+    if plan.get("success") is False:
+        return plan
     formatted = _format_consolidate_plan(plan)
 
     return {
@@ -2823,8 +3258,49 @@ async def _handle_consolidate_memories(args: dict) -> dict:
 
 
 # ── 知识库工具处理函数 ──────────────────────────────
+# ── 知识库检索的本地回落（2026-09-15）────────────────────
+# 背景：实测会话 0fbe78fc 中 RAG 两路返空，模型只能手动 list_notes 用关键词试错 5 次
+# 才捞到料（而本地笔记里明明有 ID:49/54/57/70 四篇高度相关的骨架）。
+# 这里把「试错」固化进工具内部：RAG 无实质结果时自动回落本地笔记+记忆，一次给全。
+# 判据宁可宽松（多给料无害），只追加不替换，原 RAG 输出始终保留。
+_RAG_EMPTY_PAT = re.compile(r"未找到|无法完整回答|无法回答|没有相关|未收录|无法提供")
+# 60 字：实测有效答案可短至 ~100 字（"根据文献片段，凯恩斯主义的核心观点是…+来源"），
+# 设 120 会把这类有效答案误判为空 → 造成不必要的回落噪声。故取更保守的 60。
+_RAG_MIN_CHARS = 60
+
+
+def _rag_answer_is_empty(answer: str) -> bool:
+    a = (answer or "").strip()
+    if len(a) < _RAG_MIN_CHARS:
+        return True
+    return bool(_RAG_EMPTY_PAT.search(a))
+
+
+def _local_kb_fallback(question: str, limit: int = 5) -> str:
+    """查本地笔记（TF-IDF 余弦）+ 记忆（n-gram 联想），返回可读摘要；无命中返回空串。"""
+    try:
+        from .memory_engine import search_related_items
+        mems, notes = search_related_items(question, limit=limit, include_notes=True)
+    except Exception as e:
+        logger.warning("本地回落检索失败: %s", e)
+        return ""
+    lines = []
+    if notes:
+        lines.append("【本地笔记命中】")
+        for n in notes[:limit]:
+            lines.append(f"  [ID:{n['id']}] {n.get('title', '')}")
+    if mems:
+        lines.append("【本地记忆命中】")
+        for m in mems[:limit]:
+            lines.append(f"  [ID:{m['id']}] {(m.get('content') or '')[:90]}")
+    if not lines:
+        return ""
+    lines.append("（知识库未命中，以上为本地回落；需要全文请 read_note）")
+    return "\n".join(lines)
+
+
 async def _handle_retrieve_docs(args: dict) -> dict:
-    """RAG 检索：转发到 knowledge_service.search"""
+    """RAG 检索：转发到 knowledge_service.search；无实质结果时回落本地笔记/记忆"""
     question = args.get("question", "").strip()
     if not question:
         return {"success": False, "result": "question 不能为空"}
@@ -2842,10 +3318,24 @@ async def _handle_retrieve_docs(args: dict) -> dict:
                 except Exception:
                     detail = raw
             code = r.get("code") or "SEARCH_FAIL"
-            return {"success": False, "result": f"知识库检索失败（{code}）: {detail}", "code": code}
-        return {"success": True, "result": r.get("answer", "")}
+            merged = f"知识库检索失败（{code}）: {detail}"
+            fb = _local_kb_fallback(question, limit=top_k)
+            if fb:
+                merged += f"\n\n{fb}"
+            return {"success": False, "result": merged, "code": code, "fellback": bool(fb)}
+        answer = r.get("answer", "") or ""
+        if _rag_answer_is_empty(answer):
+            fb = _local_kb_fallback(question, limit=top_k)
+            if fb:
+                head = answer.strip() or "（知识库未返回实质内容）"
+                return {"success": True, "result": f"{head}\n\n{fb}", "fellback": True}
+        return {"success": True, "result": answer}
     except Exception as e:
-        return {"success": False, "result": f"知识库检索失败: {e}"}
+        merged = f"知识库检索失败: {e}"
+        fb = _local_kb_fallback(question, limit=top_k)
+        if fb:
+            merged += f"\n\n{fb}"
+        return {"success": False, "result": merged, "fellback": bool(fb)}
 
 
 # ── 编辑类工具（需用户确认后执行）────────────────────
@@ -3520,7 +4010,7 @@ async def _handle_call_mcp(args: dict) -> dict:
     tool_args = args.get("args") or {}
 
     if not mcp_name:
-        return {"success": False, "result": "mcp_name 不能为空（如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler / jin10）"}
+        return {"success": False, "result": "mcp_name 不能为空（如 fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler）"}
 
     # 发现模式：列出可用工具
     if not tool_name:
@@ -3561,6 +4051,37 @@ async def _handle_call_mcp(args: dict) -> dict:
     # 某些 MCP server 把 "未知工具" 作为 content 文本返回（非 JSON-RPC 错误）
     if isinstance(result, dict) and "error" in result:
         return await _mcp_tool_not_found(mcp_name, client, tool_name, str(result.get("error", "")))
+
+    # Z14（消费侧）：MCP **工具级错误**（CallToolResult.isError）。
+    # 服务端明确告知「工具执行失败」，但 JSON-RPC 层是成功的（信封无 error 键），
+    # 故上面那条判据抓不到 —— 实测 trace id=327：fact-check-mcp 参数校验失败，
+    # 错误文本在 content 里，最终却记成 success:True。
+    #
+    # ⚠️ 接口契约（与 mcp_client.py 生产侧两端共同遵守，勿重命名该键）：
+    #   `_extract_tool_result()` 返回的 dict **可含** `"_mcp_is_error": True`
+    #   （由服务端 result.isError 翻译而来）；消费侧**必须**用 .get() 读，
+    #   缺省即 falsy ⇒ 未实现 isError 的 server 行为完全不变（fail-safe）。
+    #   生产侧未落地前本分支恒不触发，故此改动是惰性的。
+    if isinstance(result, dict) and result.get("_mcp_is_error"):
+        # 保留错误原文（别丢 result），排查与 LLM 定位都要用
+        return {
+            "success": False,
+            "result": f"调用 {mcp_name}.{tool_name} 失败（工具级错误）: {_format_mcp_result(result)}",
+        }
+
+    # Z2（消费侧）：服务端把失败原因写在 client._last_error，而 call_tool 返回空结果时，
+    # 原实现会给 LLM 一个 success:True 的空壳，掩盖真实故障。这里把它变成可见失败。
+    # ⚠️ 必须用 getattr + try 兼容 A2 队尚未实现 last_error() 的中间状态：
+    #    对方文件未完成时，本文件不能因此抛错（契约：last_error() -> str）。
+    err = ""
+    try:
+        _last_err_fn = getattr(client, "last_error", None)
+        if callable(_last_err_fn):
+            err = _last_err_fn() or ""
+    except Exception:
+        err = ""
+    if not result and err:
+        return {"success": False, "result": f"调用 {mcp_name}.{tool_name} 失败: {err}"}
 
     return {
         "success": True,

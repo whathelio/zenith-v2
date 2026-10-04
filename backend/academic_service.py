@@ -39,6 +39,10 @@ ELITE_VENUES = {
 
 DEFAULT_TIMEOUT = 20.0
 
+# search_papers 并行查询的数据源数量（openalex / crossref / semantic_scholar）。
+# 用于判定「是否所有源都失败」——全失败时要明确报错，不能伪装成「检索成功但无结果」。
+_SOURCE_COUNT = 3
+
 
 def _clean(text) -> str:
     if text is None:
@@ -403,6 +407,24 @@ async def search_papers(query: str, from_date: str = "", to_date: str = "",
             except Exception as e:
                 logger.warning("academic_paper_upsert failed: %s", e)
 
+    # ⚠️ 2026-09-11 修正：原先无论数据源是否全部失败都返回 `success=True`，
+    # 于是「三个源全挂」与「真的没检索到」在调用方看来一模一样
+    # （都是 success=True + count=0 + papers=[]）—— 典型的「看起来正常实际是空」。
+    # 路由层 `routers/academic.py` 早已写好 `if not success → 400` 的分支，
+    # 本次只是补齐服务端的契约。
+    sources_meta = ["openalex", "crossref", "semantic_scholar", "paperswithcode", "github"]
+    if not merged and len(errors) >= _SOURCE_COUNT:
+        return {
+            "success": False,
+            "error": "全部数据源检索失败：" + "；".join(errors)[:300],
+            "query": query,
+            "count": 0,
+            "papers": [],
+            "errors": errors,
+            "cached": False,
+            "sources": sources_meta,
+        }
+
     return {
         "success": True,
         "query": query,
@@ -410,7 +432,9 @@ async def search_papers(query: str, from_date: str = "", to_date: str = "",
         "papers": merged,
         "errors": errors or [],
         "cached": True if store else False,
-        "sources": ["openalex", "crossref", "semantic_scholar", "paperswithcode", "github"],
+        # 部分源失败时把情况显式带出去，便于调用方判断结果是否完整
+        "partial": bool(errors),
+        "sources": sources_meta,
     }
 
 

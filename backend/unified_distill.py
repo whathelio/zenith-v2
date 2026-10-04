@@ -1170,15 +1170,24 @@ async def distill_daily(date: str = "", save_txt: bool = True, save_md: bool = T
     )
 
     # 3. 自动存入记忆库（核心洞察作为 experience）
+    #    2026-09-11（修复 B4 — 去重基准不对称）：
+    #      旧代码比较的是**裸 insight**，落库的是**加了 `[每日总结 date] ` 前缀**的文本。
+    #      前缀会稀释 TF-IDF 余弦：实测同一批 5 组近义改写，
+    #        「带前缀 vs 带前缀」= 0.767~0.832（本该拦截）
+    #        「裸 vs 带前缀」（写入时真实走的路径）= 0.500~0.593 → 全部跌破 0.75 阈值 → 全部放行
+    #      结果：同一天反复蒸馏出的近义句全部入库（2026-08-26 一天 10+ 条）。
+    #      修法：先算出**最终落库形态**，再对它去重 —— 比较对象与存储对象必须同形。
     saved_count = 0
     for insight in result.get("insights", []):
         if isinstance(insight, str) and insight.strip():
-            if not _is_duplicate(insight.strip()):
+            stored = f"[每日总结 {date}] {insight.strip()}"
+            if not _is_duplicate(stored):
                 mem_add(
                     type_="experience",
-                    content=f"[每日总结 {date}] {insight.strip()}",
+                    content=stored,
                     importance=4,
                     keywords=f"每日总结,{date}",
+                    dedup=False,  # 上游已用同形文本判定过，避免重复判定
                 )
                 saved_count += 1
 
@@ -1271,25 +1280,30 @@ async def distill_weekly(week_start: str = "", save_txt: bool = True, save_md: b
     )
 
     # 3. 自动存入记忆库
+    #    2026-09-11（修复 B4）：与 distill_daily 同理 —— 先组出最终落库形态，再对同形文本去重。
     saved_count = 0
     for lesson in result.get("lessons", []):
         if isinstance(lesson, str) and lesson.strip():
-            if not _is_duplicate(lesson.strip()):
+            stored = f"[每周总结 {week_start}] {lesson.strip()}"
+            if not _is_duplicate(stored):
                 mem_add(
                     type_="experience",
-                    content=f"[每周总结 {week_start}] {lesson.strip()}",
+                    content=stored,
                     importance=4,
                     keywords=f"每周总结,{week_start}",
+                    dedup=False,  # 上游已用同形文本判定过
                 )
                 saved_count += 1
     for pattern in result.get("patterns", []):
         if isinstance(pattern, str) and pattern.strip():
-            if not _is_duplicate(pattern.strip()):
+            stored = f"[每周规律 {week_start}] {pattern.strip()}"
+            if not _is_duplicate(stored):
                 mem_add(
                     type_="fact",
-                    content=f"[每周规律 {week_start}] {pattern.strip()}",
+                    content=stored,
                     importance=3,
                     keywords=f"每周规律,{week_start}",
+                    dedup=False,  # 上游已用同形文本判定过
                 )
                 saved_count += 1
 
@@ -1665,14 +1679,21 @@ def _to_md_weekly(result: dict, weekly_data: dict) -> str:
             lines.append("")
 
     for key, title in [("patterns", "## 规律模式"),
-                        ("trends", "## 趋势变化"),
-                        ("goal_progress", "## 目标进展")]:
+                        ("trends", "## 趋势变化")]:
         items = result.get(key, [])
         if items:
             lines.append(title)
             for it in items:
                 lines.append(f"- {it}")
             lines.append("")
+
+    # goal_progress 是「一句话描述」字符串，不是列表 —— 不能进上面的 for 循环
+    # （曾误入循环体导致逐字符拆成 "- C" / "- F" / "- A"，5 期 weekly 全部中招）
+    gp = result.get("goal_progress", "")
+    if gp:
+        lines.append("## 目标进展")
+        lines.append(str(gp))
+        lines.append("")
 
     tags = result.get("tags", [])
     if tags:

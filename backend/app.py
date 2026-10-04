@@ -19,9 +19,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
-from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news, cache, summaries, academic
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news, cache, summaries, academic, processes, market, mt5
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled
+from .validators.sanitize_guard import GUIDE_SHIELD, refusal_text
 from .llm_client import call_llm
 from .memory_engine import reset_counter, flush_conversation_memories
 from .confirm_flow import confirm_proposal, reject_proposal, modify_proposal
@@ -30,7 +31,6 @@ from .confirm_flow import TutorialFlow, list_active_tutorials
 from .schedule_reminder import get_due_reminders, get_upcoming_schedules, REMINDER_PRESETS
 from .recurrence import expand_recurring
 from .file_analyzer import analyze_file_stream
-from .unified_distill import distill_conversation, distill_schedules, distill_memories, distill_all, distill_daily, distill_weekly
 from . import scheduler
 
 PROJECT_DIR = Path(__file__).parent.parent
@@ -39,12 +39,65 @@ FRONTEND_PUBLIC = PROJECT_DIR / "frontend" / "public"
 STANDALONE_HTML = PROJECT_DIR / "frontend" / "index-standalone.html"
 
 
+def _sync_skills_on_startup() -> None:
+    """启动时把技能目录幂等同步进 memories(type='skill')（2026-09-28 新增，Z4）。
+
+    背景：技能此前只在 4 个手动 HTTP 端点（routers/modules.py 的 /skills/import、
+    /skills/import-file 等）触发导入，**无启动自动、无定时任务**，导致磁盘上 36 个
+    SKILL.md 而 memories(type='skill') 自 2026-08-26（id=2131）起零新增。
+
+    幂等性依据：skill_loader.import_skill_to_memory 是 upsert —— 按 name 命中已有
+    技能则 UPDATE，否则 INSERT（见 skill_loader.py:158-182）；实测连续两次调用
+    第二次新增 0 行（_diag_archive/2026-09-28/a3_selftest.py）。
+
+    2026-09-28 D9 补记：本函数的日志口径已由「导入(新增+更新)」改为「落库(新增+更新)」，
+    并把「去重拦截 / 守卫拒绝」拆成独立字段单独打印。修正前这两类条目被计入 imported
+    —— 技能实际没落库，日志却报成功（静默丢技能）。
+
+    运行方式：后台守护线程。理由 —— 实测 36 个技能首次同步耗时约 1.4s（第二次约 0.5s），
+    直接同步会拖慢启动；且目录规模只增不减，不能假设「永远够快」。
+    线程 + try/except 保证**绝不阻塞/中断启动**（失败只告警），
+    单条技能的 UPDATE/INSERT 是原子事务，与并发读请求无部分可见问题。
+    """
+    import threading
+
+    def _run() -> None:
+        log = logging.getLogger("zenith.app")
+        try:
+            from . import skill_loader
+            from .config import get_skills_dir
+            skills_dir = get_skills_dir()
+            result = skill_loader.import_all_from_dir(skills_dir)
+            # imported = **真正落库**数（新增 + 更新，mem_id > 0）—— 见 import_all_from_dir 返回口径。
+            # D9（2026-09-28）：skipped / rejected 必须一并打印 —— 此前它们被并进 imported，
+            # 导致「日志报导入 36 个、库里实际更少」且每次启动重复丢同一批，无任何痕迹。
+            log.info(
+                "技能目录同步完成 [%s]：扫描 %s 个 / 落库(新增+更新) %s 个 / 去重拦截 %s 个 / 守卫拒绝 %s 个 / 错误 %s 个",
+                skills_dir, result.get("scanned"), result.get("imported"),
+                result.get("skipped"), result.get("rejected"), result.get("errors"),
+            )
+            for e in result.get("error_list", []) or []:
+                log.warning("技能导入失败: %s → %s", e.get("name"), e.get("error"))
+            for e in result.get("skipped_list", []) or []:
+                log.warning("技能未落库（内容去重拦截）: %s", e.get("name"))
+            for e in result.get("rejected_list", []) or []:
+                log.warning("技能未落库（明文密钥守卫拒绝）: %s", e.get("name"))
+        except Exception as e:
+            # 原则：技能同步失败必须降级放行（对照 routers/chat.py:256「评估失败必须降级放行」）
+            log.warning("技能目录同步失败（已降级放行，不影响启动）: %s", e)
+
+    threading.Thread(target=_run, name="skill-sync-on-startup", daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
     ensure_dirs()
     if not (PROJECT_DIR / "config" / "config.yaml").exists():
         save_config(DEFAULT_CONFIG)
+
+    # 技能目录幂等同步（后台线程，失败降级放行，绝不阻塞启动）
+    _sync_skills_on_startup()
 
     # 启动所有后台定时任务（scheduler.py 统一管理）
     scheduler.start_all_background_tasks()
@@ -563,112 +616,6 @@ async def summarize_conversation(conv_id: str):
     }
 
 
-# ===========================================================================
-# 统一蒸馏 API
-# ===========================================================================
-
-@app.post("/api/distill/conversation/{conv_id}")
-async def api_distill_conv(conv_id: str, save_txt: bool = True):
-    """对话蒸馏 — 总结 + 知识提取 + 记忆存储 + txt 输出"""
-    result = await distill_conversation(conv_id, save_txt=save_txt)
-    if not result.get("success", True) and "error" in result:
-        raise HTTPException(400, result["error"])
-    return result
-
-
-@app.post("/api/distill/schedules")
-async def api_distill_schedules(
-    status: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    save_txt: bool = True,
-):
-    """日程蒸馏 — 规律/遗漏/优化 + txt 输出"""
-    return await distill_schedules(status=status, date_from=date_from, date_to=date_to, save_txt=save_txt)
-
-
-@app.post("/api/distill/memories")
-async def api_distill_memories(
-    type_: str = "",
-    search: str = "",
-    save_txt: bool = True,
-):
-    """记忆蒸馏 — 精华/合并/过时 + txt 输出"""
-    return await distill_memories(type_=type_, search=search, save_txt=save_txt)
-
-
-@app.post("/api/distill/all")
-async def api_distill_all(
-    conv_id: str = "",
-    schedule_status: str = "confirmed",
-    memory_type: str = "",
-    save_txt: bool = True,
-):
-    """全维度综合蒸馏 — 交叉关联对话/日程/记忆 + txt 输出"""
-    return await distill_all(
-        conv_id=conv_id,
-        schedule_status=schedule_status,
-        memory_type=memory_type,
-        save_txt=save_txt,
-    )
-
-
-@app.post("/api/distill/daily/{date}")
-async def api_distill_daily(date: str, save_txt: bool = True, save_md: bool = True):
-    """每日蒸馏 — 聚合指定日期的对话/日程/笔记/记忆 → 生成每日总结"""
-    result = await distill_daily(date=date, save_txt=save_txt, save_md=save_md)
-    if not result.get("success", True) and "error" in result:
-        raise HTTPException(400, result["error"])
-    return result
-
-
-@app.post("/api/distill/weekly/{week_start}")
-async def api_distill_weekly(week_start: str, save_txt: bool = True):
-    """每周蒸馏 — 聚合指定周（从周一开始）的对话/日程/笔记/记忆 → 生成周总结"""
-    result = await distill_weekly(week_start=week_start, save_txt=save_txt)
-    if not result.get("success", True) and "error" in result:
-        raise HTTPException(400, result["error"])
-    return result
-
-
-@app.get("/api/distill/files")
-async def api_distill_list_files():
-    """列出已保存的蒸馏 txt 文件"""
-    from .unified_distill import _OUTPUT_DIR
-    import os
-    if not os.path.exists(_OUTPUT_DIR):
-        return {"files": []}
-    files = []
-    for f in sorted(os.listdir(_OUTPUT_DIR)):
-        if f.endswith(".txt"):
-            filepath = os.path.join(_OUTPUT_DIR, f)
-            stat = os.stat(filepath)
-            files.append({
-                "name": f,
-                "path": filepath,
-                "size": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            })
-    return {"files": files, "count": len(files)}
-
-
-@app.get("/api/distill/file/{filename}")
-async def api_distill_get_file(filename: str):
-    """下载指定蒸馏 txt 文件"""
-    from .unified_distill import _OUTPUT_DIR
-    from pathlib import Path as _P
-    # 路径穿越防护：仅允许 _OUTPUT_DIR 内的 .txt 文件
-    base = _P(_OUTPUT_DIR).resolve()
-    filepath = (base / filename).resolve()
-    if not str(filepath).startswith(str(base)):
-        raise HTTPException(400, "非法文件路径")
-    if filepath.suffix.lower() != ".txt":
-        raise HTTPException(400, "仅支持 .txt 文件")
-    if not filepath.exists():
-        raise HTTPException(404, "文件不存在")
-    return FileResponse(filepath, media_type="text/plain", filename=filepath.name)
-
-
 def _parse_json_response_single(content: str) -> dict:
     """解析 LLM 返回的单体 JSON"""
     text = content.strip()
@@ -1085,7 +1032,9 @@ async def transform_item(data: dict = Body(default=None)):
             keywords=result.get("keywords", ""),
         )
         if created_id < 0:
-            raise HTTPException(400, "生成的记忆内容被守卫拒绝（可能含敏感信息）")
+            raise HTTPException(400, refusal_text(
+                "生成的记忆内容", guide=GUIDE_SHIELD,
+            ))
         created_item = db.mem_get(created_id)
     elif target_type == "note":
         created_id = db.note_add({
@@ -1094,6 +1043,13 @@ async def transform_item(data: dict = Body(default=None)):
             "tags": result.get("tags", ""),
             "status": "proposed",
         })
+        # 2026-09-16（判负补齐）：note_add 下沉落库守卫后，-1 = 内容含明文密钥、未写入。
+        # 不判负则 note_get(-1) 返回 None，接口回 {"success": true, "id": -1, "item": null}，
+        # 把「被安全门禁拒绝」谎报成创建成功。照上方 mem_add 分支同口径处理。
+        if created_id < 0:
+            raise HTTPException(400, refusal_text(
+                "生成的笔记内容", guide=GUIDE_SHIELD,
+            ))
         created_item = db.note_get(created_id)
     else:  # schedule
         created_id = db.sch_add({
@@ -1106,6 +1062,11 @@ async def transform_item(data: dict = Body(default=None)):
             "category": result.get("category", "other"),
             "status": "proposed",
         })
+        # 同上：sch_add 下沉守卫后 -1 = 被拒绝、未写入（照 mem_add 分支同口径判负）。
+        if created_id < 0:
+            raise HTTPException(400, refusal_text(
+                "生成的日程内容", guide=GUIDE_SHIELD,
+            ))
         created_item = db.sch_get(created_id)
 
     return {
@@ -1337,137 +1298,6 @@ async def calendar_data(year: int = 0, month: int = 0):
     return result
 
 
-# ═══════════════════════════════════════════════════════
-# API: Market Analysis (黄金市场分析)
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/market/status")
-async def market_status():
-    """当前市场状态（黄金价格+宏观指标+最新报告）"""
-    indicators = db.macro_indicator_list_latest(limit=15)
-    latest_report = db.market_report_get_latest()
-    return {
-        "indicators": indicators,
-        "latest_report": {
-            "id": latest_report["id"] if latest_report else None,
-            "report_date": latest_report["report_date"] if latest_report else None,
-            "gold_price": latest_report.get("gold_price", "") if latest_report else "",
-            "daily_advice": latest_report.get("daily_advice", "") if latest_report else "",
-        } if latest_report else None,
-    }
-
-
-@app.get("/api/market/cftc")
-async def market_cftc():
-    """CFTC 持仓数据 — 模块已封存"""
-    return JSONResponse(status_code=410, content={"error": "市场分析模块已封存", "detail": "CFTC 服务已归档"})
-
-
-@app.get("/api/market/cftc/gold")
-async def market_cftc_gold():
-    """CFTC 黄金专项分析 — 模块已封存"""
-    return JSONResponse(status_code=410, content={"error": "市场分析模块已封存", "detail": "CFTC 黄金分析已归档"})
-
-
-@app.get("/api/market/reports")
-async def market_reports(limit: int = 30):
-    """分析报告列表"""
-    return db.market_report_list(limit=limit)
-
-
-@app.get("/api/market/reports/latest")
-async def market_reports_latest():
-    """最新分析报告"""
-    report = db.market_report_get_latest()
-    if not report:
-        return JSONResponse(content={"id": None, "report_date": None, "gold_price": "", "daily_advice": "", "weekly_advice": "", "analysis_text": ""}, status_code=200)
-    return report
-
-
-@app.get("/api/market/reports/{report_id}")
-async def market_report_detail(report_id: int):
-    """单份报告详情"""
-    report = db.market_report_get(report_id)
-    if not report:
-        raise HTTPException(404, "报告不存在")
-    return report
-
-
-@app.post("/api/market/run-analysis")
-async def run_market_analysis():
-    return {"success": False, "error": "市场分析模块已封存"}
-
-
-@app.get("/api/market/refresh-data")
-async def refresh_market_data():
-    return {"success": False, "error": "市场分析模块已封存"}
-
-
-@app.get("/api/market/predictions")
-async def market_predictions(date: str = "", verified: str = ""):
-    """预测列表 — 模块已封存"""
-    return []
-
-
-@app.get("/api/market/predictions/hit-rate")
-async def market_predictions_hit_rate(days: int = 30):
-    return {"hit_rate": 0, "total": 0}
-
-
-@app.post("/api/market/predictions/verify")
-async def verify_predictions():
-    return {"success": False, "error": "市场分析模块已封存"}
-
-
-# ═══════════════════════════════════════════════════════
-# API: MT5 (MetaTrader 5 桥接)
-# ═══════════════════════════════════════════════════════
-
-@app.get("/api/mt5/status")
-async def mt5_status():
-    """MT5 连接状态"""
-    from .mt5_service import get_connection_status
-    return get_connection_status()
-
-
-@app.get("/api/mt5/tick")
-async def mt5_tick(symbol: str = "XAUUSD"):
-    """获取最新 Tick 报价"""
-    from .mt5_service import get_tick
-    return get_tick(symbol)
-
-
-@app.get("/api/mt5/rates")
-async def mt5_rates(symbol: str = "XAUUSD", timeframe: str = "M5", count: int = 100):
-    """获取历史 K 线数据"""
-    from .mt5_service import get_rates
-    count = min(max(count, 1), 1000)  # 限制 1-1000
-    return get_rates(symbol, timeframe, count)
-
-
-@app.get("/api/mt5/volume-profile")
-async def mt5_volume_profile(symbol: str = "XAUUSD", timeframe: str = "M5", count: int = 200):
-    """获取成交量分布 (Volume Profile)"""
-    from .mt5_service import get_volume_profile
-    count = min(max(count, 10), 500)
-    return get_volume_profile(symbol, timeframe, count)
-
-
-@app.get("/api/mt5/positions")
-async def mt5_positions():
-    """获取当前持仓"""
-    from .mt5_service import get_positions
-    return get_positions()
-
-
-@app.get("/api/mt5/tick-stats")
-async def mt5_tick_stats(symbol: str = "XAUUSD", seconds: int = 60):
-    """获取 Tick 成交统计"""
-    from .mt5_service import get_tick_stats
-    seconds = min(max(seconds, 1), 3600)
-    return get_tick_stats(symbol, seconds)
-
-
 # Router registration (must be before catch-all)
 app.include_router(memories.router)
 app.include_router(notes.router)
@@ -1483,6 +1313,9 @@ app.include_router(news.router)
 app.include_router(cache.router)
 app.include_router(summaries.router)
 app.include_router(academic.router)
+app.include_router(processes.router)
+app.include_router(market.router)
+app.include_router(mt5.router)
 
 
 @app.get("/{full_path:path}")

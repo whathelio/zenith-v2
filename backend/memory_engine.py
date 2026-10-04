@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from .database import mem_add, mem_for_inject, mem_search, mem_list, note_list, db, _now
+from .database import DB_PATH, mem_add, mem_for_inject, mem_search, mem_list, note_list, db, _now
 
 if TYPE_CHECKING:
     import numpy as np  # 仅类型注解用（np.ndarray），运行时走函数内延迟导入
@@ -19,6 +20,78 @@ logger = logging.getLogger("zenith.memory")
 _conv_counters: dict[str, int] = {}          # conv_id → round count
 _conv_text_buffer: dict[str, str] = {}       # conv_id → accumulated text
 _pending_tasks: set = set()
+
+# 2026-09-15（修复：硬杀导致缓冲永久丢失）：
+#   上面两个 dict 此前只存在内存中。而提取是「每 3 轮触发一次」——计数未攒够 3
+#   时进程被硬杀（watchdog/任务管理器结束进程），缓冲随进程一起消失，该进程内
+#   累积的对话文本**永久不再进入提取队列**。实测某天 5 个会话、6.2 万字符输入，
+#   仅 1 个会话触发了提取，其余 4 个连「提取已启动」的日志都没打出来。
+#   这里把两个 dict 镜像到磁盘，进程重启后由 _load_buffer() 恢复，继续攒计数。
+#   保持既有内存 dict 结构与全部引用点不变，只在变更处追加 _save_buffer()。
+_BUFFER_PATH = DB_PATH.parent / "memory_buffer.json"
+
+
+def _load_buffer() -> None:
+    """模块加载时从磁盘恢复 _conv_counters / _conv_text_buffer。
+
+    fail-safe：文件不存在、不可读、JSON 损坏、结构不符 —— 任一情况都降级为空
+    缓冲并打 warning，**绝不抛异常**（记忆引擎不能因为一个缓冲文件而无法导入）。
+    """
+    try:
+        if not _BUFFER_PATH.exists():
+            return
+        with open(_BUFFER_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"顶层结构应为 dict，实际为 {type(data).__name__}")
+        counters = data.get("counters") or {}
+        texts = data.get("text_buffer") or {}
+        if not isinstance(counters, dict) or not isinstance(texts, dict):
+            raise ValueError("counters/text_buffer 应为 dict")
+        # 逐条校验而非无脑 str()：非法条目丢弃并计数，避免把 '[1, 2]' 这类
+        # 字符串化的垃圾当作对话文本送进 LLM 提取。合法条目仍照常恢复。
+        bad = 0
+        for k, v in counters.items():
+            try:
+                _conv_counters[str(k)] = int(v)
+            except (TypeError, ValueError):
+                bad += 1
+        for k, v in texts.items():
+            if isinstance(v, str):
+                _conv_text_buffer[str(k)] = v
+            else:
+                bad += 1
+        if bad:
+            logger.warning("记忆缓冲忽略 %d 条结构非法的条目", bad)
+        logger.info(
+            "记忆缓冲已恢复: %d 个对话待续 (counters=%d)",
+            len(_conv_text_buffer), len(_conv_counters),
+        )
+    except Exception as e:  # noqa: BLE001 — 加载失败必须降级，不得阻断模块导入
+        _conv_counters.clear()
+        _conv_text_buffer.clear()
+        logger.warning("记忆缓冲加载失败，已降级为空缓冲（不影响运行）: %s", e)
+
+
+def _save_buffer() -> None:
+    """把两个缓冲 dict 落盘到 _BUFFER_PATH。
+
+    fail-safe（硬要求）：任何写入失败只 warning，**绝不抛出**——落盘失败不能让
+    记忆提取主流程崩掉。先写 .tmp 再原子 replace，避免进程在写入中途被硬杀时
+    留下半个 JSON（半个 JSON 会被 _load_buffer 判为损坏，等于丢掉全部缓冲）。
+    """
+    try:
+        _BUFFER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _BUFFER_PATH.parent / (_BUFFER_PATH.name + ".tmp")
+        payload = {"counters": _conv_counters, "text_buffer": _conv_text_buffer}
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        tmp.replace(_BUFFER_PATH)  # 原子替换
+    except Exception as e:  # noqa: BLE001 — 落盘失败不得影响主流程
+        logger.warning("记忆缓冲落盘失败（不影响记忆提取）: %s", e)
+
+
+_load_buffer()
 
 # 关键词提取停用词
 _STOPWORDS = frozenset(
@@ -35,6 +108,44 @@ _STOPWORDS = frozenset(
 # generate_consolidate_plan（LLM 辅助整理计划）曾各用 0.7 / 0.85 不一致，
 # 统一为 0.85（更保守，宁少合不误删）。
 MERGE_SIM_THRESHOLD = 0.85
+
+# 记忆衰减窗口（天）。仅对「存在真实引用记录（last_touched_at 非空）」的记忆生效。
+# 取值与语义见 mem_consolidate 内注释（2026-09-11 修复 B3）。
+DECAY_DAYS = 30
+
+# 召回结果是否回写 last_touched_at。设为 False 可一键退回旧行为（不改结构，仅停回写）。
+MARK_READ_ON_RECALL = True
+
+
+def mem_mark_read(ids) -> int:
+    """把「被检索到」这一事实回写到 last_touched_at，**不改变 importance**。
+
+    2026-09-11（修复 B2 — 引用回写缺失）：
+      衰减判据依赖 last_touched_at，但全仓只有 1 个调用点（tools.py 的显式引用路径），
+      实测 last_touched_at 仅 230/2090 = 11% 有值 → 衰减判据永远回落到入库时间。
+      而 mem_touch 会顺带 importance+1，不能直接用于「召回即回写」（每轮对话把重要度打满）。
+      故拆出本函数：只记「读过」，不记「重要」。
+
+    批量写，单次 UPDATE ... WHERE id IN (...)：召回一次通常命中 10~15 条，
+    逐条 UPDATE 会在每轮对话上放大成十几次写事务。
+    """
+    if not MARK_READ_ON_RECALL:
+        return 0
+    mids = [int(i) for i in ids if i]
+    if not mids:
+        return 0
+    mids = list(dict.fromkeys(mids))  # 去重且保序
+    try:
+        with db() as c:
+            ph = ",".join("?" * len(mids))
+            cur = c.execute(
+                f"UPDATE memories SET last_touched_at = ? WHERE id IN ({ph})",
+                [_now(), *mids]
+            )
+            return cur.rowcount or 0
+    except Exception as e:  # noqa: BLE001 — 回写失败不得影响检索主流程
+        logger.warning("引用回写失败（不影响检索）: %s", e)
+        return 0
 
 
 def _extract_keywords(text: str, max_k: int = 8) -> list[str]:
@@ -81,6 +192,9 @@ def search_related_memories(keywords: list[str], limit: int = 15, min_keyword_re
                 relevant.append(m)
             if len(relevant) >= limit:
                 break
+    # 注：此处**不**回写 last_touched_at。本函数同时服务于 build_memory_injection
+    # 与 _retrieve_related_memories（去重参考），后者只是「看一眼候选」而非「引用」。
+    # 引用回写的唯一入口在 build_memory_injection（真正进 prompt 的那批）。
     return relevant
 
 
@@ -125,6 +239,15 @@ def build_memory_injection(current_query: str = "") -> str:
         for item in items[:5]:
             lines.append(f"  - {item['content']}")
 
+    # 2026-09-11（修复 B2 — 引用回写）：
+    #   只有**真正被渲染进 prompt** 的记忆才算「被引用」，故回写点放在渲染之后、
+    #   且只取实际渲染的 items[:5]（groups 里超过 5 条的并未进 prompt，不该被记为引用）。
+    #   不放在 search_related_memories / search_related_items 里的原因：
+    #     ① 那两个函数也服务于去重参考检索（只是「看一眼候选」）
+    #     ② 评估集会对全量记忆批量召回，逐次回写会产生大量无意义写事务并拖慢基线
+    #   这里是每轮对话恰好一次、且集合最小的位置。
+    mem_mark_read([it["id"] for items in groups.values() for it in items[:5]])
+
     if notes:
         lines.append("\n## 相关笔记")
         for nt in notes[:5]:
@@ -166,6 +289,7 @@ def reset_counter(conv_id: str = ""):
     else:
         _conv_counters.clear()
         _conv_text_buffer.clear()
+    _save_buffer()  # 变更点①：两个分支（单个 pop / 全量 clear）都覆盖
 
 
 def flush_conversation_memories(conv_id: str):
@@ -176,6 +300,7 @@ def flush_conversation_memories(conv_id: str):
     """
     text = _conv_text_buffer.pop(conv_id, "")
     _conv_counters.pop(conv_id, None)
+    _save_buffer()  # 变更点②：放在空文本早返回之前，保证 pop 结果一定落盘
     if not text.strip():
         return
     task = asyncio.create_task(_do_extract(text, conv_id))
@@ -196,6 +321,10 @@ async def flush_all_pending_memories():
     for cid in conv_ids:
         text = _conv_text_buffer.pop(cid, "")
         _conv_counters.pop(cid, None)
+        # 变更点③：循环内逐个落盘（而非循环外一次性），放在 continue 之前 ——
+        # 本轮 await 提取耗时数秒，若此时被硬杀，已 pop 的对话必须已在盘上，
+        # 否则重启后会重新提取已处理过的对话。
+        _save_buffer()
         if not text.strip():
             continue
         try:
@@ -224,10 +353,14 @@ async def maybe_extract_memories(
     # 累积当前对话的文本
     _conv_text_buffer[conv_id] = _conv_text_buffer.get(conv_id, "") + "\n" + conversation_text
     _conv_counters[conv_id] = _conv_counters.get(conv_id, 0) + 1
+    # 变更点④：累加后立即落盘。这一句就是「攒计数期间被硬杀」这条丢数据路径的
+    # 主要防线 —— 前 1~2 轮的文本与计数在进程消失前就必须已在盘上。
+    _save_buffer()
 
     if _conv_counters[conv_id] >= interval:
         _conv_counters[conv_id] = 0
         text = _conv_text_buffer.pop(conv_id, "")
+        _save_buffer()  # 变更点⑤：计数归零 + 文本被消费，同步到盘
         task = asyncio.create_task(_do_extract(text, conv_id))
         _pending_tasks.add(task)
         task.add_done_callback(_pending_tasks.discard)
@@ -639,6 +772,7 @@ def search_related_items(query: str, limit: int = 15, include_notes: bool = True
         except Exception as e:
             logger.warning("笔记联想召回失败: %s", e)
 
+    # 注：引用回写不在此处 —— build_memory_injection 会在实际渲染进 prompt 后统一回写。
     return memories, notes
 
 
@@ -698,39 +832,67 @@ def mem_consolidate():
             sim = _similarity(content, other_content)
             if sim >= MERGE_SIM_THRESHOLD:
                 keeper = m if m["importance"] >= other["importance"] else other
-                to_del = other if m["importance"] >= other["importance"] else m
+                to_arc = other if m["importance"] >= other["importance"] else m
+                keeper_id, arc_id = keeper["id"], to_arc["id"]
 
                 merged_kw = set()
-                for kw_str in (keeper.get("keywords", "") + "," + to_del.get("keywords", "")).split(","):
+                for kw_str in (keeper.get("keywords", "") + "," + to_arc.get("keywords", "")).split(","):
                     kw = kw_str.strip()
                     if kw:
                         merged_kw.add(kw)
 
+                # 被归档条目的 keywords 里留一条可逆的反向线索，便于人工回溯与 mem_unarchive。
+                arc_kw = [k.strip() for k in (to_arc.get("keywords") or "").split(",") if k.strip()]
+                arc_kw.append(f"merged_into:{keeper_id}")
+
                 with db() as c:
                     c.execute(
-                        "UPDATE memories SET keywords = ?, distilled_from = ? WHERE id = ?",
-                        (",".join(merged_kw), to_del["id"], keeper["id"])
+                        "UPDATE memories SET keywords = ?, distilled_from = ?, last_touched_at = ? "
+                        "WHERE id = ?",
+                        (",".join(merged_kw), arc_id, _now(), keeper_id)
                     )
-                    c.execute("DELETE FROM memories WHERE id = ?", (to_del["id"],))
+                    # 2026-09-11（修复 B5 — 把不可逆操作改成可逆）：
+                    #   原实现是 `DELETE FROM memories WHERE id = to_del`：内容永久丢弃、
+                    #   无备份、无回滚路径；而触发条件只要求 0.85 相似度，并非完全相同 ——
+                    #   也就是说它可能静默吃掉一条「像但不是同一条」的记忆。
+                    #   现改为归档：内容完整保留、默认退出检索与后续合并、可 mem_unarchive 恢复。
+                    #   （当前 MERGE_SIM_THRESHOLD=0.85 偏严，实测日志全期为「合并 0 条」，
+                    #     即删除分支从未真正触发过 —— 但代码不该留这种一次性不可逆的雷。）
+                    c.execute(
+                        "UPDATE memories SET archived = 1, importance = 1, keywords = ? WHERE id = ?",
+                        (",".join(arc_kw), arc_id)
+                    )
 
-                seen_ids.add(to_del["id"])
+                seen_ids.add(arc_id)
                 merged += 1
-                logger.info("合并记忆 #%d → #%d (sim=%.2f)", to_del["id"], keeper["id"], sim)
+                logger.info("合并记忆 #%d → #%d (sim=%.2f, 已归档非删除)", arc_id, keeper_id, sim)
 
-    # 衰减：30天以上未被引用的记忆，重要度 -1。
-    # 时间基准用 last_touched_at（无则退回 recorded_at，再退回 created_at），
-    # 人工编辑过的记忆（user_edited=1）不自动衰减。
-    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    # 衰减：仅在**存在真实引用记录**时才按「距上次引用超过 DECAY_DAYS 天」降 1 点。
+    #
+    # 2026-09-11（修复 B3 —— 本次最关键的一处）：
+    #   旧判据 `COALESCE(last_touched_at, recorded_at, created_at) < cutoff` 有个致命回退：
+    #   引用回写长期缺失（mem_touch 全仓仅 1 个调用点，last_touched_at 仅 11% 有值），
+    #   89% 的条目直接落到 recorded_at，也就是 **入库时间**。于是「入库满 30 天」被误读成
+    #   「30 天没人看」→ 每 6 小时砍 1 点 importance，一路砍到 1（唯一豁免 user_edited，全库仅 3 条）。
+    #   实测后果：importance=1 占 63.6%（1328/2089），整批沉在检索排序底部。
+    #   这不是「这些记忆不重要」，是系统在给老记忆系统性降权 —— 正是「以后查细节查不到」的成因。
+    #
+    #   新判据：**必须先有 last_touched_at（确实被引用过），才谈得上「很久没被引用」**。
+    #   从未被引用的记忆不衰减 —— 它们缺的是引用信号，不是「过时」，不该被惩罚。
+    #   user_edited=1 的豁免下推到 SQL，不再依赖 Python 侧 continue。
+    cutoff = (datetime.now() - timedelta(days=DECAY_DAYS)).strftime("%Y-%m-%d")
     with db() as c:
         rows = c.execute(
-            "SELECT id, importance, user_edited FROM memories "
-            "WHERE importance > 1 AND COALESCE(last_touched_at, recorded_at, created_at) < ?",
+            "SELECT id FROM memories "
+            "WHERE importance > 1 "
+            "  AND COALESCE(archived, 0) = 0 "
+            "  AND COALESCE(user_edited, 0) = 0 "
+            "  AND COALESCE(last_touched_at, '') <> '' "
+            "  AND last_touched_at < ?",
             (cutoff,)
         ).fetchall()
         decayed = 0
         for r in rows:
-            if r["user_edited"]:
-                continue
             c.execute(
                 "UPDATE memories SET importance = importance - 1 WHERE id = ?",
                 (r["id"],)
@@ -782,33 +944,48 @@ async def reflect_memories(limit: int = 50) -> dict:
         return {"success": False, "error": str(e)}
 
     created = 0
+    # 2026-09-16（判负补齐）：note_add 下沉落库守卫后，-1 = 被拒绝、未写入。
+    # 下方三处原为无条件 created += 1，会把「根本没写进去的」也算作已创建，
+    # 而本函数回给调用方的 {"created": N} 是对事实的陈述 —— 不能虚报。
+    # 故改为仅在真正写入（id > 0）时计数。content 由 LLM 生成，理论上可能带出
+    # 明文密钥；此处只记 debug 日志、不逐条向用户报错 —— reflection 是后台派生
+    # 流程，逐条告警会淹没日志，且 created < found 本身已如实反映有内容未落库。
     for conflict in result.get("conflicts", []) or []:
-        note_add({
+        nid = note_add({
             "title": "记忆矛盾（反思）",
             "content": f"A: {conflict.get('a','')}\nB: {conflict.get('b','')}\n原因: {conflict.get('reason','')}",
             "tags": "reflection",
             "source": "reflection",
             "stage": "refined",
         })
-        created += 1
+        if nid > 0:
+            created += 1
+        else:
+            logger.debug("反思笔记被守卫拒绝，未写入: 记忆矛盾")
     for outdated in result.get("outdated", []) or []:
-        note_add({
+        nid = note_add({
             "title": "过时记忆（反思）",
             "content": f"内容: {outdated.get('content','')}\n原因: {outdated.get('reason','')}",
             "tags": "reflection",
             "source": "reflection",
             "stage": "refined",
         })
-        created += 1
+        if nid > 0:
+            created += 1
+        else:
+            logger.debug("反思笔记被守卫拒绝，未写入: 过时记忆")
     for rule in result.get("rules", []) or []:
-        note_add({
+        nid = note_add({
             "title": "记忆规律（反思）",
             "content": f"规则: {rule.get('rule','')}\n依据: {'；'.join(rule.get('based_on', []) or [])}",
             "tags": "reflection",
             "source": "reflection",
             "stage": "refined",
         })
-        created += 1
+        if nid > 0:
+            created += 1
+        else:
+            logger.debug("反思笔记被守卫拒绝，未写入: 记忆规律")
 
     found = (len(result.get("conflicts", []) or [])
              + len(result.get("outdated", []) or [])

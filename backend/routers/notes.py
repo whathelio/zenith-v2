@@ -27,6 +27,10 @@ async def create_note(data: dict = Body(...)):
 
 @router.put("/{nid}")
 async def update_note(nid: int, data: dict = Body(default=None)):
+    # 空 body / JSON null 会让 data 为 None → db.note_update 内 .items() 抛 AttributeError → 500
+    # （2026-09-11 实测；同构路由 memories/goals 均有守卫，仅此处漏）
+    if data is None:
+        raise HTTPException(400, "Update data required")
     if data:
         risk = guard_store(f"{data.get('title', '')}\n{data.get('content', '')}")
         if risk:

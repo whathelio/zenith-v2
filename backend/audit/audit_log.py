@@ -30,14 +30,32 @@ def log_event(event_type: str, data: dict, conv_id: str = ""):
         # 读取上一条记录的 hash 作为 prev_hash
         file_path = _today_file()
         prev_hash = "0" * 16
+        chain_broken = False
         if file_path.exists():
             try:
-                lines = file_path.read_text(encoding="utf-8").strip().split("\n")
+                # 只取非空行：空文件此前会 strip 出 [""] → json.loads("") 抛异常 → 被下面的
+                # except 吞掉，白走一次断裂路径。过滤空行后，空文件即正常走「创世」分支。
+                lines = [ln for ln in file_path.read_text(encoding="utf-8").split("\n") if ln.strip()]
                 if lines:
                     last = json.loads(lines[-1])
-                    prev_hash = last.get("hash", prev_hash)
-            except Exception:
-                pass
+                    if "hash" in last:
+                        prev_hash = last["hash"]
+                    else:
+                        # 末条无 hash（写入过程被杀等）——不能静默当创世值
+                        chain_broken = True
+                        logger.warning(
+                            "审计日志末条缺少 hash 字段，链将从此条断裂: file=%s", file_path.name
+                        )
+            except Exception as e:
+                # 2026-09-16：此处原为 `except Exception: pass` —— 读失败会静默把 prev_hash
+                # 回退为创世值，哈希链从这一条起无声断裂，而外层 except 看不到（异常已被内层吞）。
+                # 现在记 warning 并在本条上打 chain_broken 标记，使断裂对 verify_chain/人工可见。
+                # 注意：不改哈希算法、不改 prev_hash 取值、不回写既有数据。
+                chain_broken = True
+                logger.warning(
+                    "审计日志读取上一条 hash 失败，链将从此条断裂（prev_hash 回退创世值）: file=%s err=%s",
+                    file_path.name, e,
+                )
 
         entry = {
             "timestamp": timestamp,
@@ -47,6 +65,10 @@ def log_event(event_type: str, data: dict, conv_id: str = ""):
             "data": data,
         }
         entry["hash"] = _compute_hash(prev_hash, timestamp, event_type, data)
+        if chain_broken:
+            # 显式标记：本条是「链断裂后的第一条」，其 prev_hash 不是真实前驱 hash。
+            # 该字段不参与 _compute_hash，故 verify_chain 的校验逻辑不变。
+            entry["chain_broken"] = True
 
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

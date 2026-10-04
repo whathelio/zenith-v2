@@ -25,6 +25,28 @@ def _http_error_detail(e: httpx.HTTPStatusError) -> str:
     return f"API 错误 ({e.response.status_code})"
 
 
+def _log_empty_content(data: dict, model: str) -> None:
+    """空正文诊断 — 打印 finish_reason / reasoning 长度 / 额度消耗，便于定位瓶颈。
+
+    2026-09-15 新增：原实现只用一句「provider 返回空 content」吞掉全部信息，
+    导致「记忆提取恒 0 条」排查困难（须手工翻 API usage 才能看出是推理占满额度）。
+    """
+    try:
+        ch = (data.get("choices") or [{}])[0]
+        msg = ch.get("message") or {}
+        usage = data.get("usage") or {}
+        det = usage.get("completion_tokens_details") or {}
+        logger.warning(
+            "空正文诊断: model=%s finish_reason=%s reasoning=%d字 "
+            "completion_tokens=%s reasoning_tokens=%s — 多为推理占满 max_tokens 额度",
+            model, ch.get("finish_reason"),
+            len(msg.get("reasoning_content") or ""),
+            usage.get("completion_tokens"), det.get("reasoning_tokens"),
+        )
+    except Exception:
+        pass
+
+
 async def chat_stream(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
@@ -326,7 +348,13 @@ async def call_llm(
         "max_tokens": max_tokens,
         "stream": False,
     }
-    if "glm" in model.lower():
+    # 推理模型的 reasoning 会吃光 max_tokens → content 为空（详见下方空正文兜底）。
+    # 实测 2026-09-15：deepseek-flash + max_tokens=2000 时 reasoning_tokens=2000、
+    # content 为空、finish_reason=length；显式关闭思考后 reasoning_tokens=0、正文正常。
+    # 注：extra_body= 只是 openai SDK 的入参校验限制；此处走 raw httpx，直接写即生效。
+    # ⚠️ 不要把这行也加到流式路径（_chat_stream_openai）—— 那里禁用思考会让
+    #    聊天的 thinking 过程不再产出，messages.thinking 落空、前端失去思考展示。
+    if any(k in model.lower() for k in ("glm", "deepseek")):
         payload["thinking"] = {"type": "disabled"}
     if tools:
         payload["tools"] = tools
@@ -348,7 +376,26 @@ async def call_llm(
             raise ValueError("provider 返回空 choices")
         message = choices[0].get("message") or {}
         if not (message.get("content") or "").strip():
-            raise ValueError("provider 返回空 content")
+            # 空正文兜底（2026-09-15）：根因是推理 token 占满 max_tokens 额度。
+            # 第一道防线是上方禁用 thinking；此处覆盖「provider 忽略该参数」的
+            # 跨 provider 场景 —— 摘掉 thinking 并把额度翻倍重试一次。
+            _log_empty_content(data, model)
+            retry = dict(payload)
+            retry.pop("thinking", None)
+            retry["max_tokens"] = max(int(max_tokens or 2000) * 2, 4096)
+            r2 = await client.post(
+                f"{base_url}/chat/completions",
+                headers=headers, json=retry, timeout=120.0
+            )
+            r2.raise_for_status()
+            data = r2.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise ValueError("provider 返回空 choices（额度翻倍重试后仍为空）")
+            message = choices[0].get("message") or {}
+            if not (message.get("content") or "").strip():
+                _log_empty_content(data, model)
+                raise ValueError("provider 返回空 content（额度翻倍重试后仍为空）")
         # P2: 缓存命中率埋点 — DeepSeek 返回 usage.prompt_cache_hit_tokens
         try:
             from .database import cache_stat_add
@@ -449,7 +496,13 @@ async def extract_memories(conversation_text: str, existing_memories: Optional[l
 - event: 发生过的事件（计划了什么、完成了什么等）
 - decision: 做过的决定（选了什么方案、定了什么方向等）
 - fact: 值得记住的事实（知识点、数据、背景信息等）
-- experience: 可复用的经验技巧（工作方法、踩坑教训、最佳实践等）"""
+- experience: 可复用的经验技巧（工作方法、踩坑教训、最佳实践等）
+
+不要提取的内容（重要）：
+- 工具调用与系统运行状态：如"某工具报错""知识库检索失败""接口返回空""模块缺失""检索无结果"
+- 助手对自身功能／限制／配置的说明，以及检索过程与报错原文
+- 一次性的操作步骤与中间过程 —— 只记结论，不记流水账
+- 对话中临时引用的公共常识（无需入库）"""
 
     if existing_memories:
         existing_text = "\n".join(f"- {m}" for m in existing_memories if m and str(m).strip())

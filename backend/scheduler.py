@@ -72,6 +72,23 @@ _TASK_FAIL_ALERT_THRESHOLD = 3   # 连续失败 N 次后触发告警
 _scheduler_logger = logging.getLogger("zenith.scheduler")
 
 
+def _calendar_sync_ok(result: dict) -> tuple[bool, list]:
+    """判定一次日历同步是否算成功，返回 `(ok, errors)`。
+
+    2026-09-28 D8-a（🔴）：`calendar_sync.sync_calendar_events` **从不抛异常** ——
+    失败时它以 `{"synced": 0, "errors": [...]}` 返回。因此调用方若恒记
+    `_record_task_result(..., True)`，`fail_count` 每次都被归零，
+    连续失败计数**永远到不了 `_TASK_FAIL_ALERT_THRESHOLD`** →
+    待确认告警笔记永不产生 → 金十断供时整个同步**静默停摆**。
+
+    判据与 `tools.py:3175`（LLM 侧同一契约的正确消费方式）逐字对齐。
+    **抽成单一函数**：本文件有两处调用点（启动即同步 / 每日循环），
+    内联两次必然日后再次分叉 —— 参见 code-governance-workflow §5b.11。
+    """
+    errs = list(result.get("errors") or [])
+    return (not errs), errs
+
+
 def _record_task_result(name: str, ok: bool) -> None:
     """记录后台任务成功/失败。连续失败达阈值时：升级 error 日志 + 写一条待确认告警笔记。
 
@@ -93,14 +110,23 @@ def _record_task_result(name: str, ok: bool) -> None:
     h["alerted"] = True
     _scheduler_logger.error("后台任务连续失败 %d 次: %s（需人工关注）", n, name)
     try:
-        db.note_add({
+        alert_id = db.note_add({
             "title": f"后台任务告警: {name}",
             "content": f"后台任务「{name}」已连续失败 {n} 次，请检查 zenith.log 定位根因。",
             "tags": "系统告警,后台任务",
             "source": "scheduler",
             "status": "proposed",
         })
-        _scheduler_logger.info("后台任务告警已写入待确认列表: %s", name)
+        # 2026-09-16（判负补齐）：note_add 下沉守卫后 -1 = 被拒绝、未写入。
+        # 本处内容由任务名拼成，不含用户自由文本，命中守卫的概率极低；
+        # 且「告警写入失败」本身不该升级成新的失败源 —— 故只把日志改为如实描述，
+        # 不改控制流。
+        if alert_id < 0:
+            _scheduler_logger.warning(
+                "告警笔记被守卫拒绝，未写入待确认列表: %s", name
+            )
+        else:
+            _scheduler_logger.info("后台任务告警已写入待确认列表: %s", name)
     except Exception as e:
         _scheduler_logger.warning("告警笔记写入失败: %s", e)
 
@@ -110,7 +136,11 @@ async def _reminder_loop():
     logger = logging.getLogger("zenith.schedule")
     while True:
         try:
-            text = check_reminders()
+            # check_reminders 是同步函数（全量 sch_list + 逐条 N+1 查询）。
+            # 项目约定：阻塞调用必须走 asyncio.to_thread —— 见 process_monitor.py:11
+            # 的说明与 tools.py:2591 / routers/processes.py:31 的先例。
+            # 直接在 async 里调用会卡住事件循环（本循环每 5 分钟一次）。
+            text = await asyncio.to_thread(check_reminders)
             _record_task_result("reminder", True)
             if text:
                 logger.info("日程提醒扫描发现到期项:\n%s", text)
@@ -126,7 +156,10 @@ async def _memory_maintenance_loop():
     while True:
         await asyncio.sleep(6 * 3600)
         try:
-            result = mem_consolidate()
+            # mem_consolidate 是同步函数（全量 mem_list + 相似度计算 + 逐行 UPDATE）。
+            # 2026-08-25 的三次「假死」根因就是它同步跑在事件循环里；算法已优化为
+            # 非 O(n²)，但**挪出事件循环**这一步此前遗漏。同样走 to_thread。
+            result = await asyncio.to_thread(mem_consolidate)
             _record_task_result("memory_maintenance", True)
             if result.get("merged") or result.get("decayed"):
                 logger.info("记忆整理完成: 合并 %d 条, 衰减 %d 条",
@@ -244,8 +277,11 @@ async def _calendar_sync_loop():
         try:
             logger.info("财经日历启动即同步: days=%d min_star=%d", days, min_star)
             result = await cs.sync_calendar_events(days=days, min_star=min_star)
-            _record_task_result("calendar_sync", True)
+            _ok, _errs = _calendar_sync_ok(result)
+            _record_task_result("calendar_sync", _ok)
             logger.info("财经日历启动同步完成: %s", result)
+            if _errs:
+                logger.warning("财经日历同步存在错误（已按失败计数）: %s", _errs)
         except Exception as e:
             _record_task_result("calendar_sync", False)
             logger.warning("财经日历启动同步失败: %s", e)
@@ -261,8 +297,11 @@ async def _calendar_sync_loop():
         try:
             logger.info("财经日历同步开始: days=%d min_star=%d", days, min_star)
             result = await cs.sync_calendar_events(days=days, min_star=min_star)
-            _record_task_result("calendar_sync", True)
+            _ok, _errs = _calendar_sync_ok(result)
+            _record_task_result("calendar_sync", _ok)
             logger.info("财经日历同步完成: %s", result)
+            if _errs:
+                logger.warning("财经日历同步存在错误（已按失败计数）: %s", _errs)
         except Exception as e:
             _record_task_result("calendar_sync", False)
             logger.warning("财经日历同步失败: %s", e)
@@ -272,7 +311,16 @@ _background_tasks: list = []
 
 
 def start_all_background_tasks():
-    """启动所有后台定时任务。在 lifespan 中调用。"""
+    """启动所有后台定时任务。在 lifespan 中调用。
+
+    幂等守卫：若已有任务在跑则直接返回。避免 lifespan 重入 / 热重载导致循环被
+    重复注册 —— 重复注册会让每个 loop 同时跑两份，且旧 task 失去引用无法取消。
+    """
+    if _background_tasks:
+        logging.getLogger("zenith").warning(
+            "后台任务已注册 %d 个，跳过重复启动", len(_background_tasks))
+        return
+
     cfg = load_config()
 
     _background_tasks.append(asyncio.create_task(_memory_maintenance_loop()))

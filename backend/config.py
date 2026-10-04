@@ -4,12 +4,17 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import yaml
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.parent
 DATA_DIR = PROJECT_DIR / "data"
-CONFIG_DIR = PROJECT_DIR / "config"
+# 2026-09-16: 支持 ZENITH_CONFIG_DIR 重定向。
+# 起因：tests/conftest.py 此前只重定向了 DB，没有重定向配置目录 →
+# `PUT /api/settings` 的测试会把 model/temperature **直接写进生产 config/config.yaml**
+# （实测该文件 mtime 随每次 pytest 运行变化）。生产路径保持不变，仅在显式设置该变量时改道。
+CONFIG_DIR = Path(os.environ.get("ZENITH_CONFIG_DIR") or (PROJECT_DIR / "config"))
 CONFIG_JSON = DATA_DIR / "config.json"
 CONFIG_YAML = CONFIG_DIR / "config.yaml"
 ENV_FILE = PROJECT_DIR / ".env"
@@ -60,17 +65,18 @@ SYSTEM_PROMPT = (
     "## 行为准则\n"
     "1. 发现日程安排 → 调用 add_schedule 记录\n"
     "2. 发现值得记录的想法 → 调用 add_note 记录\n"
-    "3. 用户要求跑代码 → 调用 execute_code\n"
-    "4. 需要查已有日程/笔记/记忆 → 调用对应搜索工具\n"
-    "5. 需要分析时间安排 → 调用 time_plan\n"
-    "6. 用户发来链接 / 让你看某个网页 / 总结这篇文章或视频 → 优先调用 analyze_content（自动识别B站/GitHub/文章/视频并生成摘要）\n"
-    "7. 需要读取网页原始内容（如提取特定文字）→ 调用 web_fetch\n"
-    "8. 需要联网查最新信息 → 调用 web_search 搜索\n"
-    "9. 需要查本地文献/论文/书籍内容 → 调用 retrieve_docs（RAG 检索）\n"
-    "10. 需要查已编译的专题/Wiki → 调用 query_wiki\n"
-    "11. 用户问知识库状态 → 调用 kb_stats\n"
-    "12. 需要记录日程/笔记/记忆/技能 → 调用 smart_classify（不要用 retrieve_docs 记录信息）\n"
-    "13. 用户要查论文/文献/最新研究/高影响力文章 → 调用 academic_search；用户给出 DOI 或论文链接 → 调用 paper_lookup\n"
+    "3. 准备写入新笔记前 → 先调用 check_duplicate 查重；若已存在相似条目，改用 edit_note 更新，不要重复入库\n"
+    "4. 用户粘贴大段转录或资料（视频字幕 / 长文章 / 讲稿）→ 属「资料整理」的用 distill_note 做结构化提取；只有用户本人的观点、决定、偏好才用 add_note\n"
+    "5. 用户要求跑代码 → 调用 execute_code\n"
+    "6. 需要查已有日程/笔记/记忆 → 调用对应搜索工具\n"
+    "7. 需要分析时间安排 → 调用 time_plan\n"
+    "8. 用户发来链接 / 让你看某个网页 / 总结这篇文章或视频 → 优先调用 analyze_content（自动识别B站/GitHub/文章/视频并生成摘要）\n"
+    "9. 需要读取网页原始内容（如提取特定文字）→ 调用 web_fetch\n"
+    "10. 需要联网查最新信息 → 调用 web_search 搜索\n"
+    "11. 需要查本地文献/论文/书籍内容 → 调用 retrieve_docs（RAG 检索；返回「未命中」时会自动附本地笔记/记忆回落结果）\n"
+    "12. 用户问知识库状态 → 调用 kb_stats\n"
+    "13. 需要记录日程/笔记/记忆/技能 → 调用 smart_classify（不要用 retrieve_docs 记录信息）\n"
+    "14. 用户要查论文/文献/最新研究/高影响力文章 → 调用 academic_search；用户给出 DOI 或论文链接 → 调用 paper_lookup\n"
     "\n"
     "## 确认卡片（Confirm Card）\n"
     "当需要用户确认不可逆操作（删除、合并、归档等）或提供多个互斥决策时，"
@@ -254,6 +260,106 @@ def save_config(cfg: dict):
     _config_cache_sig = _config_file_signature()
 
 
+# ===== 敏感字段掩码（仅供「读」端点使用）=====
+#
+# 背景：GET /api/settings 与 GET /api/modules/mcp 会把 config / mcp.json 原样返回，
+# 其中 api_key、headers.Authorization 等是明文密钥。本服务无认证（本地单用户是有意
+# 设计），任何能访问 127.0.0.1:8766 的本机进程都能读走，故只能在「读」这一侧收敛暴露面。
+#
+# ⚠️ 掩码只用于「读」。写端点**必须**配合 restore_masked_fields()：前端是
+#    「GET 整包 → 改几个字段 → PUT 整包」的流程（SettingsView.tsx:68 → :108），
+#    少了这一步，掩码串会顺着写回把真实密钥覆盖掉 —— 那比泄漏更糟。
+
+# 字段名命中即视为敏感。只对「值是非空 str」的项生效，因此 max_tokens /
+# context_token_budget / chat_history_max_tokens 这类「名字含 token、值是数字」
+# 的配置天然不会被误掩码。
+_SENSITIVE_NAME_RE = re.compile(
+    r"key|token|secret|password|passwd|credential|authorization|cookie",
+    re.IGNORECASE,
+)
+
+# 掩码串的形状：`sk-abc***yz（len=51）`。保留前缀 + 末两位 + 长度，用户能分辨
+# 「配的是哪一个」，不会误以为配置丢了。
+_MASK_RE = re.compile(r"^.{0,8}\*\*\*.{0,4}（len=\d+）$")
+
+
+def mask_secret(value: str) -> str:
+    """把明文密钥转成可辨识的掩码（保留前缀与长度，足够区分不同密钥）。"""
+    s = str(value)
+    n = len(s)
+    if n >= 12:
+        return f"{s[:6]}***{s[-2:]}（len={n}）"
+    return f"{s[:max(1, n // 3)]}***（len={n}）"
+
+
+def is_masked(value) -> bool:
+    """value 是否是本模块生成的掩码串。
+
+    写端点靠它区分「这是读出来又被回传的掩码」和「用户刚输入的新密钥」。
+    """
+    return isinstance(value, str) and bool(_MASK_RE.match(value))
+
+
+def _is_sensitive_name(name: str) -> bool:
+    return bool(_SENSITIVE_NAME_RE.search(str(name)))
+
+
+def mask_sensitive_fields(obj):
+    """递归掩码 obj 中「字段名敏感 + 值为非空字符串」的项。
+
+    只按键名判定、不猜内容，因此 headers 里的 Authorization、env 里的
+    *_API_KEY、providers[].api_key 都被同一条规则覆盖。
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, str) and v and _is_sensitive_name(k):
+                out[k] = mask_secret(v)
+            else:
+                out[k] = mask_sensitive_fields(v)
+        return out
+    if isinstance(obj, list):
+        return [mask_sensitive_fields(x) for x in obj]
+    return obj
+
+
+_DROP = object()
+
+
+def restore_masked_fields(new, old):
+    """把 new 中「看起来是本模块生成的掩码」的值换回 old 里的真实值。
+
+    old 中找不到对应真值时**丢弃该字段**（而不是写入掩码串）—— 宁可不改配置，
+    也不能把密钥写坏。列表元素（providers）优先按 name 对齐，避免顺序变化张冠李戴。
+    """
+    if isinstance(new, dict):
+        out = {}
+        for k, v in new.items():
+            r = restore_masked_fields(v, old.get(k) if isinstance(old, dict) else None)
+            if r is not _DROP:
+                out[k] = r
+        return out
+    if isinstance(new, list):
+        out = []
+        for i, item in enumerate(new):
+            old_item = old[i] if isinstance(old, list) and i < len(old) else None
+            if isinstance(item, dict) and item.get("name") and isinstance(old, list):
+                old_item = next(
+                    (o for o in old
+                     if isinstance(o, dict) and o.get("name") == item.get("name")),
+                    old_item,
+                )
+            r = restore_masked_fields(item, old_item)
+            if r is not _DROP:
+                out.append(r)
+        return out
+    if is_masked(new):
+        if isinstance(old, str) and old and not is_masked(old):
+            return old
+        return _DROP
+    return new
+
+
 def get_api_base() -> str:
     return load_config().get("api_base", DEFAULT_CONFIG["api_base"])
 
@@ -270,14 +376,66 @@ def get_model() -> str:
     return load_config().get("model", DEFAULT_CONFIG["model"])
 
 
-def get_mcp_config_path() -> Path:
-    """返回 WorkBuddy mcp.json 的绝对路径（支持 ~ 展开与 ${ENV} 占位符）"""
+def _mcp_config_candidates() -> list[Path]:
+    """按优先级返回 WorkBuddy mcp.json 的候选路径（去重保序）。
+
+    WorkBuddy 有两处可能落点，且**实测两者不一致**：
+      - 用户主目录  ~/.workbuddy/mcp.json        ← mcp.json 实际所在
+      - 应用数据目录 $WORKBUDDY_CONFIG_DIR/mcp.json ← 配置模板指向的位置
+
+    因此不能只认配置值，必须带回退链，否则「配了 MCP 但找不到文件」会静默为空。
+    """
     cfg = load_config().get("mcp", {})
     raw = cfg.get("workbuddy_config_path", "~/.workbuddy/mcp.json")
     # 支持 ${ENV} 占位符
     for key, val in os.environ.items():
         raw = raw.replace(f"${{{key}}}", val)
-    return Path(raw).expanduser()
+
+    cands: list[Path] = [Path(raw).expanduser()]
+    env_dir = os.environ.get("WORKBUDDY_CONFIG_DIR", "").strip()
+    if env_dir:
+        cands.append(Path(env_dir) / "mcp.json")
+    cands.append(Path.home() / ".workbuddy" / "mcp.json")
+
+    seen: set[str] = set()
+    out: list[Path] = []
+    for c in cands:
+        key = str(c).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+_mcp_path_warned = False
+
+
+def get_mcp_config_paths() -> list[Path]:
+    """返回候选链中**实际存在**的全部 mcp.json（去重保序，优先级即顺序）。
+
+    为什么与 `get_mcp_config_path()` 并存：后者按「返回首个存在者」的语义被
+    MCP 之外的调用方当作「唯一路径」使用，语义不动；而 MCP 配置需要**跨文件
+    合并** —— 实测两份文件长期并存且内容不同（用户主目录 1 个 server /
+    应用数据目录 7 个 server），只认首个命中会让后面那份的 server 静默消失。
+    """
+    return [p for p in _mcp_config_candidates() if p.exists()]
+
+
+def get_mcp_config_path() -> Path:
+    """返回实际存在的 mcp.json 绝对路径；全都不存在时告警一次并返回首选候选。"""
+    global _mcp_path_warned
+    cands = _mcp_config_candidates()
+    for c in cands:
+        if c.exists():
+            return c
+    if not _mcp_path_warned:
+        _mcp_path_warned = True
+        import logging
+        logging.getLogger("zenith.config").warning(
+            "未找到 WorkBuddy mcp.json，MCP 桥将为空。已尝试: %s",
+            " | ".join(str(c) for c in cands),
+        )
+    return cands[0]
 
 
 def prefer_workbuddy_mcp() -> bool:
@@ -329,6 +487,84 @@ def docker_available() -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         _DOCKER_AVAILABLE_CACHE = False
     return _DOCKER_AVAILABLE_CACHE
+
+
+def get_skills_dir_candidates() -> list[Path]:
+    """按优先级返回技能目录候选链（去重保序）。
+
+    实测复核（2026-09-28，`ls` 逐目录点数 SKILL.md）：
+      - 配置项 `skills_dir`（config/config.yaml:100）= `D:\\WorkBuddyData\\.workbuddy\\skills`，
+        该目录**已非空**，含 **36** 个 `<name>/SKILL.md`；
+        它是 `get_skills_dir()` 当前的返回值（候选链首项命中）。
+      - 项目级 `<PROJECT_DIR>/.workbuddy/skills`（= `zenith-v2\\.workbuddy\\skills`）**不存在**。
+        （旧注释称「项目级技能落在这里、含 zenith-* 四个技能」，已与实测不符。）
+      - 工作区级 `<PROJECT_DIR>.parent/.workbuddy/skills`
+        （= `下载文件\\新建文件夹\\.workbuddy\\skills`）存在，含 **4** 个技能
+        （zenith-calendar-sync / zenith-memory-consolidation / zenith-rag-planning / zenith-sqlite-patterns）。
+      - 用户级 `~/.workbuddy/skills` 不存在。
+
+    因此**仍需**保留回退链：配置目录一旦缺失/被清空，能落到工作区级目录，
+    否则「技能文件扫描/导入」会变成 0。
+
+    与 `get_skills_dir()` 的区别：后者只回答「当前用哪个目录」，而技能目录
+    是**多个并列**的约定位置（项目级 / 工作区级 / 用户级 / 应用数据级），
+    只按「当前那个」做白名单会把放在其他约定位置的文件误挡。
+    """
+    cands: list[Path] = []
+    raw = (load_config().get("skills_dir", "") or "").strip()
+    if raw:
+        cands.append(Path(raw).expanduser())
+    cands.append(PROJECT_DIR / ".workbuddy" / "skills")
+    # 工作区级技能：{workspace}/.workbuddy/skills（本项目位于工作区下一层）
+    cands.append(PROJECT_DIR.parent / ".workbuddy" / "skills")
+    cands.append(Path.home() / ".workbuddy" / "skills")
+    env_dir = os.environ.get("WORKBUDDY_CONFIG_DIR", "").strip()
+    if env_dir:
+        cands.append(Path(env_dir) / "skills")
+
+    seen: set[str] = set()
+    out: list[Path] = []
+    for c in cands:
+        key = str(c).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def _has_skill_files(d: Path) -> bool:
+    """目录下是否存在 <name>/SKILL.md 结构"""
+    try:
+        return any((sub / "SKILL.md").exists() for sub in d.iterdir() if sub.is_dir())
+    except OSError:
+        return False
+
+
+_skills_dir_warned = False
+
+
+def get_skills_dir() -> str:
+    """返回实际可用的技能目录绝对路径。
+
+    优先返回「存在且含 SKILL.md」的候选；都没有则退回首个已存在目录；
+    全都不存在则告警一次并返回配置值。
+    """
+    global _skills_dir_warned
+    cands = get_skills_dir_candidates()
+    for c in cands:
+        if c.is_dir() and _has_skill_files(c):
+            return str(c)
+    for c in cands:
+        if c.is_dir():
+            return str(c)
+    if not _skills_dir_warned:
+        _skills_dir_warned = True
+        import logging
+        logging.getLogger("zenith.config").warning(
+            "未找到含 SKILL.md 的技能目录，技能文件扫描将为空。已尝试: %s",
+            " | ".join(str(c) for c in cands),
+        )
+    return str(cands[0]) if cands else ""
 
 
 # ===== Provider 管理 =====

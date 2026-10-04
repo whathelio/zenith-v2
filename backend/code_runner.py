@@ -150,7 +150,7 @@ def _static_safety_check(code: str) -> str | None:
     return None
 
 
-def _clean_env() -> dict:
+def clean_subprocess_env() -> dict:
     """返回清空危险变量的环境字典。"""
     return {
         k: v for k, v in os.environ.items()
@@ -189,7 +189,7 @@ async def _run_in_docker(code: str, timeout: int = 30) -> dict:
             *docker_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_clean_env(),
+            env=clean_subprocess_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -277,7 +277,7 @@ async def _run_subprocess_hardened(code: str, timeout: int = 30) -> dict:
         # Unix 才能用 preexec_fn 设置资源限制
         if sys.platform != "win32":
             kwargs["preexec_fn"] = _apply_resource_limits
-            kwargs["env"] = _clean_env()
+            kwargs["env"] = clean_subprocess_env()
 
         proc = await asyncio.create_subprocess_exec(
             sys.executable, script_path,

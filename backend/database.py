@@ -11,6 +11,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+# 落库守卫（2026-09-16 由 8 处函数内联 import 提升到模块顶部）
+# sanitize_guard 仅依赖 re/typing，与本模块无循环依赖
+# （output_validator 反向依赖本模块，但本文件不引用它）。
+from .validators.sanitize_guard import guard_store
+
 DB_PATH = Path(__file__).parent.parent / "data" / "zenith.db"
 _TESTING = os.environ.get("ZENITH_TESTING") == "1"
 if _TESTING:
@@ -22,12 +27,92 @@ if _TESTING:
     DB_PATH = Path(_test_tmp_path)
 _test_conn = None
 
+# journal 模式（2026-09-12）
+# 默认：生产用 WAL（并发读写性能），测试用 MEMORY。
+#
+# 为什么测试不能用 WAL：本机装了火绒，它会把**所有删除操作**重定向到回收站 ——
+# 实测连 `bash rm` 删一个普通文件都会进回收站。而 WAL 模式下 SQLite **每次
+# 打开连接**都要创建 `-wal`/`-shm`、最后一个连接关闭时再删掉它们，于是任何
+# 高频开关连接的代码路径都会往回收站灌垃圾：
+# `tests/eval_recall/test_baseline_draft.py` 单次运行约 750 次 `db.mem_get()`
+# → 实测产出 **1506 条**回收站记录，直接把回收站点爆 —— 这就是「回收站项目
+# 太多、清空要等很久」的真凶。
+#
+# 为什么也不是 DELETE：DELETE 模式下**每个写事务**都会落一个 `-journal`
+# （提交后删掉，同样进回收站）。实测改 DELETE 后 `-wal`/`-shm` 归零，但
+# 单次运行仍残留 32 条 `-journal`（恰好等于评估集的 32 个 query —— 每次检索
+# 都带写）。MEMORY 把回滚日志放在内存里，**不落任何磁盘临时文件**，实测归零。
+#
+# 代价：MEMORY 不抗进程崩溃/断电（可能损坏库）。仅用于**测试**（临时库或
+# 可从生产库重建的评估快照）；生产保持 WAL 不动。判断库文件模式需要写
+# header，故这里只在建连时设置。可用 `ZENITH_JOURNAL_MODE` 显式覆盖。
+_JOURNAL_MODE = os.environ.get("ZENITH_JOURNAL_MODE", "").strip().upper()
+if _JOURNAL_MODE not in ("WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"):
+    _JOURNAL_MODE = "MEMORY" if _TESTING else "WAL"
+
+# ── 回收站污染防护（2026-09-23）────────────────────────────────────────────
+# 症状：回收站被 `zenith.db-wal` / `zenith.db-shm` 灌满 —— 2026-09-22 一次
+# 运行就留下 **490 条**，且同一条路径重复 **245 次**（清空回收站要等很久）。
+#
+# 根因是**环境层**的「删除改道回收站」：本机对 D: 卷内任意目录的删除都会被
+# 送进回收站（不是 workspace 限定，也不是 WorkBuddy shim —— 清空 PYTHONPATH
+# 让 sitecustomize 不加载、换到 D:\ 根目录，实测同样复现）。
+# 而 WAL 模式下 SQLite 会在**最后一个连接关闭**时删除 `-wal`/`-shm`，
+# 于是「每调用一次 db 就 +2 条」：条目数正比于调用次数，与数据量无关。
+#
+# 实测对照（20 次 open/close，原始数据见 `_diag_archive/2026-09-23/`）：
+#   WAL +41 ｜ WAL+保活连接 **0** ｜ TRUNCATE 0 ｜ PERSIST 0 ｜ DELETE +21 ｜ MEMORY 0
+#
+# 取舍：生产用 WAL 是刻意选择（并发读写），**不改 journal 模式**，改为持有一个
+# 长生命周期「保活连接」——只要它活着，别人的 close 就不是「最后一个」，
+# 运行期零删除（跨进程亦实测归零）。残留仅为**全部进程退出时的一次性 2 条**。
+# 若日后想改模式，仍可用 ZENITH_JOURNAL_MODE 覆盖（无需改代码）。
+_KEEPER: Optional[sqlite3.Connection] = None
+_KEEPER_PATH: Optional[str] = None
+
+
+def _release_keeper():
+    """释放保活连接（换库路径 / 显式收尾时调用）。"""
+    global _KEEPER, _KEEPER_PATH
+    if _KEEPER is not None:
+        try:
+            _KEEPER.close()
+        except Exception:
+            pass
+    _KEEPER, _KEEPER_PATH = None, None
+
+
+def _keep_wal_alive():
+    """确保 DB_PATH 上有一个常驻连接，使 WAL 伴生文件永不被删除（幂等）。
+
+    只在 WAL 模式且非测试时启用。路径变化（如 eval_recall 把 DB_PATH 指向
+    快照库）会自动换掉旧连接，避免保活错对象。
+    """
+    global _KEEPER, _KEEPER_PATH
+    if _JOURNAL_MODE != "WAL" or _TESTING:
+        return
+    path = str(DB_PATH)
+    if _KEEPER is not None and _KEEPER_PATH == path:
+        return
+    _release_keeper()
+    try:
+        k = sqlite3.connect(path, check_same_thread=False, timeout=5)
+        k.execute("PRAGMA journal_mode=WAL")
+        k.execute("PRAGMA busy_timeout=5000")
+        # 触发 wal-index 映射：让这个连接真正「占住」-wal/-shm
+        k.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        _KEEPER, _KEEPER_PATH = k, path
+    except Exception:
+        # 保活失败不影响正常读写，只是失去这层保护
+        _KEEPER, _KEEPER_PATH = None, None
+
 
 def _conn():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _keep_wal_alive()
     c = sqlite3.connect(str(DB_PATH))
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
+    c.execute(f"PRAGMA journal_mode={_JOURNAL_MODE}")
     c.execute("PRAGMA busy_timeout=5000")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA foreign_keys=ON")
@@ -116,7 +201,7 @@ def _migrate_schedules():
 
 
 def _migrate_notes():
-    """迁移 notes 表 — 新增 stage/recorded_at/distilled_at/distilled_into 字段。"""
+    """迁移 notes 表 — 新增 stage/recorded_at/distilled_at/distilled_into/confirmed_at 字段。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
     try:
@@ -129,6 +214,10 @@ def _migrate_notes():
             ("recorded_at", "TEXT"),
             ("distilled_at", "TEXT"),
             ("distilled_into", "TEXT DEFAULT ''"),
+            # 2026-09-15: 补 confirmed_at —— schedules 表早有此列，notes 表此前没有，
+            # 导致「提议 → 确认」的时点与时延在数据上不可追溯（3 条新笔记查出来都是
+            # status='confirmed'，但无法区分是用户点确认还是被自动/批量确认的）。
+            ("confirmed_at", "TEXT"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
@@ -142,7 +231,7 @@ def _migrate_notes():
 
 
 def _migrate_memories():
-    """迁移 memories 表 — 新增 recorded_at/distilled_from 字段。"""
+    """迁移 memories 表 — 新增 recorded_at/distilled_from/archived 字段 + created_at 回填。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
     try:
@@ -155,6 +244,10 @@ def _migrate_memories():
             ("distilled_from", "INTEGER DEFAULT NULL"),
             ("user_edited", "INTEGER DEFAULT 0"),
             ("last_touched_at", "TEXT"),
+            # 2026-09-11: 「归档」升为一等状态。
+            # 此前只能拿 importance=1 冒充归档 —— 那只是排序垫底，语义上仍在库中活跃，
+            # 且与「真的不重要」无法区分。归档默认不对检索可见，可随时 mem_unarchive 恢复。
+            ("archived", "INTEGER DEFAULT 0"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
@@ -162,6 +255,18 @@ def _migrate_memories():
         # 旧数据回填：recorded_at 用 created_at
         if "recorded_at" in cols:
             c.execute("UPDATE memories SET recorded_at = created_at WHERE recorded_at IS NULL OR recorded_at = ''")
+        # 2026-09-11 修复（B1）：created_at 曾经有过一段没写进 INSERT 的窗口
+        #   （实测 id 1~1264 / recorded_at 全为 2026-07 的行 created_at 恒为 NULL，共 1164 条）。
+        #   created_at 为 NULL 时，`ORDER BY ... created_at DESC` 会把它们排到最后，
+        #   导致这批记忆永远进不了 mem_for_inject 的注入窗口 —— 不是被删，是被埋。
+        #   注意：本回填必须在 ALTER 之后执行，故用 ALTER 后的实时列集合重新取一次。
+        cols_now = {row[1] for row in c.execute("PRAGMA table_info(memories)").fetchall()}
+        if "created_at" in cols_now and "recorded_at" in cols_now:
+            c.execute(
+                "UPDATE memories SET created_at = recorded_at "
+                "WHERE (created_at IS NULL OR created_at = '') "
+                "  AND recorded_at IS NOT NULL AND recorded_at <> ''"
+            )
         c.commit()
     finally:
         c.close()
@@ -318,6 +423,9 @@ def _migrate_academic_papers():
 
 
 def init_db():
+    # 建表/迁移前先立保活连接：_migrate_* 系列用的是裸 sqlite3.connect，
+    # 若等 _conn() 才建立，首次启动会先漏出几条回收站条目。
+    _keep_wal_alive()
     # 先迁移旧数据库的 CHECK 约束（新增 experience 类型）
     _migrate_memory_types()
     _migrate_schedules()
@@ -367,6 +475,7 @@ CREATE TABLE IF NOT EXISTS memories (
     distilled_from INTEGER DEFAULT NULL,
     user_edited INTEGER DEFAULT 0,
     last_touched_at TEXT,
+    archived INTEGER DEFAULT 0,
     created_at TEXT
 );
 
@@ -432,6 +541,14 @@ CREATE TABLE IF NOT EXISTS notes (
     recorded_at TEXT,
     distilled_at TEXT,
     distilled_into TEXT DEFAULT '',
+    -- 2026-09-16（连带修复）：notes 此前只在 _migrate_notes() 里补 confirmed_at，
+    -- 而 init_db() 是「先迁移、后建表」——新库上迁移时表还不存在，直接 return，
+    -- 建表语句又没这一列，于是**全新库上 note_add 一律抛 OperationalError**，
+    -- 要等下一次启动跑第二遍 init_db 才被 ALTER 补上（实测：init_db 一次缺列、
+    -- 两次才齐）。这同时让 tests/backend/test_tools.py::test_distill_note 单独跑必失败、
+    -- 混在全量里却因前面某个用例触发二次 init_db 而通过 —— 基线 174 掩盖了它。
+    -- 与 schedules 建表保持一致（它早已显式列出 confirmed_at）。
+    confirmed_at TEXT,
     created_at TEXT,
     updated_at TEXT
 );
@@ -798,6 +915,17 @@ def msg_recent(cid: str, n: int = 10) -> list:
     return [dict(r) for r in reversed(rs)]
 
 
+def msg_last_user_id(cid: str) -> int | None:
+    """取对话中最后一条 user 消息的 id（工具痕迹归属用）"""
+    with db() as c:
+        r = c.execute(
+            "SELECT id FROM messages WHERE conversation_id = ? AND role = 'user' AND archived = 0"
+            " ORDER BY id DESC LIMIT 1",
+            (cid,),
+        ).fetchone()
+    return r["id"] if r else None
+
+
 def msg_count(cid: str) -> int:
     with db() as c:
         r = c.execute(
@@ -832,13 +960,26 @@ def msg_update(msg_id: int, content: str) -> bool:
 
 
 def msg_del_from(msg_id: int) -> int:
-    """删除 id >= msg_id 的所有消息（含自身及后续），返回删除数量"""
+    """删除「同一会话内」id >= msg_id 的所有消息（含自身及后续），返回删除数量。
+
+    ⚠️ 必须限定 conversation_id：messages.id 是全局自增、跨会话连续，
+    只按 id 比较会连带删掉其它会话中所有更大的 id。
+    （2026-09-11 实测：对一条早期消息执行 edit → 误删 647 条其它会话消息、波及 104 个会话。）
+
+    msg_id 不存在时返回 0，不再误删「所有 id 更大的消息」。
+    """
     with db() as c:
-        # 先定位所属会话以刷新 updated_at
+        # 先定位所属会话 —— 它同时就是删除范围
         row = c.execute("SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)).fetchone()
-        cur = c.execute("DELETE FROM messages WHERE id >= ?", (msg_id,))
-        if row:
-            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), row["conversation_id"]))
+        if not row:
+            return 0
+        cid = row["conversation_id"]
+        cur = c.execute(
+            "DELETE FROM messages WHERE conversation_id = ? AND id >= ?",
+            (cid, msg_id),
+        )
+        if cur.rowcount:
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), cid))
         return cur.rowcount
 
 
@@ -946,20 +1087,52 @@ def trace_stats(conv_id: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Write Guards（落库守卫公共入口）
+# ---------------------------------------------------------------------------
+
+def _secret_risk(data, field: str, keys=None) -> Optional[dict]:
+    """落库守卫：拼接指定字段并检测明文密钥。命中返回 risk dict，否则 None。
+
+    两种调用口径（与原各写库函数逐字等价，勿统一）：
+
+    - `keys` 传字段名序列：按 `"\\n"` 拼接 `data.get(k) or ''`。
+      用于 `sch_add/sch_update`（title+description）、`note_add/note_update`
+      （title+content）、`goal_add/goal_update`（title）。
+      注意用的是 `or ''` 而非 `data.get(k, '')`：显式 `null` 渲染为 `""` 而非 `"None"`。
+    - `keys` 为 None：`data` 本身即待检测文本，原样透传给 `guard_store`。
+      用于 `mem_add` / `mem_update`（它们不做字段拼接，直接传变量）。
+
+    返回值语义（`-1` / `False`）与 warning 文案留在各调用点，不在此处收敛。
+    """
+    if keys is None:
+        text = data
+    else:
+        text = "\n".join(f"{data.get(k) or ''}" for k in keys)
+    return guard_store(text, field=field)
+
+
+# ---------------------------------------------------------------------------
 # Memories
 # ---------------------------------------------------------------------------
 
 def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
-    """按创建日期范围筛选记忆"""
+    """按创建日期范围筛选记忆。
+
+    日期基准用 COALESCE(created_at, recorded_at)：2026-07 及更早的历史记忆
+    created_at 为 NULL（该列后续才加，未回填），若只用 created_at 会让这些记忆
+    永远匹配不到任何日期区间，导致按日期重跑蒸馏时静默漏数据。
+    recorded_at 覆盖 100%，可安全兜底（2026-09-10 修复）。
+    """
+    eff = "COALESCE(created_at, recorded_at)"
     q = "SELECT * FROM memories WHERE 1=1"
     ps = []
     if date_from:
-        q += " AND substr(created_at, 1, 10) >= substr(?, 1, 10)"
+        q += f" AND substr({eff}, 1, 10) >= substr(?, 1, 10)"
         ps.append(date_from)
     if date_to:
-        q += " AND substr(created_at, 1, 10) <= substr(?, 1, 10)"
+        q += f" AND substr({eff}, 1, 10) <= substr(?, 1, 10)"
         ps.append(date_to)
-    q += " ORDER BY importance DESC, created_at DESC"
+    q += f" ORDER BY importance DESC, {eff} DESC"
     with db() as c:
         rs = c.execute(q, ps).fetchall()
     return [dict(r) for r in rs]
@@ -967,16 +1140,43 @@ def mem_list_by_date(date_from: str = "", date_to: str = "") -> list:
 
 def mem_add(type_: str, content: str, importance: int = 3,
             keywords: str = "", source_conv_id: str = "",
-            recorded_at: str = "", distilled_from: Optional[int] = None) -> int:
+            recorded_at: str = "", distilled_from: Optional[int] = None,
+            dedup: bool = True) -> int:
+    """写入记忆。
+
+    返回值：`> 0` 新记忆 id；`-1` 被明文密钥守卫拒绝；`-2` 被相似度去重拦截（未写入）。
+
+    2026-09-11（修复 B6 — 门禁下沉）：
+      此前 `_is_duplicate` 靠调用方自觉调用。实测审计 18 个 `mem_add` 调用点，
+      `scheduler.py` / `skill_loader.py` 从未调用，`rag/import_shiji.py` 更是绕过
+      `mem_add` 直接 SQL INSERT —— 「靠调用方记得」等于没有门禁。
+      故把去重下沉为本函数的默认行为（`dedup=True`）。
+      `dedup=False` 仅供已在上游完成等价判定、或确需写入近似条目的场景显式关闭。
+    失败语义：去重判定本身异常时 **fail-open**（放行写入）并记 warning ——
+      记忆写入路径上，丢一条记忆比留一条冗余更贵的错误。
+    """
     # 落库守卫：拒绝明文密钥写入记忆库（防蒸馏/对话把明文提进记忆）
-    from .validators.sanitize_guard import guard_store
-    risk = guard_store(content, field="memory")
+    risk = _secret_risk(content, field="memory")
     if risk:
         logging.getLogger("zenith.db").warning(
             "拒绝写入记忆（含明文密钥）: type=%s source=%s names=%s",
             type_, source_conv_id, risk["names"]
         )
         return -1
+
+    if dedup:
+        # 函数内延迟导入：database 是 memory_engine 的依赖，模块级互相 import 会成环。
+        from .memory_engine import _is_duplicate
+        try:
+            if _is_duplicate(content):
+                logging.getLogger("zenith.db").info(
+                    "记忆去重拦截（未写入）: type=%s source=%s content=%s",
+                    type_, source_conv_id, content[:60],
+                )
+                return -2
+        except Exception as e:  # noqa: BLE001 — fail-open，见 docstring
+            logging.getLogger("zenith.db").warning("记忆去重判定异常（放行写入）: %s", e)
+
     now = _now()
     with db() as c:
         cur = c.execute(
@@ -987,14 +1187,23 @@ def mem_add(type_: str, content: str, importance: int = 3,
         return cur.lastrowid
 
 
-def mem_list(type_: str = "", limit: int = 0) -> list:
+def mem_list(type_: str = "", limit: int = 0, include_archived: bool = False) -> list:
+    """列出记忆。默认排除已归档条目。
+
+    排序键同样做 NULL 安全处理（见 mem_for_inject 的说明）：created_at 为 NULL 时回落
+    recorded_at，避免历史数据整批沉到列表末尾。
+    """
     with db() as c:
         q = "SELECT * FROM memories"
-        ps = []
+        ps: list = []
+        conds = []
         if type_:
-            q += " WHERE type = ?"
-            ps.append(type_)
-        q += " ORDER BY importance DESC, created_at DESC"
+            conds.append("type = ?"); ps.append(type_)
+        if not include_archived:
+            conds.append("COALESCE(archived, 0) = 0")
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY importance DESC, COALESCE(NULLIF(created_at, ''), NULLIF(recorded_at, ''), '') DESC"
         if limit > 0:
             q += " LIMIT ?"
             ps.append(limit)
@@ -1003,6 +1212,7 @@ def mem_list(type_: str = "", limit: int = 0) -> list:
 
 
 def mem_search(keyword: str = "", limit: int = 30) -> list:
+    """检索记忆。默认排除已归档（archived=1）条目 —— 归档即“不再参与日常检索”。"""
     with db() as c:
         kw = keyword.strip()
         if not kw:
@@ -1018,7 +1228,7 @@ def mem_search(keyword: str = "", limit: int = 30) -> list:
             rs = c.execute(
                 "SELECT m.* FROM memories m "
                 "JOIN memories_fts fts ON m.id = fts.rowid "
-                "WHERE memories_fts MATCH ? "
+                "WHERE memories_fts MATCH ? AND COALESCE(m.archived, 0) = 0 "
                 "ORDER BY rank "
                 "LIMIT ?",
                 (fts_query, limit)
@@ -1028,7 +1238,8 @@ def mem_search(keyword: str = "", limit: int = 30) -> list:
         except Exception:
             pass
         rs = c.execute(
-            "SELECT * FROM memories WHERE content LIKE ? OR keywords LIKE ? "
+            "SELECT * FROM memories "
+            "WHERE (content LIKE ? OR keywords LIKE ?) AND COALESCE(archived, 0) = 0 "
             "ORDER BY importance DESC LIMIT ?",
             (f"%{kw}%", f"%{kw}%", limit)
         ).fetchall()
@@ -1053,8 +1264,7 @@ def mem_update(mid: int, content: str = "", type_: str = "", importance: int = 0
     new_content = content if content else existing.get("content", "")
     if not new_content:
         return False
-    from .validators.sanitize_guard import guard_store
-    risk = guard_store(new_content, field="memory")
+    risk = _secret_risk(new_content, field="memory")
     if risk:
         logging.getLogger("zenith.db").warning(
             "拒绝更新记忆（含明文密钥）: mid=%s names=%s", mid, risk["names"]
@@ -1092,13 +1302,46 @@ def mem_get(mid: int) -> dict | None:
 
 
 def mem_for_inject(limit: int = 20) -> list:
-    """获取需要注入到对话上下文的重要记忆"""
+    """获取需要注入到对话上下文的重要记忆（排除已归档）。
+
+    2026-09-11（修复 B1）：排序键从裸 `created_at DESC` 改为 `COALESCE(NULLIF(...))`。
+    背景：created_at 曾有一段没写进 INSERT 的窗口，实测 1164 条（id 1~1264）为 NULL；
+    SQLite 中 `ORDER BY x DESC` 把 NULL 排在最后 → 这批记忆永远进不了注入窗口。
+    现在 NULL 会回落到 recorded_at，两者皆空才回落空串。
+    """
     with db() as c:
         rs = c.execute(
-            "SELECT * FROM memories ORDER BY importance DESC, created_at DESC LIMIT ?",
+            "SELECT * FROM memories "
+            "WHERE COALESCE(archived, 0) = 0 "
+            "ORDER BY importance DESC, COALESCE(NULLIF(created_at, ''), NULLIF(recorded_at, ''), '') DESC "
+            "LIMIT ?",
             (limit,)
         ).fetchall()
     return [dict(r) for r in rs]
+
+
+def mem_archive(mid: int, archived: bool = True) -> bool:
+    """归档 / 取消归档一条记忆。
+
+    归档语义 = 「保留内容、退出日常检索」—— 与「删除」严格区分：
+      - 内容完整保留在表中，可通过 include_archived 检索或 mem_unarchive 恢复
+      - 默认不参与 mem_search / mem_for_inject / mem_consolidate
+      - 不视为人工编辑（不动 user_edited），故仍可被后续维护流程处理
+
+    引入原因（2026-09-11）：此前「归档」只能拿 importance=1 冒充 —— 那只是排序垫底，
+    语义上仍在库中活跃，与「真的不重要」无法区分，且会让 63.6% 的记忆挤在 imp=1。
+    """
+    with db() as c:
+        cur = c.execute(
+            "UPDATE memories SET archived = ? WHERE id = ?",
+            (1 if archived else 0, mid)
+        )
+        return cur.rowcount > 0
+
+
+def mem_unarchive(mid: int) -> bool:
+    """取消归档（mem_archive 的语义别名，便于调用点自解释）。"""
+    return mem_archive(mid, archived=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1349,24 @@ def mem_for_inject(limit: int = 20) -> list:
 # ---------------------------------------------------------------------------
 
 def sch_add(data: dict) -> int:
+    """写入日程。
+
+    返回值：`> 0` 新日程 id；`-1` 被明文密钥守卫拒绝（未写入）。
+
+    2026-09-16（门禁下沉）：守卫此前只装在 `routers/schedules.py`，而 `tools.py` 的
+    `_handle_add_schedule` / `_handle_create_plan_schedule` / `_handle_smart_classify` /
+    `_distill_raw_note` 均直调本函数，绕过了路由层守卫（副本库实测：明文密钥被写入并返回 id）。
+    守卫口径与路由层保持一致（title + description 两个自由文本字段）。
+    """
+    # 落库守卫：拒绝明文密钥写入日程（防 AI 工具路径绕过路由层守卫）
+    risk = _secret_risk(data, "schedule", ["title", "description"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝写入日程（含明文密钥）: title=%s source=%s names=%s",
+            str(data.get("title", ""))[:40], data.get("source", ""), risk["names"]
+        )
+        return -1
+
     now = _now()
     status = data.get("status", "confirmed")
     with db() as c:
@@ -1165,8 +1426,25 @@ def sch_get(sid: int) -> Optional[dict]:
 _SCHEDULE_COLUMNS = {"title", "description", "start_time", "end_time", "location", "status", "priority", "importance", "category", "impact", "country", "remind_before", "goal_id", "recurrence", "parent_id", "source", "confirmed_at"}
 
 
-def sch_update(sid: int, data: dict):
-    """更新日程。值为 None 的字段会被显式清空（设为 NULL）。"""
+def sch_update(sid: int, data: dict) -> bool:
+    """更新日程。值为 None 的字段会被显式清空（设为 NULL）。
+
+    返回值：`True` 已更新（或无字段可更新）；`False` 被明文密钥守卫拒绝（未写入）。
+    历史上本函数恒返回 None，现按 `mem_update`（同为「更新 + 守卫」）的布尔语义对齐；
+    现存调用方均忽略返回值，故不受影响。
+
+    2026-09-16（门禁下沉）：守卫此前只装在 `routers/schedules.py`，直调本函数同样绕过
+    （`tools.py` 的 `_handle_complete_schedule`、`confirm_flow.py` 的确认卡片等）。
+    守卫口径与路由层一致：仅校验 title + description。
+    """
+    # 落库守卫：拒绝把明文密钥更新进日程（与路由层同口径）
+    risk = _secret_risk(data, "schedule", ["title", "description"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝更新日程（含明文密钥）: sid=%s names=%s", sid, risk["names"]
+        )
+        return False
+
     fs = []
     ps = []
     for k, v in data.items():
@@ -1176,13 +1454,14 @@ def sch_update(sid: int, data: dict):
         fs.append(f"{k} = ?")
         ps.append(v)
     if not fs:
-        return
+        return True
     ps.append(sid)
     with db() as c:
         c.execute(f"UPDATE schedules SET {', '.join(fs)} WHERE id = ?", ps)
         # P1-2: status 变为 confirmed 时自动更新 confirmed_at
         if data.get("status") == "confirmed":
             c.execute("UPDATE schedules SET confirmed_at = ? WHERE id = ?", (_now(), sid))
+    return True
 
 
 def sch_del(sid: int):
@@ -1248,6 +1527,25 @@ def psum_delete(period_type: str, period_key: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def note_add(data: dict) -> int:
+    """写入笔记。
+
+    返回值：`> 0` 新笔记 id；`-1` 被明文密钥守卫拒绝（未写入）。
+
+    2026-09-16（门禁下沉）：守卫此前只装在 `routers/notes.py`，而 `tools.py` 的
+    `_handle_add_note` / `_handle_smart_classify` 是直调本函数的 —— 它们不经 FastAPI
+    路由，于是整条 AI 工具路径绕过了路由层守卫（副本库实测：明文密钥被直接写入并返回 id）。
+    而 `config.py` 的 SYSTEM_PROMPT 恰恰引导模型走这条路径。故照 `mem_add` 的既有范式，
+    把守卫下沉到本函数 —— 「靠调用方记得」等于没有门禁。
+    """
+    # 落库守卫：拒绝明文密钥写入笔记（防 AI 工具路径绕过路由层守卫）
+    risk = _secret_risk(data, "note", ["title", "content"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝写入笔记（含明文密钥）: title=%s source=%s names=%s",
+            str(data.get("title", ""))[:40], data.get("source", ""), risk["names"]
+        )
+        return -1
+
     now = _now()
     recorded = data.get("recorded_at") or now
     stage = data.get("stage", "raw")
@@ -1255,8 +1553,8 @@ def note_add(data: dict) -> int:
         stage = "raw"
     with db() as c:
         cur = c.execute(
-            "INSERT INTO notes (title, content, tags, source, status, stage, recorded_at, distilled_at, distilled_into, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO notes (title, content, tags, source, status, stage, recorded_at, distilled_at, distilled_into, confirmed_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 data["title"],
                 data.get("content", ""),
@@ -1267,6 +1565,10 @@ def note_add(data: dict) -> int:
                 recorded,
                 data.get("distilled_at", ""),
                 data.get("distilled_into", ""),
+                # 2026-09-15: 允许调用方显式给出确认时点（如「确认后合并」产生的笔记）。
+                # 手记/直接创建的笔记不传 → NULL，表示「无确认动作、时点未知」，这是诚实表达。
+                # 注意：此处必须显式列在白名单式的 INSERT 列表里，否则调用方传了也会被静默丢弃。
+                data.get("confirmed_at"),
                 now,
                 now,
             )
@@ -1308,10 +1610,35 @@ def note_get(nid: int) -> Optional[dict]:
     return dict(r) if r else None
 
 
-_NOTE_COLUMNS = {"title", "content", "tags", "source", "status", "stage", "recorded_at", "distilled_at", "distilled_into"}
+_NOTE_COLUMNS = {"title", "content", "tags", "source", "status", "stage", "recorded_at", "distilled_at", "distilled_into", "confirmed_at"}
 
 
-def note_update(nid: int, data: dict):
+def note_update(nid: int, data: dict) -> bool:
+    """更新笔记（部分字段）。返回 `True` 已更新；`False` 被明文密钥守卫拒绝（未写入）。
+
+    返回值语义参照 `mem_update`（同为「更新 + 守卫」）：
+      - 历史上本函数恒返回 None，现存调用方均忽略返回值 —— 但**忽略返回值不等于安全**，
+        见下方 merge/edit 分支的说明；本次只改返回语义 + 加守卫，不改任何写库逻辑。
+
+    2026-09-16（门禁下沉）：守卫此前只装在 `routers/notes.py`，而 `confirm_flow.py` 的
+    `edit_note` 确认卡片、`modify_proposal` 的笔记分支、`tools.py` 的 `_distill_raw_note`
+    均直调本函数 —— 它们不经 FastAPI 路由，于是「用户确认卡片」这条路径整条绕过守卫
+    （副本库实测：明文密钥经 edit_note 直接写进 notes）。
+    守卫口径与 `note_add` / 路由层**完全一致**：`title + content`。
+
+    ⚠️ 只校验**本次传入的字段**，不合并库中既有值。原因：notes 表存在守卫上线前
+    写入的历史条目，若把既有 content 也纳入校验，则 `tools.py` 里那些只改
+    `stage` / `distilled_into` 的**元数据更新**（不传 title/content）会被历史数据连坐拒绝，
+    整条蒸馏链对这些笔记永久失效。守卫的职责是「别把新密钥写进去」，不是「清洗存量」。
+    """
+    # 落库守卫：拒绝把明文密钥更新进笔记（与 note_add / 路由层同口径）
+    risk = _secret_risk(data, "note", ["title", "content"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝更新笔记（含明文密钥）: nid=%s names=%s", nid, risk["names"]
+        )
+        return False
+
     fs = []
     ps = []
     for k, v in data.items():
@@ -1320,11 +1647,18 @@ def note_update(nid: int, data: dict):
         if v is not None:
             fs.append(f"{k} = ?")
             ps.append(v)
+    # 2026-09-15: status 变为 confirmed 但调用方未显式给 confirmed_at 时兜底补时间戳。
+    # 参照 sch_update 的同名机制，但更精确 —— 仅在显式值缺失时才补，不覆盖调用方传的值。
+    # 目的：消除「依赖每个调用方记得传」这一脆弱点（本次缺陷的成因就是它）。
+    if data.get("status") == "confirmed" and data.get("confirmed_at") is None:
+        fs.append("confirmed_at = ?")
+        ps.append(_now())
     fs.append("updated_at = ?")
     ps.append(_now())
     ps.append(nid)
     with db() as c:
         c.execute(f"UPDATE notes SET {', '.join(fs)} WHERE id = ?", ps)
+    return True
 
 
 def note_del(nid: int) -> bool:
@@ -1339,6 +1673,26 @@ def note_del(nid: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def goal_add(data: dict) -> int:
+    """写入目标。
+
+    返回值：`> 0` 新目标 id；`-1` 被明文密钥守卫拒绝（未写入）。
+
+    2026-09-16（门禁下沉）：`routers/goals.py` 的 POST 是**唯一**调用方，守卫此前不在此层，
+    而本函数是「AI 工具 / 前端 / 未来任何调用方」的公共落库口 —— 照 `note_add` / `sch_add`
+    的既有范式下沉，使守卫随函数走而非随路由走。
+
+    守卫口径：goals 表**唯一**自由文本字段是 `title`（`strategy` 虽为 TEXT，但受
+    `CHECK(strategy IN ('compound','linear'))` 约束，是枚举而非自由文本，故不纳入）。
+    """
+    # 落库守卫：拒绝明文密钥写入目标（防绕过路由层守卫）
+    risk = _secret_risk(data, "goal", ["title"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝写入目标（含明文密钥）: title=%s names=%s",
+            str(data.get("title", ""))[:40], risk["names"]
+        )
+        return -1
+
     now = _now()
     # 计算预计完成日期（按日化复利）
     daily = data.get("daily_target", 5)
@@ -1422,7 +1776,26 @@ def goal_get(gid: int) -> Optional[dict]:
 _GOAL_COLUMNS = {"title", "start_value", "target_value", "current_value", "daily_target", "strategy", "status", "start_date", "end_date", "active_days"}
 
 
-def goal_update(gid: int, data: dict):
+def goal_update(gid: int, data: dict) -> bool:
+    """更新目标（部分字段）。返回 `True` 已更新（或无字段可更新）；`False` 被明文密钥守卫拒绝（未写入）。
+
+    返回值语义参照 `sch_update`（同为「update + 守卫」的 dict 入参函数）：
+    历史上本函数恒返回 None，现存调用方（`routers/goals.py`、`routers/schedules.py` 的
+    done 结算分支）均忽略返回值；对齐布尔语义后，调用方**应当**判负 —— 尤其是
+    `routers/goals.py`（本轮已补），否则「被拒绝」会被当成「已保存」展现给用户。
+
+    2026-09-16（门禁下沉）：与 `goal_add` 同源，守卫随函数走。
+    口径同 `goal_add`：仅 `title`（唯一自由文本字段）；且只校验传入字段，
+    避免把库中既有数据纳入校验导致数值型更新（current_value 结算）被连坐拒绝。
+    """
+    # 落库守卫：拒绝把明文密钥更新进目标（与 goal_add 同口径）
+    risk = _secret_risk(data, "goal", ["title"])
+    if risk:
+        logging.getLogger("zenith.db").warning(
+            "拒绝更新目标（含明文密钥）: gid=%s names=%s", gid, risk["names"]
+        )
+        return False
+
     import math
     fs = []
     ps = []
@@ -1457,16 +1830,23 @@ def goal_update(gid: int, data: dict):
                 except (ValueError, TypeError):
                     pass
     if not fs:
-        return
+        return True
     fs.append("updated_at = ?")
     ps.append(_now())
     ps.append(gid)
     with db() as c:
         c.execute(f"UPDATE goals SET {', '.join(fs)} WHERE id = ?", ps)
+    return True
 
 
 def goal_del(gid: int):
+    """删除目标，并先解除关联日程的 goal_id，避免悬挂引用。
+
+    schedules.goal_id 未声明 FOREIGN KEY 约束，SQLite 既不会级联也不会报错，
+    所以必须显式置 NULL——否则会留下指向已删目标的日程（2026-09-10 修复）。
+    """
     with db() as c:
+        c.execute("UPDATE schedules SET goal_id = NULL WHERE goal_id = ?", (gid,))
         c.execute("DELETE FROM goals WHERE id = ?", (gid,))
 
 
@@ -1710,9 +2090,18 @@ def market_report_list(limit: int = 30) -> list:
 
 
 def market_report_get_latest() -> Optional[dict]:
+    """最新一份**有效**分析报告。
+
+    封存期间（2026-07）产生过 analysis_text='Error: ' 的空报告，且所有记录的
+    report_date 都是同一天，仅按日期排序会随机命中坏记录。这里显式跳过空/报错行
+    （2026-09-10 修复）。不删除原始数据，仅查询侧过滤。
+    """
     with db() as c:
         r = c.execute(
-            "SELECT * FROM market_reports ORDER BY report_date DESC LIMIT 1"
+            "SELECT * FROM market_reports "
+            "WHERE analysis_text IS NOT NULL AND analysis_text != '' "
+            "  AND analysis_text NOT LIKE 'Error%' "
+            "ORDER BY report_date DESC, id DESC LIMIT 1"
         ).fetchone()
     return dict(r) if r else None
 

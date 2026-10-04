@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -33,13 +34,57 @@ def _is_testing() -> bool:
     return os.environ.get("ZENITH_TESTING") == "1"
 
 
+# ── git 可执行文件解析（2026-09-16 新增）──────────────────────
+# 原因：服务进程的 PATH 里通常没有 git —— 实测 `list_snapshots` 返回
+# 「非 git 仓库或 git 不可用」，连带让 `rollback_code` / `ensure_git_clean_snapshot`
+# 在生产环境失效，用户只能退回文件备份兜底（精炼计划里已出现该降级）。
+# 本模块是 git 的唯一封装入口（全文件只有 _run_git 一处 subprocess），故单点收口。
+_GIT_CANDIDATES = (
+    r"C:\Program Files\Git\cmd\git.exe",
+    r"C:\Program Files (x86)\Git\cmd\git.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\cmd\git.exe"),
+)
+_GIT_BIN: str | None = None
+
+
+def _resolve_git() -> str:
+    """解析 git 可执行文件（结果缓存）。解析顺序：
+    ① `ZENITH_GIT` 环境变量（可由 .env 注入 —— config._load_dotenv 会把 .env 写进 environ）
+    ② PATH 中的 git
+    ③ 常见安装位置
+    都找不到时返回 "git"，保持原行为（subprocess 抛 FileNotFoundError → 优雅降级）。
+    """
+    global _GIT_BIN
+    if _GIT_BIN is not None:
+        return _GIT_BIN
+
+    explicit = (os.environ.get("ZENITH_GIT") or "").strip()
+    if explicit and Path(explicit).exists():
+        _GIT_BIN = explicit
+        return _GIT_BIN
+
+    found = shutil.which("git")
+    if found:
+        _GIT_BIN = found
+        return _GIT_BIN
+
+    for cand in _GIT_CANDIDATES:
+        if cand and Path(cand).exists():
+            _GIT_BIN = cand
+            return _GIT_BIN
+
+    logger.warning("未找到 git（PATH / ZENITH_GIT / 常见位置均无）→ 代码快照与回退不可用")
+    _GIT_BIN = "git"
+    return _GIT_BIN
+
+
 def _run_git(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess | None:
     """执行 git 命令（在项目根目录）。失败返回 None，不抛异常。"""
     if _is_testing():
         return None
     try:
         return subprocess.run(
-            ["git", *args],
+            [_resolve_git(), *args],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,

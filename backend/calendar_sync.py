@@ -11,7 +11,7 @@ from typing import Optional
 
 from .timezone import now_tz
 from . import database as db
-from ._archived.jin10_service import get_jin10_service
+from .jin10_service import get_jin10_service
 
 logger = logging.getLogger("zenith.calendar_sync")
 
@@ -101,7 +101,13 @@ async def sync_calendar_events(days: int = 7, min_star: int = 2) -> dict:
     try:
         raw_events = await svc.list_calendar()
         if raw_events is None:
-            errors.append("无法获取外部财经日历（返回 None）")
+            # 2026-09-28 D8-b：把金十侧的**具体原因**带出来。此前只有一句「返回 None」，
+            # 无法区分 token 缺失 / 401 / 超时 / 协议错 —— 只能另写一次性探针排障。
+            # 用 getattr 兼容（与 tools.py 消费 mcp_client.last_error 的写法一致，见 Z2）。
+            _lerr = getattr(svc, "last_error", None)
+            reason = _lerr() if callable(_lerr) else ""
+            errors.append(f"无法获取外部财经日历：{reason}" if reason
+                          else "无法获取外部财经日历（返回 None，且服务未提供原因）")
             return {"synced": 0, "errors": errors, "next_sync": ""}
 
         now = now_tz()
@@ -146,11 +152,11 @@ async def sync_calendar_events(days: int = 7, min_star: int = 2) -> dict:
     except Exception as e:
         errors.append(str(e))
         logger.warning("财经日历同步失败: %s", e)
-    finally:
-        try:
-            await svc.close()
-        except Exception:
-            pass
+    # 注意：svc 来自 get_jin10_service()，是**进程级单例**，这里不能 close()。
+    # close() 会把单例的 httpx client 关掉并把 _initialized 打回 False，
+    # 导致下一次调用必须重做完整 MCP 握手（initialize + notifications/initialized
+    # + tool call 共 3 次 POST）。实测日志中「金十 MCP 初始化成功」重复 64 次、
+    # 且 session 全程为 None，正是由此产生。单例连接生命周期由单例自己管。
 
     return {
         "synced": synced,

@@ -33,6 +33,20 @@ async def knowledge_search(data: dict = Body(default=None)):
     return await knowledge_service.search(q)
 
 
+@router.post("/wiki")
+async def knowledge_wiki(data: dict = Body(default=None)):
+    """《史记》wiki 问答代理（转发到 api_gateway /wiki）。
+
+    2026-09-11：前端 KnowledgeView 的「wiki 模式」此前恒 404 ——
+    service 层 `wiki_query()` 早已实现，只是从未暴露成路由。
+    与 /search 同形状；网关不可用时由 service 层返回 {error, code}。
+    """
+    q = (data or {}).get("question", "").strip()
+    if not q:
+        raise HTTPException(400, "question is required")
+    return await knowledge_service.wiki_query(q)
+
+
 @router.post("/ingest")
 async def knowledge_ingest(file: UploadFile = File(...)):
     if not file.filename:

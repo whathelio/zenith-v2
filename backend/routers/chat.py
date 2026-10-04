@@ -117,6 +117,40 @@ def _split_query(q: str) -> list:
     return list(dict.fromkeys(out))
 
 
+# ── Z6 技能层级兜底阈值（缺失「层级：」行时的判据，集中于此便于调参）──────────
+# 背景：skill_loader 写入的「层级：」行在存量数据中大面积缺失（实测 50 条技能里
+# 41 条无）。原逻辑一律落默认 L1 → 全文注入，渐进载入形同虚设。以下阈值用于对
+# **缺失层级行**的技能做可解释、可复现的兜底判定：
+#   仅当「内容足够长」**且**「含长步骤块」时才判 L2（走摘要注入），其余一律保守
+#   判 L1（全文注入）——宁可多注入，不可漏注入关键技能。
+SKILL_FALLBACK_L2_MIN_CHARS = 600        # 内容字符数下限：低于此值不可能判 L2
+SKILL_FALLBACK_L2_MIN_STEPS = 5          # 「长步骤块」判据 A：有序步骤行数 ≥ 此值
+SKILL_FALLBACK_L2_MIN_STEP_CHARS = 400   # 「长步骤块」判据 B：步骤行累计字符 ≥ 此值
+
+
+def _infer_skill_layer(content: str) -> str:
+    """缺失「层级：」行时的兜底层级判定（Z6）。
+
+    可解释启发式：仅当内容冗长（≥ SKILL_FALLBACK_L2_MIN_CHARS）**且**含成块有序
+    步骤（长步骤块，见两个判据）时判 L2（摘要注入），否则保守判 L1（全文注入）。
+    """
+    import re as _re
+    text = (content or "").strip()
+    if len(text) < SKILL_FALLBACK_L2_MIN_CHARS:
+        return "L1"
+    step_re = _re.compile(r"^\s*\d+[.、)．]\s*\S")  # 形如「1.」「2、」「3)」的步骤行
+    step_count = 0
+    step_chars = 0
+    for ln in text.splitlines():
+        if step_re.match(ln):
+            step_count += 1
+            step_chars += len(ln.strip())
+    if step_count >= SKILL_FALLBACK_L2_MIN_STEPS or \
+       step_chars >= SKILL_FALLBACK_L2_MIN_STEP_CHARS:
+        return "L2"
+    return "L1"
+
+
 def _build_skill_injection(current_query: str) -> str:
     """从记忆库检索 type='skill' 匹配当前查询，作为硬性指令注入 system prompt。
 
@@ -169,10 +203,15 @@ def _build_skill_injection(current_query: str) -> str:
             name = c[3:].split("\n")[0].strip() if c.startswith("技能：") else "(未命名)"
             # 解析层级标签（skill_loader 写入的「层级：L1/L2/L3」行）
             layer = "L1"
+            layer_missing = True
             for line in c.splitlines():
                 if line.startswith("层级："):
                     layer = line[3:].strip().upper()
+                    layer_missing = False
                     break
+            if layer_missing:
+                # Z6: 缺失层级行时不再一律当 L1 全文注入，改为可解释兜底判定
+                layer = _infer_skill_layer(c)
             if layer.startswith("L2") and not want_detail:
                 trigger = ""
                 for line in c.splitlines():
@@ -197,7 +236,11 @@ async def _process_conv(
     user_msg_id: 当前用户消息的 id，用于把工具痕迹关联到所属消息（前端交错渲染）。"""
     logger = logging.getLogger("zenith.chat")
     try:
-        reminder = check_reminders()
+        # check_reminders 是同步函数（全量 sch_list + 逐条 N+1 查询），而这里在
+        # **每轮对话开头**执行——直接调用会阻塞事件循环、拖慢对话流。
+        # 项目约定：阻塞调用走 asyncio.to_thread
+        # （见 process_monitor.py:11 的说明、tools.py:2591 / routers/processes.py:31 的先例）。
+        reminder = await asyncio.to_thread(check_reminders)
         if reminder:
             event_queue.put_nowait(json.dumps({'type': 'reminder', 'content': reminder}, ensure_ascii=False))
 
@@ -205,6 +248,50 @@ async def _process_conv(
         assistant_thinking = ""  # 收集思考过程（与 WorkBuddy 对齐持久化）
         tool_results = []
         MAX_TOOL_ROUNDS = 10
+
+        # ── ① 评估层 + 只读预执行（2026-09-15 新增）──────────────
+        # 每轮对话必跑一次模块需求评估，结果既留痕（assess）又注入 system prompt。
+        # 目的：把「本轮该用哪些模块」从"模型临时决定"变成系统显式步骤，
+        # 并让收尾的 assess_outcome 能自动发现「建议了但没执行」的断点。
+        # 原则：评估失败必须降级放行（绝不阻塞对话）；预执行只允许只读白名单。
+        assessment: dict = {}
+        called_tools: list[str] = []
+        try:
+            from ..assessor import assess_round, summarize_assessment
+
+            assessment = assess_round(user_message)
+            try:
+                db.trace_add(conv_id, "assess",
+                             data=summarize_assessment(assessment),
+                             message_id=user_msg_id)
+            except Exception:
+                pass  # 留痕失败不影响对话
+
+            # 只读项预执行（最多 2 项，避免拖慢首轮）。白名单见 assessor.PREREAD_SAFE。
+            executed: set[str] = set()
+            preread_blocks: list[str] = []
+            for item in (assessment.get("preread") or [])[:2]:
+                try:
+                    pr = await execute_tool(item["tool"], item["args"], conv_id=conv_id)
+                    txt = str(pr.get("result") or pr.get("error") or "")[:1200]
+                    if txt:
+                        preread_blocks.append(f"[系统已自动执行 {item['tool']}]\n{txt}")
+                        executed.add(item["tool"])
+                        called_tools.append(item["tool"])
+                except Exception as e:
+                    logger.warning("预执行 %s 失败（降级忽略）: %s", item["tool"], e)
+
+            hint = assessment.get("hint") or ""
+            if hint and executed:
+                hint += ("\n（注：" + "、".join(sorted(executed))
+                         + " 已由系统自动执行，结果见下方，无需重复调用）")
+            blocks = [b for b in (hint, "\n\n".join(preread_blocks)) if b]
+            if blocks and messages and isinstance(messages[0], dict) \
+                    and messages[0].get("role") == "system":
+                # 追加到 system content 末尾：前缀保持不变，不破坏 prefix cache
+                messages[0]["content"] = (messages[0].get("content") or "") + "\n" + "\n\n".join(blocks)
+        except Exception as e:
+            logger.warning("模块评估失败（已降级放行）: %s", e)
 
         for round_num in range(MAX_TOOL_ROUNDS):
             round_text = ""
@@ -262,9 +349,13 @@ async def _process_conv(
                     }, ensure_ascii=False))
 
                 t_start = time.time()
+                called_tools.append(tool_name)  # 2026-09-15: 供收尾 assess_outcome 对比
                 try:
                     result = await execute_tool(tool_name, tool_args, conv_id=conv_id)
-                    success = bool(result.get("success", True)) and not result.get("error")
+                    # Z8: 显式「明确失败才算失败」——仅当 result["success"] is False 判失败；
+                    # 缺失 success 键视为成功（保留原 default=True 意图）；不再因结果携带
+                    # error 业务字段（如 {success:True, error:"警告"}）而误判为失败。
+                    success = result.get("success", True) is not False
                 except Exception as exc:
                     result = {"error": str(exc), "result": f"工具执行异常: {exc}"}
                     success = False
@@ -278,7 +369,8 @@ async def _process_conv(
                 tool_results.append(result)
 
                 # Phase 1: 工具调用结束事件
-                result_text = str(result.get("result", ""))
+                # 失败结果通常只有 error 键（无 result），必须透传，否则 LLM/前端只见空串
+                result_text = str(result.get("result") or result.get("error") or "")
                 if show_bubbles:
                     event_queue.put_nowait(json.dumps({
                         'type': 'tool_call_end',
@@ -299,14 +391,26 @@ async def _process_conv(
                 # Phase 1: 写入执行追踪
                 if trace_enabled:
                     try:
+                        # B-13② 2026-09-11：补齐结构化代码痕迹字段。
+                        # 上面 tool_call_end 事件本就带着 stdout/stderr/exit_code/lang（:298-301），
+                        # 而前端**重载历史痕迹时正是读它们**（ChatView.tsx:125-128）——
+                        # 原先只发不存，于是「刷新页面后代码体丢失」。
+                        # 截断到 4000 字符：code_runner 可能产出大量 stdout，
+                        # 整段落库会让 conversation_traces 迅速膨胀；4000 足够渲染气泡。
+                        _cut = lambda v: (str(v)[:4000] if v is not None else None)  # noqa: E731
                         db.trace_add(
                             conv_id, "tool_call",
                             data={
                                 "name": tool_name,
                                 "args": tool_args,
                                 "result_summary": result_text[:500],
+                                "error": str(result.get("error") or "")[:1000],  # Z7: 补全失败原因全貌
                                 "success": success,
                                 "duration_ms": duration_ms,
+                                "stdout": _cut(result.get("stdout")),
+                                "stderr": _cut(result.get("stderr")),
+                                "exit_code": result.get("exit_code"),
+                                "lang": result.get("lang"),
                             },
                             round_num=round_num,
                             message_id=user_msg_id,
@@ -319,10 +423,14 @@ async def _process_conv(
                     try:
                         v_warnings = validate_tool_result(tool_name, tool_args, result_text)
                         for w in v_warnings:
+                            # ⚠️ 2026-09-11：字段名统一为 `message`。
+                            # 原先这里发 `content`，而下方 L3 输出校验（:424）发的是 `message`
+                            # （它直接展开 output_validator 的字典）—— 同一事件类型两种字段名，
+                            # 消费方必然漏掉一种。trace 写入用的是 w["message"]，与此无关、不受影响。
                             event_queue.put_nowait(json.dumps({
                                 'type': 'warning',
                                 'level': w.get('level', 'warning'),
-                                'content': w.get('message', ''),
+                                'message': w.get('message', ''),
                                 'tool': tool_name,
                             }, ensure_ascii=False))
                             # 写入 traces
@@ -350,7 +458,12 @@ async def _process_conv(
                         assistant_text += tool_info
                         event_queue.put_nowait(json.dumps({'type': 'text', 'content': tool_info}, ensure_ascii=False))
 
-                tool_content = str(result.get("result", ""))
+                # 错误优先回传：失败结果没有 result 键，只有 error——
+                # 必须把错误文本送回 LLM，否则模型只见空结果、自行编造原因
+                if result.get("error") and not result.get("result"):
+                    tool_content = f"[工具错误] {result['error']}"
+                else:
+                    tool_content = str(result.get("result", ""))
                 prune_cfg = cfg.get("tool_result_prune", {}) or {}
                 if prune_cfg.get("enabled", True):
                     tool_content = prune_tool_result(
@@ -383,6 +496,29 @@ async def _process_conv(
                     event_queue.put_nowait(json.dumps({'type': 'full_text', 'content': assistant_text, 'conversation_id': conv_id}, ensure_ascii=False))
             except Exception as e:
                 logger.warning("收尾回答生成失败: %s", e)
+
+        # ── ③ 漏执行对比（2026-09-15 新增）──────────────────────
+        # 记录「评估建议了什么 vs 实际调用了什么」。这是本机制的核心价值：
+        # 「提示词教了、模型没做」这类断点从此自动浮出，不必再人工翻 traces
+        # （审计时正是靠手工翻 1081 条 trace 才发现「工具存在但不被调用」）。
+        #
+        # ⚠️ 2026-09-15 修正：**无建议也要留痕**（D4② 决策）。
+        # 首版写成 `if _sug:`，结果上线首日 5 轮对话全部无建议 → 全部没落 this trace，
+        # 从痕迹上完全看不出评估层跑过，无法区分「没评估」与「评估了但没命中」。
+        # 改判 `if assessment`：评估成功（哪怕零命中）即落痕；评估整个失败时不落痕。
+        try:
+            if assessment:
+                _sug = [s["tool"] for s in (assessment.get("suggested") or [])]
+                _called = set(called_tools)
+                db.trace_add(conv_id, "assess_outcome",
+                             data={
+                                 "suggested": _sug,
+                                 "called": sorted(_called),
+                                 "missed": [t for t in _sug if t not in _called],
+                             },
+                             message_id=user_msg_id)
+        except Exception:
+            pass  # 对比失败不影响主流程
 
         if assistant_text:
             db.msg_add(conv_id, "assistant", assistant_text, thinking=assistant_thinking)
@@ -664,7 +800,10 @@ def _start_sse(conv_id: str, user_message: str, cfg: dict,
     if persist_user:
         user_msg_id = db.msg_add(conv_id, "user", user_message)
     else:
-        user_msg_id = None
+        # 用户消息已存在（chat 主路径端点已插入 / regenerate/edit 复用），
+        # 取最后一条 user 消息 id 作为工具痕迹归属——否则痕迹 message_id 为 NULL，
+        # 前端回读时无法交错归位，会堆在结论下方
+        user_msg_id = db.msg_last_user_id(conv_id)
 
     messages = _build_chat_messages(conv_id, cfg, persona_name, user_message)
 

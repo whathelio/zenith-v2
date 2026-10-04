@@ -1,13 +1,24 @@
 """Modules API — Skills (from memories) + MCP configurations (WorkBuddy 风格)"""
 import json
+import logging
 import os
 from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException, Query
 from .. import database as db
 from .. import skill_loader
-from ..config import load_config, save_config
+from ..config import (
+    load_config,
+    save_config,
+    get_skills_dir,
+    mask_sensitive_fields,
+    restore_masked_fields,
+)
+from ..mcp_health import DEFAULT_TIMEOUT as MCP_HEALTH_TIMEOUT
+from ..mcp_health import DEFAULT_TTL as MCP_HEALTH_TTL
 
 router = APIRouter(prefix="/api/modules", tags=["modules"])
+
+logger = logging.getLogger("zenith.modules")
 
 
 # ---------- Helpers ----------
@@ -49,7 +60,11 @@ def _memory_to_skill(m: dict) -> dict:
         "steps": steps,
         "mcp_required": mcp_required,
         "tags": [t.strip() for t in (m.get("keywords") or "").split(",") if t.strip()],
-        "usage_count": 0,
+        # memories 表无计数字段（列见 database.py:467）→ 不存在真实「使用次数」，
+        # 故不再硬编码 0：读不到即返回 None（前端仅声明类型、无消费点）。
+        # 「是否/何时被使用」由 last_used_at（= memories.last_touched_at）体现。
+        "usage_count": m.get("usage_count"),
+        "last_used_at": m.get("last_touched_at") or "",
         "confirmed_by_user": 1 if m.get("importance", 0) >= 3 else 0,
         "source_conv_id": m.get("source_conv_id", ""),
         "created_at": m.get("created_at", ""),
@@ -73,6 +88,34 @@ async def list_skills(search: str = Query(""), confirmed: int = Query(-1)):
     if confirmed >= 0:
         result = [s for s in result if s["confirmed_by_user"] == confirmed]
     return result
+
+
+# ⚠️ 静态段路由必须声明在 /skills/{skill_id} **之前**。
+# FastAPI 按声明顺序匹配，动态段在前会把 /skills/stats、/skills/match、/skills/files
+# 全部吞成 skill_id="stats" → 422 int_parsing。2026-09-10 修复（原为潜伏 bug）。
+
+@router.get("/skills/stats")
+async def skills_stats():
+    all_memories = db.mem_list(type_="skill")
+    confirmed = sum(1 for m in all_memories if m.get("importance", 0) >= 3)
+    return {"loaded": len(all_memories), "total": len(all_memories), "confirmed": confirmed}
+
+
+@router.get("/skills/match")
+async def match_skills(scene: str = Query("")):
+    if not scene.strip():
+        return []
+    results = db.mem_search(scene.strip()[:30], limit=10)
+    skill_mems = [m for m in results if m.get("type") == "skill"]
+    return [_memory_to_skill(m) for m in skill_mems[:5]]
+
+
+@router.get("/skills/files")
+async def list_skill_files(dir: str = Query("")):
+    """列出 skills 目录下所有 SKILL.md 文件"""
+    skills_dir = dir or get_skills_dir()
+    scanned = skill_loader.scan_skills_dir(skills_dir)
+    return {"skills_dir": skills_dir, "count": len(scanned), "skills": scanned}
 
 
 @router.get("/skills/{skill_id}")
@@ -154,13 +197,6 @@ async def delete_skill(skill_id: int):
     return {"success": True}
 
 
-@router.get("/skills/stats")
-async def skills_stats():
-    all_memories = db.mem_list(type_="skill")
-    confirmed = sum(1 for m in all_memories if m.get("importance", 0) >= 3)
-    return {"loaded": len(all_memories), "total": len(all_memories), "confirmed": confirmed}
-
-
 # ---------- Skill Actions ----------
 
 @router.post("/skills/{skill_id}/confirm")
@@ -176,19 +212,31 @@ async def confirm_skill(skill_id: int):
 
 @router.post("/skills/{skill_id}/use")
 async def use_skill(skill_id: int):
+    """记录技能被使用一次（原为空操作，只返回 {"success": True}）。
+
+    落点说明：`{skill_id}` 是 **memories 表**的 id —— 技能以 `type='skill'` 存于 memories
+    （见 get_skill / _memory_to_skill 的取数口径）。`skills` 表当前 0 行，且全仓已无任何
+    建表/读写它的代码（grep 无 `INTO skills` / `FROM skills`），故不可作为落点。
+
+    memories **无计数字段**（列见 database.py:467），无法累加次数；按既定方案复用既有
+    `last_touched_at` 记录「最后一次被使用时间」，避免加列（加列需 migration，超出本队范围）。
+    此处直接 UPDATE 而非复用 memory_engine.mem_touch：后者会额外把 importance +1
+    （对技能是语义外副作用），且该文件正由其他队并行修改；直连更新与本文件
+    confirm_skill / improve_skill 的写法一致，更自洽。
+    """
     skill = db.mem_get(skill_id)
     if not skill or skill.get("type") != "skill":
         raise HTTPException(404, "Skill not found")
-    return {"success": True, "id": skill_id}
-
-
-@router.get("/skills/match")
-async def match_skills(scene: str = Query("")):
-    if not scene.strip():
-        return []
-    results = db.mem_search(scene.strip()[:30], limit=10)
-    skill_mems = [m for m in results if m.get("type") == "skill"]
-    return [_memory_to_skill(m) for m in skill_mems[:5]]
+    from datetime import datetime
+    now = datetime.now().astimezone().isoformat()
+    with db.db() as c:
+        c.execute("UPDATE memories SET last_touched_at = ? WHERE id = ?", (now, skill_id))
+    updated = db.mem_get(skill_id)
+    return {
+        "success": True,
+        "id": skill_id,
+        "last_used_at": (updated or {}).get("last_touched_at") or now,
+    }
 
 
 @router.post("/skills/{skill_id}/feedback")
@@ -226,21 +274,17 @@ async def improve_skill(skill_id: int, data: dict = Body(default=None)):
 
 # ---------- Skill Directory Scan (仿 WorkBuddy 目录加载) ----------
 
-@router.get("/skills/files")
-async def list_skill_files(dir: str = Query("")):
-    """列出 skills 目录下所有 SKILL.md 文件"""
-    cfg = load_config()
-    skills_dir = dir or cfg.get("skills_dir", os.path.expanduser("~/.workbuddy/skills"))
-    scanned = skill_loader.scan_skills_dir(skills_dir)
-    return {"skills_dir": skills_dir, "count": len(scanned), "skills": scanned}
-
-
 @router.post("/skills/import")
 async def import_skills_from_dir(data: dict = Body(default=None)):
-    """从目录批量导入 SKILL.md 到 memories 表"""
+    """从目录批量导入 SKILL.md 到 memories 表。
+
+    返回 scanned / imported / skipped / rejected / errors 及各自明细列表。
+    2026-09-28 D9：`imported` 由「尝试数」收紧为「**真正落库**数」；
+    `skipped`（内容去重拦截）/`rejected`（明文密钥守卫拒绝）均**未写入**，
+    此前它们被并进 imported，造成「提示导入 36 个、库里其实更少」。
+    """
     dir_path = (data or {}).get("dir", "")
-    cfg = load_config()
-    skills_dir = dir_path or cfg.get("skills_dir", os.path.expanduser("~/.workbuddy/skills"))
+    skills_dir = dir_path or get_skills_dir()
     result = skill_loader.import_all_from_dir(skills_dir)
     return result
 
@@ -277,7 +321,7 @@ async def import_skill_file(data: dict = Body(default=None)):
 
     metadata, body = skill_loader._parse_frontmatter(raw)
     name = metadata.get("name", skill_md.parent.name if skill_md.parent.name else skill_md.stem)
-    skills_dir = os.path.expanduser("~/.workbuddy/skills")
+    skills_dir = get_skills_dir()
 
     mem_id = skill_loader.import_skill_to_memory(
         name=name,
@@ -286,6 +330,18 @@ async def import_skill_file(data: dict = Body(default=None)):
         skills_dir=skills_dir,
         source_file=str(skill_md),
     )
+
+    # D9（2026-09-28）：必须判负。mem_add 契约：>0 落库成功；-1 明文密钥守卫拒绝；
+    # -2 内容去重拦截（均**未写入**）。此前无条件返回 {"success": True, "id": -2}，
+    # 前端 LibraryView 又只看 result.name → 弹「已导入技能 ✓」，而库里根本没有。
+    # 与本文件其余端点一致，改用 HTTPException（request() 会把 detail 带进 e.message，
+    # 前端现有 catch 无需改动即可如实提示）。
+    if mem_id <= 0:
+        if mem_id == -1:
+            raise HTTPException(422, "技能未导入：内容含明文密钥，被安全守卫拒绝（未写入）")
+        if mem_id == -2:
+            raise HTTPException(409, "技能未导入：与已有记忆高度相似，被去重拦截（未写入）")
+        raise HTTPException(500, f"技能写入失败：mem_add 返回 {mem_id}（未写入）")
 
     skill = db.mem_get(mem_id)
     result = {
@@ -303,7 +359,7 @@ async def import_skill_file(data: dict = Body(default=None)):
 # ---------- MCP Configurations (仿 WorkBuddy mcp.json 格式) ----------
 
 def _normalize_mcp_server(s: dict) -> dict:
-    """统一返回格式：enabled 字段兼容前��，同时保留原 disabled/command/args/serverUrl"""
+    """统一返回格式：enabled 字段兼容前端，同时保留原 disabled/command/args/serverUrl"""
     server = dict(s)
     server["enabled"] = not s.get("disabled", False) and s.get("enabled", True)
     return server
@@ -314,9 +370,57 @@ async def list_mcp():
     # 优先读取 WorkBuddy 真实 mcp.json（含 zenith-auditor 依赖项），回退 config.yaml 占位
     from ..mcp_config import load_mcp_servers
     servers = load_mcp_servers()
+    # 只读端点：掩码 headers.Authorization / env 里的凭据。实测 mcp.json 的
+    # mt5-terminal 带明文 Bearer token，原样返回等于把它交给任何本机进程。
+    # 注意 enabled/count/source 都由未掩码字段派生，掩码不影响它们。
+    servers = mask_sensitive_fields(servers)
     enabled = len([s for s in servers if s.get("enabled")])
     return {"servers": servers, "count": len(servers), "enabled": enabled,
             "source": "workbuddy" if servers and any(s.get("command") or s.get("serverUrl") for s in servers) else "config"}
+
+
+# 注意：这两个 health 路由必须留在 /mcp/{name} 系列之前（静态段优先），
+# 否则 "health" 会被当成 name 匹配走。
+@router.get("/mcp/health")
+async def mcp_health_all(
+    refresh: bool = Query(False, description="忽略 TTL 缓存，全部重新握手"),
+    timeout: float = Query(MCP_HEALTH_TIMEOUT, ge=1, le=60, description="单个服务握手超时（秒）"),
+    ttl: float = Query(MCP_HEALTH_TTL, ge=0, le=3600, description="结果缓存秒数"),
+):
+    """MCP 服务真实健康检查。
+
+    与 `GET /mcp` 的区别：`/mcp` 的 enabled 只是配置开关（开关开了不代表能用），
+    这里做真实握手（stdio 拉起子进程 / HTTP initialize + tools/list），
+    返回 ok / error / disabled / unknown，并附延迟、工具数与失败原因。
+
+    默认走 TTL 缓存，避免每次开面板都拉起全部子进程；`refresh=1` 强制重测。
+    """
+    from .. import mcp_health
+    from ..mcp_config import load_mcp_servers
+
+    servers = load_mcp_servers()
+    return await mcp_health.health_snapshot(servers, timeout=timeout, ttl=ttl, refresh=refresh)
+
+
+@router.get("/mcp/health/{name}")
+async def mcp_health_one(
+    name: str,
+    refresh: bool = Query(False, description="忽略缓存，重新握手"),
+    timeout: float = Query(MCP_HEALTH_TIMEOUT, ge=1, le=60, description="握手超时（秒）"),
+):
+    """单个 MCP 服务的真实健康检查。"""
+    from .. import mcp_health
+    from ..mcp_config import load_mcp_servers
+
+    cfg = next((s for s in load_mcp_servers() if s.get("name") == name), None)
+    if cfg is None:
+        raise HTTPException(404, f"MCP 服务不存在: {name}")
+    if refresh:
+        mcp_health.invalidate(name)
+        return await mcp_health.check_server(cfg, timeout=timeout)
+    # 复用 TTL 缓存语义：命中直接返回，未命中才握手
+    snap = await mcp_health.health_snapshot([cfg], timeout=timeout)
+    return (snap["servers"] or [{}])[0]
 
 
 @router.post("/mcp")
@@ -331,12 +435,21 @@ async def add_mcp(data: dict = Body(default=None)):
     if not name:
         raise HTTPException(400, "name is required")
 
-    # 构建 WorkBuddy 风格的��目
+    # ⚠️ 防「读→写回」：headers 是 GET /api/modules/mcp 的掩码字段。调用方若把读到的
+    # server 对象整包提交回来，必须把掩码换回真值，否则 token 会被写成 `Bear***yz（len=49）`。
+    # （今天的前端只提交表单里的 name/url/enabled，不触发该路径；这是防后续加编辑表单踩坑。）
+    from ..mcp_config import load_mcp_servers
+    existing = next((s for s in load_mcp_servers() if s.get("name") == name), None)
+    headers = restore_masked_fields(
+        data.get("headers") or {}, (existing or {}).get("headers") or {}
+    )
+
+    # 构建 WorkBuddy 风格的条目
     entry = {"name": name, "disabled": data.get("disabled", False)}
     if data.get("serverUrl"):
         entry["serverUrl"] = data["serverUrl"]
-        if data.get("headers"):
-            entry["headers"] = data["headers"]
+        if headers:
+            entry["headers"] = headers
     elif data.get("command"):
         entry["command"] = data["command"]
         entry["args"] = data.get("args", [])
@@ -362,6 +475,9 @@ async def add_mcp(data: dict = Body(default=None)):
 
     cfg["mcp_servers"] = servers
     save_config(cfg)
+    # 配置变了 → 该服务的健康结论作废（事件驱动失效，不做后台轮询）
+    from .. import mcp_health
+    mcp_health.invalidate(name)
     return {"success": True, "server": entry}
 
 
@@ -381,8 +497,14 @@ async def update_mcp(name: str, data: dict = Body(default=None)):
     else:
         raise HTTPException(400, "需要 enabled 或 disabled 字段")
     try:
-        from .mcp_config import save_mcp_override
+        from .. import mcp_health
+        # 注意是 `..mcp_config`（backend 包），不是 `.mcp_config`（backend.routers 包）。
+        # 写错时此处会抛 ModuleNotFoundError，被下方 except 吞成 500，
+        # 表现为「UI 上切换启用开关一直失败」。
+        from ..mcp_config import save_mcp_override
         save_mcp_override(name, disabled)
+        # 启停变化直接影响「是否握手」，必须让缓存失效
+        mcp_health.invalidate(name)
     except Exception as e:
         raise HTTPException(500, f"保存覆盖失败: {e}")
     return {"success": True, "name": name, "disabled": disabled}
@@ -396,11 +518,60 @@ async def delete_mcp(name: str):
     save_config(cfg)
     # 同时清除本地覆盖，避免残留禁用状态
     try:
-        from .mcp_config import clear_mcp_override
+        from .. import mcp_health
+        from ..mcp_config import clear_mcp_override
         clear_mcp_override(name)
+        mcp_health.invalidate(name)
     except Exception:
         pass
     return {"success": True}
+
+
+# ---------- MCP 脚本导入的路径白名单 ----------
+#
+# 这个端点的产出会被 MCP 客户端当子进程拉起执行（mcp_client._connect_stdio），
+# 而端点本身没有鉴权（服务只监听 127.0.0.1，本机任意进程都能 POST）——
+# 「接受任意路径」于是等价于「本机任意进程可让 Zenith 执行任意脚本」。
+# 因此把范围收到三处**约定位置**：项目内 / 技能目录候选链 / WorkBuddy 配置域
+# （实测 7 个 stdio server 的脚本都落在 $WORKBUDDY_CONFIG_DIR\skills\... 下），
+# 另加用户在 config.yaml 里显式声明的 mcp.allowed_import_dirs。
+_ALLOWED_IMPORT_CONFIG_KEY = "allowed_import_dirs"
+
+
+def _mcp_import_allowed_roots() -> list[Path]:
+    """返回允许被 import-file 注册的目录（已 resolve、去重保序）。"""
+    from ..config import PROJECT_DIR, get_skills_dir_candidates
+
+    roots: list[Path] = [PROJECT_DIR]
+    # 技能目录是「多个并列的约定位置」，只按当前生效那个做白名单会误挡其他位置。
+    # 无需再单独 append get_skills_dir()：其返回值必为候选链中的元素（见 config.py
+    # get_skills_dir 实现），候选链已覆盖；下方 resolve + seen 去重再做兜底。
+    roots.extend(get_skills_dir_candidates())
+    env_dir = os.environ.get("WORKBUDDY_CONFIG_DIR", "").strip()
+    if env_dir:
+        roots.append(Path(env_dir))
+    roots.append(Path.home() / ".workbuddy")
+    extra = (load_config().get("mcp") or {}).get(_ALLOWED_IMPORT_CONFIG_KEY, [])
+    if isinstance(extra, list):
+        roots.extend(Path(str(x)).expanduser() for x in extra if str(x).strip())
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            resolved = r.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(resolved)
+    return out
+
+
+def _mcp_import_outside_roots(path: Path) -> bool:
+    """path 是否在白名单之外。Windows 下 PurePath 比较自带大小写折叠。"""
+    return not any(path.is_relative_to(r) for r in _mcp_import_allowed_roots())
 
 
 @router.post("/mcp/import-file")
@@ -409,6 +580,8 @@ async def import_mcp_file(data: dict = Body(default=None)):
     接受：{ "file_path": "/path/to/mcp_server.py", "name": "my-mcp" }
           { "file_path": "/path/to/mcp_server.js", "name": "my-mcp", "args": ["--flag"] }
           { "file_path": "/path/to/mcp_server.py" } — name 自动从文件名推导
+          { "file_path": "/path/to/mcp_server.py", "confirm_outside": true }
+              — 目录白名单之外的脚本，必须显式确认才允许注册
 
     自动检测：
       .py   → command = python 解释器路径
@@ -423,11 +596,28 @@ async def import_mcp_file(data: dict = Body(default=None)):
         raise HTTPException(400, "file_path is required")
 
     path = Path(os.path.expanduser(file_path)).resolve()
+
+    # 白名单之外的路径要求显式确认：本机手工导入第三方 server 是真实需求，
+    # 不硬挡；但必须由调用方明确表达「我知道这是目录外的脚本」。
+    if _mcp_import_outside_roots(path):
+        if not data.get("confirm_outside"):
+            allowed = " ｜ ".join(str(r) for r in _mcp_import_allowed_roots())
+            raise HTTPException(
+                403,
+                f"脚本路径不在允许目录内: {path}。允许的目录: {allowed}。"
+                f"如确实需要注册目录外脚本，请显式传 confirm_outside=true，"
+                f"或把所在目录加入 config.yaml 的 mcp.{_ALLOWED_IMPORT_CONFIG_KEY}。",
+            )
+        logger.warning("import-file 注册了目录白名单之外的脚本（已显式确认）: %s", path)
+
     if not path.is_file():
         raise HTTPException(404, f"文件不存在: {file_path}")
 
     suffix = path.suffix.lower()
     extra_args = data.get("args", [])
+    # args 会原样拼进子进程 argv，非字符串元素会让 create_subprocess_exec 崩在启动阶段
+    if not isinstance(extra_args, list) or not all(isinstance(a, str) for a in extra_args):
+        raise HTTPException(400, "args 必须是字符串数组")
 
     # 自动推导运行时
     python_runtimes = [
@@ -486,6 +676,9 @@ async def import_mcp_file(data: dict = Body(default=None)):
     cfg["mcp_servers"] = servers
     save_config(cfg)
 
+    from .. import mcp_health
+    mcp_health.invalidate(entry.get("name"))
+
     return {
         "success": True,
         "server": entry,
@@ -524,7 +717,7 @@ async def modules_stats():
     from ..mcp_config import load_mcp_servers
     servers = load_mcp_servers()
     enabled = len([s for s in servers if s.get("enabled")])
-    skills_dir = load_config().get("skills_dir", "")
+    skills_dir = get_skills_dir()
     files_count = 0
     if skills_dir:
         files_count = len(skill_loader.scan_skills_dir(skills_dir))

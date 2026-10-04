@@ -1,5 +1,26 @@
-"""Schedules API — 日程 CRUD + 日历 + 提醒"""
+"""Schedules API — 日程 CRUD + 提醒确认（日历/提醒 presets 由 app.py 提供）
+
+⚠️ 2026-09-11 修正：本 router **只保留 app.py 未注册的路径**（从 12 条删到 7 条）。
+
+删除的 5 条**全部被 app.py 遮蔽、从未执行过**：
+
+    /api/reminders/presets    ← app.py:722
+    /api/calendar/templates   ← app.py:749
+    /api/calendar/week        ← app.py:754
+    /api/calendar/month       ← app.py:827
+    /api/calendar             ← app.py:1241
+
+原因：`schedules.router` 在 `app.py:1475` 才 include，**晚于** app.py 里那批
+`@app.get(...)` 装饰器；FastAPI/Starlette 按**注册顺序**匹配，先注册者胜。
+
+**删除不改变任何运行时行为**（它们本就从未执行）。附带消除一个地雷：
+被删的 `/api/calendar/week` 那版返回的是 dict-of-days，与前端契约不符 ——
+一旦遮蔽关系反转就会直接打崩周视图。
+
+用 `tools/audit/duplicate_routes.py` 可复现此检测。
+"""
 from fastapi import APIRouter, HTTPException, Body, Request
+
 from .. import database as db
 from ..validators.sanitize_guard import guard_store
 
@@ -114,12 +135,6 @@ async def schedule_ai_plan(data: dict = Body(default=None)):
     return result
 
 
-@router.get("/api/reminders/presets")
-async def get_reminder_presets():
-    from ..schedule_reminder import REMINDER_PRESETS
-    return REMINDER_PRESETS
-
-
 @router.post("/api/reminders/ack")
 async def ack_reminders(data: dict = Body(default=None)):
     from ..schedule_reminder import ack_reminders as _ack
@@ -129,84 +144,3 @@ async def ack_reminders(data: dict = Body(default=None)):
     return {"success": True, "acked": _ack(ids)}
 
 
-@router.get("/api/calendar/templates")
-async def get_calendar_templates():
-    return [
-        {"id": "nonfarm", "name": "非农就业", "category": "economic", "importance": 5, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "cpi", "name": "CPI", "category": "economic", "importance": 5, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "ppi", "name": "PPI", "category": "economic", "importance": 4, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "fomc", "name": "FOMC 决议", "category": "economic", "importance": 5, "country": "US", "duration": 60, "remind_before": 2880},
-        {"id": "gdp", "name": "GDP", "category": "economic", "importance": 4, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "retail_sales", "name": "零售销售", "category": "economic", "importance": 3, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "jobless_claims", "name": "初请失业", "category": "economic", "importance": 3, "country": "US", "duration": 30, "remind_before": 1440},
-        {"id": "pmi", "name": "PMI", "category": "economic", "importance": 4, "country": "CN", "duration": 30, "remind_before": 1440},
-    ]
-
-
-@router.get("/api/calendar/week")
-async def get_calendar_week(date: str = ""):
-    from datetime import datetime, timedelta
-    if date:
-        base = datetime.strptime(date, "%Y-%m-%d")
-    else:
-        base = datetime.now()
-    monday = base - timedelta(days=base.weekday())
-    days = [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-    result = {}
-    for d in days:
-        result[d] = db.sch_list(date_from=d, date_to=d)
-    return result
-
-
-@router.get("/api/calendar/month")
-async def get_calendar_month(date: str = ""):
-    from datetime import datetime, timedelta
-    if date:
-        base = datetime.strptime(date, "%Y-%m-%d")
-    else:
-        base = datetime.now()
-    start = base.replace(day=1)
-    if start.month == 12:
-        end = start.replace(year=start.year + 1, month=1, day=1)
-    else:
-        end = start.replace(month=start.month + 1, day=1)
-    result = {}
-    d = start
-    while d < end:
-        ds = d.strftime("%Y-%m-%d")
-        result[ds] = db.sch_list(date_from=ds, date_to=ds)
-        d += timedelta(days=1)
-    return result
-
-
-@router.get("/api/calendar")
-async def get_calendar(date: str = "", month: str = ""):
-    from datetime import datetime, timedelta
-    days = {}
-    if month:
-        y, m = map(int, month.split("-"))
-        start = datetime(y, m, 1)
-        if m == 12:
-            end = datetime(y + 1, 1, 1)
-        else:
-            end = datetime(y, m + 1, 1)
-        d = start
-        while d < end:
-            days[d.strftime("%Y-%m-%d")] = []
-            d += timedelta(days=1)
-    else:
-        if date:
-            d = datetime.strptime(date, "%Y-%m-%d")
-        else:
-            d = datetime.now()
-        days = {d.strftime("%Y-%m-%d"): []}
-    items = db.sch_list()
-    for item in items:
-        st = item.get("start_time", "")[:10]
-        if st in days:
-            days[st].append(dict(item))
-    return {
-        "date": date or datetime.now().strftime("%Y-%m-%d"),
-        "days": days,
-        "all_schedules": [dict(r) for r in items],
-    }

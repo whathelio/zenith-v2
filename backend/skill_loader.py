@@ -7,6 +7,19 @@ from pathlib import Path
 
 logger = logging.getLogger("zenith.skill_loader")
 
+# 技能导入路径：被 mem_add 的**内容相似度去重**拦截（返回 -2）时，是否以
+# `dedup=False` 重试一次（D9，2026-09-28）。
+#
+# 为什么要绕：mem_add 的去重判定是拿**全库记忆**（不限 type）做候选池、阈值 0.75，
+# 目标是抑制「对话蒸馏出的记忆」膨胀。而目录技能是**磁盘的确定性镜像**：
+#   - 技能之间同名重复，已由 import_skill_to_memory 的 name-upsert 拦掉；
+#   - 技能与某条对话记忆"像"，不构成"该技能是重复的"证据 —— 属误伤。
+# 被误拦的后果极其隐蔽：技能没写进库，但 import_all_from_dir 仍把它计入 imported，
+# 且**每次启动重试都会被同样拦掉** → 永久静默丢失。
+#
+# 回滚：改为 False 即恢复「被拦即丢」的旧行为（其余分类/告警逻辑仍生效）。
+SKILL_IMPORT_RETRY_ON_DEDUP = True
+
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """解析 YAML frontmatter（零依赖，纯正则）。
@@ -120,8 +133,17 @@ def scan_skills_dir(skills_dir: str) -> list[dict]:
 
 def import_skill_to_memory(name: str, frontmatter: dict, body: str,
                            skills_dir: str = "", source_file: str = "") -> int:
-    """将解析后的 SKILL.md 导入到 memories 表。
-    返回 memory_id，已存在则更新。"""
+    """将解析后的 SKILL.md 导入到 memories 表（upsert：按 name 命中则 UPDATE，否则 INSERT）。
+
+    **返回值契约**（与 `database.mem_add` 对齐，2026-09-28 D9 显性化）：
+      - `> 0`  : 写入成功，值为 memory_id（新增或更新）
+      - `-1`   : 内容含明文密钥，被 `mem_add` 的密钥守卫拒绝，**未写入**
+      - `-2`   : 被 `mem_add` 的内容相似度去重拦截，**未写入**
+                 （若 `SKILL_IMPORT_RETRY_ON_DEDUP` 为 True，会先以 dedup=False 重试，
+                 重试成功则返回真实 id，仍失败/关闭开关时才把 -2 透出）
+    调用方**必须判负**，否则会把"写入失败"当成功 —— 见 routers/modules.py 与
+    import_all_from_dir 的处理。
+    """
     from . import database as db
 
     description = frontmatter.get("description", "")
@@ -171,22 +193,48 @@ def import_skill_to_memory(name: str, frontmatter: dict, body: str,
             return m["id"]
 
     # 新建
-    mem_id = db.mem_add(
-        type_="skill",
-        content=content,
-        importance=3,
-        keywords=keywords,
-        source_conv_id=f"file:{source_file}" if source_file else "",
-    )
-    logger.info("技能已导入: %s (id=%s)", name, mem_id)
+    def _insert(dedup: bool) -> int:
+        return db.mem_add(
+            type_="skill",
+            content=content,
+            importance=3,
+            keywords=keywords,
+            source_conv_id=f"file:{source_file}" if source_file else "",
+            dedup=dedup,
+        )
+
+    mem_id = _insert(True)
+    if mem_id == -2 and SKILL_IMPORT_RETRY_ON_DEDUP:
+        # 去重门禁面向「对话记忆」，对目录技能属误伤 → 按磁盘权威重试一次
+        # （见模块顶部 SKILL_IMPORT_RETRY_ON_DEDUP 的完整依据）
+        logger.warning("技能被内容去重拦截，按目录权威重试写入: %s", name)
+        mem_id = _insert(False)
+
+    if mem_id < 0:
+        logger.warning("技能写入失败（未落库）: %s (code=%s)", name, mem_id)
+    else:
+        logger.info("技能已导入: %s (id=%s)", name, mem_id)
     return mem_id
 
 
 def import_all_from_dir(skills_dir: str) -> dict:
-    """扫描目录并批量导入所有 SKILL.md 到 memories 表"""
+    """扫描目录并批量导入所有 SKILL.md 到 memories 表。
+
+    返回口径（2026-09-28 D9 修正）：
+      - `imported` : **真正落库**的条数（新增 + 更新，即 mem_id > 0）。
+                     修正前它把被守卫拒绝/去重拦截的条目也算作成功 —— 表现为
+                     「日志说导入 36 个，库里其实少几个」且每次启动重复丢同一批。
+      - `skipped`  : 被内容去重拦截、重试后仍未落库（mem_id == -2）
+      - `rejected` : 被明文密钥守卫拒绝（mem_id == -1）
+      - `errors`   : 解析/读写异常，或 mem_add 返回了预期外的码
+    新增的三个键是**追加**的：`scanned/imported/errors/imported_list/error_list`
+    保持原语义与原名，旧调用方不受影响。
+    """
     scanned = scan_skills_dir(skills_dir)
-    imported = []
-    errors = []
+    imported: list = []
+    skipped: list = []
+    rejected: list = []
+    errors: list = []
 
     for skill in scanned:
         try:
@@ -202,14 +250,29 @@ def import_all_from_dir(skills_dir: str) -> dict:
                 skills_dir=skills_dir,
                 source_file=str(skill_md),
             )
-            imported.append({"name": skill["name"], "id": mem_id})
+
+            if mem_id > 0:
+                imported.append({"name": skill["name"], "id": mem_id})
+            elif mem_id == -2:
+                skipped.append({"name": skill["name"], "id": mem_id, "reason": "dedup"})
+                logger.warning("技能未落库（内容去重拦截）: %s", skill["name"])
+            elif mem_id == -1:
+                rejected.append({"name": skill["name"], "id": mem_id, "reason": "secret_guard"})
+                logger.warning("技能未落库（明文密钥守卫拒绝）: %s", skill["name"])
+            else:
+                errors.append({"name": skill["name"],
+                               "error": f"mem_add 返回预期外的码 {mem_id}"})
         except Exception as e:
             errors.append({"name": skill["name"], "error": str(e)})
 
     return {
         "scanned": len(scanned),
         "imported": len(imported),
+        "skipped": len(skipped),
+        "rejected": len(rejected),
         "errors": len(errors),
         "imported_list": imported,
+        "skipped_list": skipped,
+        "rejected_list": rejected,
         "error_list": errors,
     }

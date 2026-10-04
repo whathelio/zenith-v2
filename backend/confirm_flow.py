@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from .database import sch_update, note_update, sch_list, db
 from .timezone import now_tz
+from .validators.sanitize_guard import GUIDE_SHIELD, refusal_text
 
 logger = logging.getLogger("zenith.confirm")
 
@@ -47,7 +48,7 @@ def confirm_proposal(proposal_type: str, proposal_id: int) -> dict:
         sch_update(proposal_id, {"status": "confirmed", "confirmed_at": now})
         return {"success": True, "message": f"日程 (ID:{proposal_id}) 已确认保存"}
     elif proposal_type == "note":
-        note_update(proposal_id, {"status": "confirmed"})
+        note_update(proposal_id, {"status": "confirmed", "confirmed_at": now})
         return {"success": True, "message": f"笔记 (ID:{proposal_id}) 已确认保存"}
     return {"success": False, "message": "未知类型"}
 
@@ -75,13 +76,43 @@ def modify_proposal(proposal_type: str, proposal_id: int, changes: dict) -> dict
         filtered = {k: v for k, v in changes.items() if k in allowed}
         filtered["status"] = "confirmed"
         filtered["confirmed_at"] = now
-        sch_update(proposal_id, filtered)
+        # 2026-09-16（判负补齐，同类缺陷）：sch_update 今天已改为「可能返回 False」
+        # （守卫命中），而本分支的 filtered 含 title/description → 守卫**可达**。
+        # 与下方笔记分支完全同型：不判负就会对「什么都没写」回「已修改并确认」。
+        if not sch_update(proposal_id, filtered):
+            logger.warning("日程「修改并确认」被守卫拒绝（未写入）: sid=%s", proposal_id)
+            return {
+                "success": False,
+                "message": refusal_text(
+                    f"日程 (ID:{proposal_id})",
+                    action="未更新",
+                    guide=GUIDE_SHIELD,
+                ),
+            }
         return {"success": True, "message": f"日程 (ID:{proposal_id}) 已修改并确认"}
     elif proposal_type == "note":
         allowed = {"title", "content", "tags"}
         filtered = {k: v for k, v in changes.items() if k in allowed}
         filtered["status"] = "confirmed"
-        note_update(proposal_id, filtered)
+        # 「修改并确认」与 confirm_proposal 语义相同（都是用户确认），故同样落确认时点；
+        # 否则走此路径的笔记 confirmed_at 仍为 NULL，时延依旧不可追溯。
+        filtered["confirmed_at"] = now
+        # 2026-09-16（判负补齐）：note_update 下沉落库守卫后开始可能返回 False。
+        # 本分支的 filtered 含 title/content（用户在「修改并确认」卡片里填的自由文本），
+        # 故守卫**可达** —— 不判负就会在「什么都没写」的情况下回「已修改并确认」，
+        # 把拒绝谎报成成功（用户以为改动已落地，实际库里还是原内容）。
+        if not note_update(proposal_id, filtered):
+            logger.warning(
+                "笔记「修改并确认」被守卫拒绝（未写入）: nid=%s", proposal_id
+            )
+            return {
+                "success": False,
+                "message": refusal_text(
+                    f"笔记 (ID:{proposal_id})",
+                    action="未更新",
+                    guide=GUIDE_SHIELD,
+                ),
+            }
         return {"success": True, "message": f"笔记 (ID:{proposal_id}) 已修改并确认"}
     return {"success": False, "message": "未知类型"}
 
@@ -209,13 +240,31 @@ def _execute_action(action: dict) -> str:
             if not db.note_get(nid):
                 raise ValueError(f"笔记 #{nid} 不存在，合并中止")
         # 创建合并笔记
+        # 2026-09-15: 合并是「经确认卡片执行」的动作（用户点确认才落库），与 confirm_proposal
+        # 同属「用户确认后落库」语义，故同样落确认时点，避免同类缺陷只修一半。
         new_id = db.note_add({
             "title": new_title,
             "content": merged_content,
             "tags": merged_tags,
             "source": "merge",
             "status": "confirmed",
+            "confirmed_at": now_tz().isoformat(),
         })
+        # 2026-09-16（修复：守卫下沉后新引入的数据丢失风险）：
+        # note_add 下沉落库守卫后开始可能返回 -1 —— 语义是「被拒绝，什么都不写」。
+        # 而下方 delete 分支不判返回值：合并内容含明文密钥时，新笔记根本没落库，
+        # 原稿却照删，还回「已合并 N 篇笔记为 #-1」把失败谎报成成功 ——
+        # 一次操作同时丢失 N 篇原稿且无任何提示。此前 note_add 从不返回负值，
+        # 故此风险由本次下沉新引入。
+        # 必须在任何 note_del 之前判负并中止（与同文件 edit_memory 分支对守卫的处理同范式）。
+        if new_id < 0:
+            logger.warning(
+                "合并笔记被守卫拒绝（未写入、原稿未改动）: nids=%s title=%s",
+                nids, new_title[:40],
+            )
+            raise ValueError(
+                refusal_text("合并", action="原稿未改动", guide=GUIDE_SHIELD)
+            )
         deleted = []
         if not keep_originals:
             for nid in nids:
@@ -240,7 +289,17 @@ def _execute_action(action: dict) -> str:
         changes = {k: v for k, v in p.items() if k in ("title", "content", "tags") and v is not None}
         if not changes:
             raise ValueError("没有可应用的修改字段")
-        db.note_update(nid, changes)
+        # 2026-09-16（判负补齐）：note_update 下沉落库守卫后开始可能返回 False。
+        # 此前不判负 → changes 含明文密钥时笔记根本没改写，却照回「已修改笔记 #nid」，
+        # 把拒绝谎报成成功（与 merge_notes 的 note_add 漏判负同源，那次的代价是丢 2 篇原稿；
+        # 本分支单阶段、不涉及删除，故最坏后果是「静默未生效」）。
+        # 与同文件 edit_memory 分支同范式：raise —— confirm_action 会捕获异常并把动作
+        # 放回 _pending_actions 允许重试，同时向用户返回 success=False。
+        if not db.note_update(nid, changes):
+            logger.warning("edit_note 被守卫拒绝（未写入）: nid=%s", nid)
+            raise ValueError(
+                refusal_text("笔记更新", action="未改动", guide=GUIDE_SHIELD)
+            )
         return f"已修改笔记 #{nid}: {changes.get('title', note.get('title', ''))[:40]}"
 
     if t == "delete_memory":
@@ -270,7 +329,9 @@ def _execute_action(action: dict) -> str:
             keywords=changes.get("keywords", ""),
         )
         if not ok:
-            raise ValueError("更新被守卫拒绝（内容含敏感信息）")
+            raise ValueError(
+                refusal_text("记忆更新", action="未改动", guide=GUIDE_SHIELD)
+            )
         return f"已修改记忆 #{mid}: {changes.get('content', mem.get('content', ''))[:40]}"
 
     if t == "edit_file":
