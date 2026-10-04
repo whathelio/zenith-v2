@@ -50,7 +50,13 @@ class TestMemTouch:
 
 
 class TestConsolidateDecay:
-    """K4 — 衰减跳过 user_edited，按 last_touched_at 判断"""
+    """K4 — 衰减契约（2026-09-11 修正）
+
+    修正原因：旧契约把 `COALESCE(last_touched_at, recorded_at, created_at)` 当时间基准，
+    于是「入库满 30 天」被误判成「30 天没被引用」→ 每 6 小时砍 1 点 importance，
+    实测把 63.6% 的记忆压到 importance=1（检索排序垫底）。
+    新契约：**只有存在真实引用记录（last_touched_at 非空）才谈得上「很久没被引用」**。
+    """
 
     def test_decay_skips_user_edited(self, test_db):
         old = "2026-01-01T00:00:00"
@@ -60,17 +66,35 @@ class TestConsolidateDecay:
         mid_normal = mem_add(type_="fact", content="普通旧记忆", importance=2)
         mid_edited = mem_add(type_="fact", content="手工编辑旧记忆", importance=2)
         with db() as c:
+            # 两条都带「30 天前的引用记录」，唯一差别是 user_edited
             c.execute(
-                "UPDATE memories SET created_at=?, recorded_at=NULL, last_touched_at=NULL WHERE id=?",
-                (old, mid_normal),
+                "UPDATE memories SET created_at=?, recorded_at=?, last_touched_at=? WHERE id=?",
+                (old, old, old, mid_normal),
             )
             c.execute(
-                "UPDATE memories SET created_at=?, recorded_at=NULL, last_touched_at=NULL, user_edited=1 WHERE id=?",
-                (old, mid_edited),
+                "UPDATE memories SET created_at=?, recorded_at=?, last_touched_at=?, user_edited=1 WHERE id=?",
+                (old, old, old, mid_edited),
             )
         mem_consolidate()
         assert mem_get(mid_edited)["importance"] == 2  # 手工记忆不衰减
         assert mem_get(mid_normal)["importance"] == 1  # 普通记忆衰减
+
+    def test_no_touch_record_never_decays(self, test_db):
+        """B3 修复点：没有引用记录（last_touched_at 为空）的记忆，即使入库很久也不衰减。
+
+        这正是旧实现把 1164 条历史记忆压到 importance=1 的路径。
+        """
+        old = "2026-01-01T00:00:00"
+        for i in range(8):
+            mem_add(type_="fact", content=f"填充记忆B{i}", importance=2)
+        mid = mem_add(type_="fact", content="从未被引用的旧记忆", importance=2)
+        with db() as c:
+            c.execute(
+                "UPDATE memories SET created_at=?, recorded_at=?, last_touched_at=NULL WHERE id=?",
+                (old, old, mid),
+            )
+        mem_consolidate()
+        assert mem_get(mid)["importance"] == 2, "无引用记录不应被判定为陈旧"
 
 
 class TestSimilarityThreshold:

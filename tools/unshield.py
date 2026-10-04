@@ -21,16 +21,26 @@ def load_map() -> dict:
 
 
 def unmask_text(text: str) -> str:
-    """还原 {{SEC_xxx}} 占位符为原始值"""
+    """还原 {{SEC_xxx}} 占位符为原始值。
+
+    ⚠️ 2026-09-11 修正：原正则 `\\{\\{([A-Za-z0-9_]+)\\}\\}` **不限定 SEC_ 前缀**，
+    与 shield.py 的产出格式（`SEC_{next_id:03d}`，见 shield.py:83）不一致 ——
+    它会把任何 `{{任意词}}` 都送去查表；一旦诱导 AI 输出与映射表键同名的占位符，
+    就会被还原，**违背「绝不还原」铁律**。
+
+    现与 shield.py 的产出格式、以及本文件 __main__ 的判据（`\\{\\{SEC_\\d+\\}\\}`）对齐。
+    """
     mapping = load_map()
     if not mapping:
         return text
 
     def replace_placeholder(match):
         key = match.group(1)
+        if not key.startswith("SEC_"):        # 双保险：只认 shield 生成的键
+            return match.group(0)
         return mapping.get(key, match.group(0))
 
-    return re.sub(r"\{\{([A-Za-z0-9_]+)\}\}", replace_placeholder, text)
+    return re.sub(r"\{\{(SEC_\d+)\}\}", replace_placeholder, text)
 
 
 def get_clipboard():

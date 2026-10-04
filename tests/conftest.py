@@ -1,6 +1,8 @@
 """pytest fixtures — 内存数据库 + 隔离测试环境"""
 import os
+import shutil
 import sys
+import tempfile
 import pytest
 from pathlib import Path
 
@@ -11,6 +13,21 @@ sys.path.insert(0, str(PROJECT_DIR / "backend"))
 
 # 全局设置测试模式
 os.environ["ZENITH_TESTING"] = "1"
+
+# 2026-09-16: 重定向配置目录到临时区（此前只重定向了 DB，漏了这一项）。
+# 症状：test_api_chat 里 `PUT /api/settings {"model":"test-model","temperature":0.5}`
+# 会**直接写进生产配置** config/config.yaml，实测该文件 mtime 随每次 pytest 变化，
+# 把用户的 model 改成 "test-model"、temperature 改成 0.5。
+# 做法：把生产 config.yaml 拷一份到临时目录 —— 测试读写的仍是同一份内容，但落点在临时区。
+_TEST_CONF_DIR = Path(tempfile.gettempdir()) / "zenith_test_config"
+try:
+    _TEST_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    _prod_conf = PROJECT_DIR / "config" / "config.yaml"
+    if _prod_conf.exists():
+        shutil.copyfile(_prod_conf, _TEST_CONF_DIR / "config.yaml")
+except Exception:
+    pass
+os.environ["ZENITH_CONFIG_DIR"] = str(_TEST_CONF_DIR)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -25,6 +42,38 @@ def _cleanup_test_db():
                 os.remove(p)
     except Exception:
         pass
+    # 2026-09-15: memory_engine 的缓冲落盘文件也落在同一临时目录（= DB_PATH.parent），
+    # 此前只清 .db / -wal / -shm，会在 %TEMP% 累积 memory_buffer.json 残留。
+    try:
+        from backend.memory_engine import _BUFFER_PATH as _mb
+        for p in (str(_mb), str(_mb) + ".tmp"):
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
+    # 2026-09-28（D16）：配置副本目录（见本文件 :22）此前**未清** —— 它是本会话自建的
+    # 夹具，却不随会话结束消失。虽**不累积**（固定目录 + 每次 copyfile 覆盖写），
+    # 但留着就是 %TEMP% 里一处恒定残留。下次 pytest 会用 mkdir + copyfile 原样重建，
+    # 故删除无副作用。
+    #
+    # ⚠️ 安全前置（必留）：先断言目标**确实是「临时目录下的 zenith_test_config」**。
+    #    宁可不清，也绝不能误伤生产配置目录 `config/` —— 那会把用户设置删掉。
+    #
+    # 权衡：本机装了火绒，它把 `os.remove` 重定向到回收站 → 本段会让每次 pytest 多
+    # 1~2 条回收站记录（与上面几段既有清理同性质）。换来的是 %TEMP% 真正零残留。
+    # 若要回退：删掉本段即可（不影响前面几段的清理）。
+    try:
+        _tmp_root = Path(tempfile.gettempdir()).resolve()
+        _conf_target = Path(_TEST_CONF_DIR).resolve()
+        if (_conf_target.parent == _tmp_root
+                and _conf_target.name.startswith("zenith_test_config")
+                and _conf_target.is_dir()):
+            for _p in _conf_target.iterdir():
+                if _p.is_file():
+                    os.remove(_p)
+            os.rmdir(_conf_target)
+    except Exception:
+        pass
 
 
 @pytest.fixture(scope="function")
@@ -34,7 +83,19 @@ def test_db():
 
     init_db()
 
-    # 返回一个可以直接用的连接（用于断言验证）
+    # 2026-09-11 补上真正的隔离（此前 docstring 声称「完全隔离」，实际没有）：
+    #   DB_PATH 并非 :memory:，而是**会话级共享的临时文件**（模块导入时 mkstemp 一次），
+    #   init_db() 只建表、不清数据 → 上一个测试写入的记忆会残留到下一个测试。
+    #   此前无感，是因为没有任何写入路径会因「库中已存在近似内容」而拒绝写入；
+    #   自 mem_add 内置去重门禁后，残留会直接让后续 mem_add 返回 -2（未写入），
+    #   表现为 mem_get(mid) 返回 None 这种与代码本身无关的诡异失败。
+    with db_ctx() as conn:
+        for tbl in ("memories", "notes"):
+            try:
+                conn.execute(f"DELETE FROM {tbl}")
+            except Exception:
+                pass
+
     with db_ctx() as conn:
         yield conn
 

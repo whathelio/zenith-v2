@@ -1,6 +1,28 @@
 """工具系统测试 — 字典分发 + smart_classify + 日程工具"""
 import pytest
-from backend.tools import execute_tool, _TOOL_HANDLERS, _handle_search_memory, _handle_list_schedule
+from backend.tools import execute_tool, _TOOL_HANDLERS
+
+
+def _assert_tool_contract(result, tool: str):
+    """工具返回契约 —— 取代原先的 `assert "success" in result`。
+
+    ⚠️ 2026-09-12：那种写法只检查**键存在**，`{"success": False}` 也能通过，
+    等于什么都没验证 —— **工具彻底失效也不会被测试发现**。
+
+    本函数断言三件事：
+      1. 返回结构化 dict（即没抛异常）；
+      2. `success` 是**真布尔**（不是字符串/None）；
+      3. **失败时必须给出说明** —— 外部依赖缺失（无 LLM 密钥 / 网关离线）可以失败，
+         但不允许静默失败：调用方必须能区分「没有结果」与「执行失败」。
+         这与 B-8/B-12 同一条纪律。
+    """
+    assert isinstance(result, dict), f"{tool} 应返回 dict，实得 {type(result).__name__}"
+    assert "success" in result, f"{tool} 返回缺少 success 字段：{result!r}"
+    assert isinstance(result["success"], bool), \
+        f"{tool} 的 success 应为 bool，实得 {type(result['success']).__name__}"
+    if not result["success"]:
+        detail = result.get("result") or result.get("error")
+        assert detail, f"{tool} 失败但未给出任何说明（静默失败）：{result!r}"
 
 
 class TestToolRegistry:
@@ -88,7 +110,7 @@ class TestScheduleTools:
     async def test_time_plan(self, test_db):
         result = await execute_tool("time_plan", {})
         # time_plan 可能因为无 LLM 密钥而失败，但不应崩溃
-        assert "success" in result
+        _assert_tool_contract(result, "time_plan")
 
 
 class TestMemoryTools:
@@ -100,12 +122,12 @@ class TestMemoryTools:
         from backend.database import note_add
         note_add({"title": "测试笔记", "content": "今天学习了Python异步编程", "stage": "raw", "source": "manual"})
         result = await execute_tool("distill_note", {"note_id": 1})
-        assert "success" in result
+        _assert_tool_contract(result, "distill_note")
 
     @pytest.mark.asyncio
     async def test_consolidate_memories(self, test_db):
         result = await execute_tool("consolidate_memories", {})
-        assert "success" in result
+        _assert_tool_contract(result, "consolidate_memories")
 
 
 class TestConsolidateDefense:
@@ -118,10 +140,20 @@ class TestConsolidateDefense:
         from backend import llm_client
         from backend.database import mem_add
 
-        # 造 ≥5 条记忆，确保触发 LLM 建议段（generate_consolidate_plan 的 LLM 分支门槛）
-        for i in range(6):
-            mem_add(type_="experience", content=f"测试记忆条目 {i}：关于工作流的经验",
-                    importance=3, keywords="test")
+        # 造 ≥5 条记忆，确保触发 LLM 建议段（generate_consolidate_plan 的 LLM 分支门槛）。
+        # 2026-09-11：原本用 6 条仅下标不同的近似句（`测试记忆条目 {i}：关于工作流的经验`），
+        # 在 mem_add 内置去重门禁后会被判定为近似 → 只入 1 条 → 达不到门槛 → 本用例失去意义。
+        # 改为 6 条语义互不相同的真实样本（既要过门槛，也不该绕过门禁）。
+        _seeds = [
+            "每日蒸馏在 23:00 自动执行，聚合当日对话、日程、笔记与记忆后生成总结报告",
+            "交易日开盘前需要核对亚盘欧盘时间，并计算持仓股的应计比率与期权 Gamma 风险",
+            "知识库写入分三条通道：笔记由对话直写，记忆自动提取，RAG 文献须经外部脚本入库",
+            "代理故障的排查顺序是先看证书链再查 DNS 解析，最后验证 IPv6 隧道是否形成黑洞",
+            "浏览器扩展抓取字幕时优先使用 CC 轨道，AI 字幕需要额外鉴权且时序不稳定",
+            "磁盘健康诊断脚本必须在本机真实环境运行，沙箱内读取到的 SMART 数据不可信",
+        ]
+        for i, s in enumerate(_seeds):
+            mem_add(type_="experience", content=s, importance=3, keywords="test")
 
         async def _fake_call_llm_fail(**kwargs):
             return {"role": "assistant", "content": "Error: boom"}
@@ -241,10 +273,10 @@ class TestDistillTools:
     @pytest.mark.asyncio
     async def test_distill_conv_noexist(self, test_db):
         result = await execute_tool("distill_conversation", {"conv_id": "nonexistent"})
-        assert "success" in result
+        _assert_tool_contract(result, "distill_conversation")
 
     @pytest.mark.asyncio
     async def test_kb_stats(self, test_db):
         result = await execute_tool("kb_stats", {})
         # 知识库网关可能离线，但工具不应崩溃
-        assert "success" in result
+        _assert_tool_contract(result, "kb_stats")

@@ -130,9 +130,25 @@ def test_baseline_draft(engine, dataset):
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     # 只做数值合法性断言，不设 recall 阈值（draft 标签）
+    #
+    # ⚠️ 2026-09-12 补强：下面这组「范围断言」**抓不到检索层整体失效** ——
+    #    `_recall_at_k = hits/len(relevant)` 与 `_precision_at_k` 按构造恒在 [0,1]，
+    #    所以**即使检索永远返回空、召回恒为 0，范围断言也照样全部通过**。
+    #    本测试的职责是「产出基线数字」而非「评估质量」，所以不设阈值是对的；
+    #    但「什么都没检索到」必须报出来 —— 否则基线数字会被误读成「模型检索能力差」，
+    #    而真实原因是检索层坏了。故在其后补上真正会失败的断言。
     for k in (1, 3, 5, 10):
         assert 0.0 <= metrics["avg_recall"][str(k)] <= 1.0
         assert 0.0 <= metrics["avg_precision"][str(k)] <= 1.0
         assert 0.0 <= metrics["avg_recall_ngram_only"][str(k)] <= 1.0
         assert 0.0 <= metrics["avg_recall_fts_only"][str(k)] <= 1.0
     assert 0.0 <= metrics["query_level_truncation_rate"] <= 1.0
+
+    # —— 以下才是会真正失败的断言 ——
+    assert n == len(dataset["queries"]), \
+        f"有查询未被处理：处理 {n} 条，数据集 {len(dataset['queries'])} 条"
+    assert any(r["n_retrieved"] > 0 for r in per_query), \
+        "所有查询都没检索到任何记忆 —— 检索层可能整体失效" \
+        "（此时 recall 恒为 0，与「真的检索不到」在数字上无法区分）"
+    assert metrics["probe_mode"] in ("anchor", "normalized-fallback"), \
+        f"probe_mode 取值异常：{metrics['probe_mode']}"
