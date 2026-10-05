@@ -7,6 +7,11 @@ envs/
 # Python bytecode
 __pycache__/
 .pytest_cache/
+# pytest-cov 产物（2026-10-05 引入 pytest-cov 后补：此前只忽略 .pytest_cache，
+# 跑 --cov 会在仓库根留下 .coverage 数据文件，污染 git status）
+.coverage
+.coverage.*
+htmlcov/
 *.py[cod]
 *.pyo
 *.egg-info/

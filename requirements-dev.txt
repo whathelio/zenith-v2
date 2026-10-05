@@ -1,0 +1,37 @@
+# 开发 / 测试依赖 —— **运行时不需要**这些。
+#
+# 安装（开发者）：
+#   .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+# 安装（生产 / 只用服务）：
+#   .venv/Scripts/python.exe -m pip install -r requirements.txt
+#
+# 2026-10-04 拆出：此前测试依赖与运行依赖混在 requirements.txt 里
+# （原文件第 45-50 行的「# 测试依赖」分组），导致生产部署会连带装上 pytest。
+#
+# ⚠️ 国内网络：PyPI 直连常失败，用镜像
+#   -i https://mirrors.aliyun.com/pypi/simple/
+#   （2026-10-04 实测：pypi.tuna 与直连均不可用，aliyun 可用）
+
+-r requirements.txt
+
+# ── 测试框架 ──
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# ── 覆盖率与超时 ──
+# 2026-10-04 补入：此前这两个都无法使用 ——
+#   无 pytest-cov → 覆盖率完全测不了；
+#   无 pytest-timeout → `--timeout=` 参数报 unrecognized arguments。
+# 首次实测基线：backend 总覆盖率 32%（11423 语句 / 7755 未覆盖）。
+pytest-cov==7.1.0
+pytest-timeout==2.4.0
+coverage==7.16.2
+
+# ── Lint ──
+# ⚠️ 此包此前**只装在 venv 里却没声明** ——
+# `.pre-commit-config.yaml:24` 的 `entry: .venv/Scripts/ruff.exe check` 硬依赖它，
+# 换机重建环境后 pre-commit 门禁会静默失效（hook 装上了但跑不起来）。
+ruff==0.16.2

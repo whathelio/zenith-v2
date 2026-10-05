@@ -1,0 +1,62 @@
+# Zenith v2 持续集成
+#
+# 2026-10-04 新建。此前 468 个测试**没有任何强制执行点**：
+# `.pre-commit-config.yaml` 只跑 ruff lint、不跑测试，且是 local hook
+# —— 未执行 `pre-commit install` 的克隆完全没有质量门禁。
+#
+# 平台选 windows-latest 而非 ubuntu：项目含 Windows 专有逻辑
+# （火绒/WAL 保活、PowerShell 进程采集、MT5 桥接），
+# 用 Linux runner 会产生与生产环境无关的假失败。
+#
+# 本地复现同一套检查：
+#   .venv/Scripts/python.exe -m pytest tests/ -q --timeout=120 --cov=backend
+#   .venv/Scripts/ruff.exe check .
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 准备测试配置
+        shell: pwsh
+        run: |
+          # config/config.yaml 不入库（含密钥），从 example 复制一份供测试读取。
+          # conftest.py 随后会把它拷到 %TEMP% 并在会话结束时清理。
+          if (-not (Test-Path config/config.yaml)) {
+            Copy-Item config/config.yaml.example config/config.yaml
+          }
+
+      # ⚠️ --exit-zero：存量代码有 15 处未清的 lint 错误（12 F401 未用 import /
+      #    2 F541 空 f-string / 1 F841 未用变量）。先只报告不阻塞，
+      #    待清理后**删掉 --exit-zero**即可变成硬门禁。
+      #    （另有 F841 类错误无法自动修，需人工处理。）
+      - name: Lint（暂不阻塞）
+        run: ruff check . --exit-zero
+
+      - name: 测试与覆盖率
+        run: pytest tests/ -q --timeout=120 --cov=backend --cov-report=term

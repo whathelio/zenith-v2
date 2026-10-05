@@ -29,8 +29,12 @@ cd zenith-v2
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
 # 或 .venv\Scripts\activate  # Windows
-pip install -r requirements.txt
+pip install -r requirements.txt        # 只跑服务（运行依赖）
+# pip install -r requirements-dev.txt  # 开发者：另加 pytest / pytest-cov / ruff
 ```
+
+> **国内网络**：PyPI 直连常失败，加镜像参数（2026-10-04 实测 aliyun 可用）：
+> `pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/`
 
 ### 3. 配置 API Key
 
@@ -109,7 +113,8 @@ zenith-v2/
 ├── start.py                # 入口脚本（跨平台单实例锁）
 ├── zenith.bat              # Windows 启动脚本
 ├── zenith.sh               # Linux/macOS 启动脚本
-├── requirements.txt
+├── requirements.txt        # 运行依赖
+├── requirements-dev.txt    # 开发依赖（pytest / pytest-cov / pytest-timeout / ruff）
 └── README.md
 ```
 

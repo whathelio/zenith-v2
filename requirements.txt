@@ -42,9 +42,6 @@ urllib3==2.7.0
 uvicorn==0.51.0
 websockets==16.1
 yfinance==1.5.1
-# 测试依赖
-iniconfig==2.3.0
-packaging==26.3
-pluggy==1.6.0
-pytest==9.1.1
-pytest-asyncio==1.4.0
+# 测试 / 开发依赖已拆到 requirements-dev.txt（2026-10-04）
+# —— 生产部署不再连带安装 pytest / pytest-cov / ruff 等工具。
+# 开发者：pip install -r requirements-dev.txt
