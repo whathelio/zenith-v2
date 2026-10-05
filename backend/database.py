@@ -152,7 +152,14 @@ def _migrate_memory_types():
 
         # executescript 会自动提交每条语句，不需要显式 BEGIN/COMMIT
         c.execute("PRAGMA foreign_keys=OFF")
+        # 2026-10-04：重建 memories **前**先丢弃 memories_fts。
+        # memories_fts 是 external-content 虚表（content='memories'），下方
+        # `DROP TABLE memories` 会让它进入「disk image is malformed」状态；
+        # 而 _migrate_memories_fts 的存在性检查只看表名（表还在，只是坏了）→
+        # 不会重建它，FTS 就此永久损坏且难以察觉。
+        # 丢弃后由 init_db 末尾的 _migrate_memories_fts 重新建立并回填。
         c.executescript("""
+DROP TABLE IF EXISTS memories_fts;
 CREATE TABLE IF NOT EXISTS memories_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT CHECK(type IN ('personal_info','preference','event','decision','fact','experience','skill')),
@@ -317,6 +324,20 @@ def _migrate_market_reports():
 
 
 def _migrate_memories_fts():
+    """建 memories 全文索引表与同步触发器。
+
+    ⚠️ 调用方必须在**建表 executescript 之后**调用本函数 —— 下面的
+    `CREATE TRIGGER ... ON memories` 要求 `memories` 表已存在，否则会失败。
+
+    2026-10-04 两处修复：
+    1. 本函数此前**从未被 `init_db()` 调用**：11 个 `_migrate_*` 只调了 10 个，
+       导致全新库不建 `memories_fts`，记忆全文搜索静默退化为 LIKE 全表扫。
+       （生产库之所以正常，是历史遗留：表在早期版本就被建过，与代码路径无关。）
+    2. 触发器创建移出 `if not ft_exists` 分支：原实现下，「表已存在但触发器缺失」
+       的库（例如 `_migrate_memory_types` 重建 memories 时连带删掉了触发器）
+       永远补不回同步能力，FTS 会静默停止更新。触发器自带 `IF NOT EXISTS`，
+       独立创建是幂等的。
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(str(DB_PATH))
     try:
@@ -329,6 +350,11 @@ def _migrate_memories_fts():
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, keywords, content='memories', content_rowid='id'
 );
+""")
+            # 仅首次建表时回填，避免每次启动全量 rebuild（对比 academic_papers_fts 的教训）
+            c.execute("INSERT INTO memories_fts(rowid, content, keywords) SELECT id, content, keywords FROM memories")
+        # 触发器独立于「表是否首次创建」——IF NOT EXISTS 保证幂等，可修复缺失的触发器
+        c.executescript("""
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
 END;
@@ -340,8 +366,7 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
     INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
 END;
 """)
-            c.execute("INSERT INTO memories_fts(rowid, content, keywords) SELECT id, content, keywords FROM memories")
-            c.commit()
+        c.commit()
         c.execute("PRAGMA foreign_keys=ON")
     finally:
         c.close()
@@ -736,6 +761,12 @@ END;
 INSERT INTO academic_papers_fts(academic_papers_fts) VALUES('rebuild');
 
 """)
+
+    # 2026-10-04 修复：此前 _migrate_memories_fts 从未被调用（11 个 _migrate_* 只调了 10 个）
+    # → 全新库不建 memories_fts 表与触发器，记忆全文搜索静默退化为 LIKE 全表扫。
+    # ⚠️ 必须放在上方 executescript **之后**：该迁移内部的 `CREATE TRIGGER ... ON memories`
+    #    要求目标表已存在，建表前调用会失败。
+    _migrate_memories_fts()
 
 
 # ---------------------------------------------------------------------------
