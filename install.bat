@@ -51,7 +51,30 @@ if exist ".venv\Scripts\python.exe" (
 echo.
 
 REM ---- 3. install runtime dependencies ----
-echo [3/4] Installing dependencies (a few minutes on first run) ...
+REM Offline mode: if a "wheels" folder sits next to this script, install from it
+REM with no network at all. It ships separately as
+REM zenith-v2-deps-win64-py313.zip (44 wheels, ~60MB).
+set "OFFLINE="
+if exist "wheels\*.whl" set "OFFLINE=1"
+
+if defined OFFLINE (
+    echo [3/4] Offline mode - installing from the local wheels folder ...
+    ".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet --disable-pip-version-check
+    ".venv\Scripts\python.exe" -m pip install --no-index --find-links wheels -r requirements.txt --disable-pip-version-check
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Offline install failed.
+        echo         The bundled wheels are built for Python 3.13 64-bit.
+        echo         Check:  .venv\Scripts\python.exe --version
+        echo         If you use another Python version, delete the wheels folder
+        echo         and run install.bat again to download from PyPI instead.
+        pause
+        exit /b 1
+    )
+    goto :deps_done
+)
+
+echo [3/4] Installing dependencies from PyPI (a few minutes on first run) ...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip --quiet --disable-pip-version-check
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check
 if errorlevel 1 (
@@ -63,11 +86,15 @@ if errorlevel 1 (
     if errorlevel 1 (
         echo.
         echo [ERROR] Dependency installation failed.
-        echo         Check your network, then run install.bat again.
+        echo         Option 1: check your network, then run install.bat again.
+        echo         Option 2: download zenith-v2-deps-win64-py313.zip from the
+        echo                   Releases page, unzip its "wheels" folder here,
+        echo                   then run install.bat again.
         pause
         exit /b 1
     )
 )
+:deps_done
 echo.
 
 REM ---- 4. seed config from template ----

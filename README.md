@@ -5,8 +5,11 @@
 [![Release](https://img.shields.io/github/v/release/whathelio/zenith-v2)](https://github.com/whathelio/zenith-v2/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **只想用，不想折腾** → [下载最新发布包](https://github.com/whathelio/zenith-v2/releases/latest)（约 7.4MB，解压后双击 `install.bat`）
-> **想改代码** → `git clone` 之后看下面第 4 节「手动安装」
+> **只想用，不想折腾** → [下载最新发布包](https://github.com/whathelio/zenith-v2/releases/latest)，解压后双击 `install.bat`
+> **内网 / 完全离线** → 额外下载 `zenith-v2-deps-win64-py313.zip`，用法见 [安装指南](INSTALL.md)
+> **想改代码** → `git clone` 之后看 [安装指南](INSTALL.md) 的 C 节
+
+完整步骤、依赖清单、排错对照表都在 **[INSTALL.md](INSTALL.md)**。
 
 ## 功能
 

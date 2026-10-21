@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Zenith v2 — Local AI Assistant",
-    version="2.0.0",
+    version="2.0.1",
     lifespan=lifespan,
 )
 
@@ -184,7 +184,7 @@ code{background:#1b1d23;padding:4px 12px;border-radius:4px;color:#ff79c6}a{color
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.0.1"}
 
 
 # Knowledge - migrated to routers/knowledge.py

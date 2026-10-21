@@ -48,14 +48,26 @@ fi
 echo ""
 
 # ── 3. 依赖 ──
-echo "[3/4] 安装依赖（首次约需数分钟）..."
-.venv/bin/python -m pip install --upgrade pip --quiet --disable-pip-version-check
-if ! .venv/bin/python -m pip install -r requirements.txt --disable-pip-version-check; then
-    echo ""
-    echo "[警告] PyPI 直连失败，改用阿里云镜像重试 ..."
-    .venv/bin/python -m pip install -r requirements.txt \
-        -i https://mirrors.aliyun.com/pypi/simple/ \
-        --trusted-host mirrors.aliyun.com --disable-pip-version-check
+if ls wheels/*.whl >/dev/null 2>&1; then
+    echo "[3/4] 检测到 wheels/ 目录，走离线安装（不联网）..."
+    .venv/bin/python -m pip install --upgrade pip --quiet --disable-pip-version-check
+    if ! .venv/bin/python -m pip install --no-index --find-links wheels -r requirements.txt --disable-pip-version-check; then
+        echo ""
+        echo "[错误] 离线安装失败。目录里的 wheel 可能与当前平台/Python 版本不匹配。"
+        echo "       删掉 wheels/ 后重跑本脚本即可改从 PyPI 安装。"
+        echo "       自己准备离线包： pip download -r requirements.txt -d wheels"
+        exit 1
+    fi
+else
+    echo "[3/4] 安装依赖（首次约需数分钟）..."
+    .venv/bin/python -m pip install --upgrade pip --quiet --disable-pip-version-check
+    if ! .venv/bin/python -m pip install -r requirements.txt --disable-pip-version-check; then
+        echo ""
+        echo "[警告] PyPI 直连失败，改用阿里云镜像重试 ..."
+        .venv/bin/python -m pip install -r requirements.txt \
+            -i https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com --disable-pip-version-check
+    fi
 fi
 echo ""
 
