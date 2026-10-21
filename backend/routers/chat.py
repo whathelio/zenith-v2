@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from .. import database as db
 from ..config import load_config
-from ..tools import TOOLS_SCHEMA, execute_tool
+from ..tools import execute_tool, get_tools_schema, collection_hint_text
 from ..llm_client import chat_stream
 from ..memory_engine import (
     maybe_extract_memories, build_memory_injection,
@@ -126,6 +126,31 @@ def _split_query(q: str) -> list:
 SKILL_FALLBACK_L2_MIN_CHARS = 600        # 内容字符数下限：低于此值不可能判 L2
 SKILL_FALLBACK_L2_MIN_STEPS = 5          # 「长步骤块」判据 A：有序步骤行数 ≥ 此值
 SKILL_FALLBACK_L2_MIN_STEP_CHARS = 400   # 「长步骤块」判据 B：步骤行累计字符 ≥ 此值
+
+
+# ── 预读「空结果」判定（2026-10-09 新增，同日复核后收窄）──────────────────
+# 背景：assessor 的只读预执行会把工具结果拼进 system content。命中空结果时
+# （如 search_memory 的「未找到相关记忆。」），这行字本身不含任何信息，
+# 却会给模型一条「记忆库里什么都没有」的错误暗示 —— 实测该路径高频命中空结果。
+# 故：空结果不注入（也不计入 executed，避免 hint 里宣称「结果见下方」而下方为空）。
+#
+# 🔴 判据必须**窄**：只认确切空结果文案 + 短文本上限。
+# 初版用「暂无 / 无相关」等宽泛子串，独立复核给出反例 ——
+# 单条有效命中「本地暂无黄金仓位」（约 40 字）会被误判为空而丢弃。
+# 同理 **不**收录 check_duplicate 的「未发现相似笔记或记忆，可放心入库。」
+# （那是有效结论，模型正需要它来判断能否入库）。
+_PREREAD_EMPTY_EXACT = ("未找到相关记忆。",)
+_PREREAD_EMPTY_MAX_CHARS = 40
+
+
+def _preread_result_is_empty(txt: str) -> bool:
+    """预读结果是否为「空」（无实质信息，不该注入 system）。"""
+    t = (txt or "").strip()
+    if not t:
+        return True
+    if len(t) > _PREREAD_EMPTY_MAX_CHARS:
+        return False
+    return any(t == m or t.startswith(m) for m in _PREREAD_EMPTY_EXACT)
 
 
 def _infer_skill_layer(content: str) -> str:
@@ -249,13 +274,29 @@ async def _process_conv(
         tool_results = []
         MAX_TOOL_ROUNDS = 10
 
+        # D3-1（2026-10-09）：知识库集合清单 → 追加到 system **尾部**。
+        #  · 为什么在这里而不是 `_build_chat_messages`：后者是**同步**函数，而清单要打网关（async）；
+        #    本函数是既有的 async 后台任务，且持有同一个 messages 列表。
+        #  · 为什么放 system 尾部而不是 tools schema：tools 渲染在 prompt **最前**，清单一变
+        #    则其后**全部**前缀缓存作废（原实现每 60 秒就可能重置一次前缀，见 tools.py 的说明）；
+        #    放 system 尾部只影响其后的 token。
+        #  · fail-safe：拿不到就当没有，绝不阻断对话。
+        if messages and messages[0].get("role") == "system":
+            try:
+                _coll_hint = await collection_hint_text()
+            except Exception:                                  # noqa: BLE001
+                _coll_hint = ""
+            if _coll_hint:
+                messages[0]["content"] = f"{messages[0]['content']}\n\n{_coll_hint}"
+
         # ── ① 评估层 + 只读预执行（2026-09-15 新增）──────────────
         # 每轮对话必跑一次模块需求评估，结果既留痕（assess）又注入 system prompt。
         # 目的：把「本轮该用哪些模块」从"模型临时决定"变成系统显式步骤，
         # 并让收尾的 assess_outcome 能自动发现「建议了但没执行」的断点。
         # 原则：评估失败必须降级放行（绝不阻塞对话）；预执行只允许只读白名单。
         assessment: dict = {}
-        called_tools: list[str] = []
+        called_tools: list[str] = []   # 仅「模型主动调用」（2026-10-09 D-B 拆分）
+        preread_tools: list[str] = []  # 仅「系统预读代执行」
         try:
             from ..assessor import assess_round, summarize_assessment
 
@@ -274,10 +315,29 @@ async def _process_conv(
                 try:
                     pr = await execute_tool(item["tool"], item["args"], conv_id=conv_id)
                     txt = str(pr.get("result") or pr.get("error") or "")[:1200]
-                    if txt:
+                    # 2026-10-09（D-B）：预读是**系统代执行**，不再混进 called（那是「模型主动调用」），
+                    # 单独记入 preread_tools —— 否则 assess_outcome 分不清「模型调了」与「系统代执行了」，
+                    # missed 对「该调却没调」这类断点不敏感。
+                    preread_tools.append(item["tool"])
+                    # 空结果不注入：见 _preread_result_is_empty 的说明（负向信号 + 避免
+                    # 下方 hint 宣称「结果见下方」而实际上什么都没有）。
+                    _p_empty = (not txt) or _preread_result_is_empty(txt)
+                    # 2026-10-09（D-C）：预读此前**不落任何痕迹** → 「取回什么、是否为空、
+                    # 是否注入 system」全都查不到，空结果过滤也因此无法用痕迹验证。
+                    try:
+                        db.trace_add(conv_id, "preread",
+                                     data={"tool": item["tool"],
+                                           "args": item.get("args") or {},
+                                           "ok": pr.get("success", True) is not False,
+                                           "empty": _p_empty,
+                                           "injected": not _p_empty,
+                                           "chars": len(txt)},
+                                     message_id=user_msg_id)
+                    except Exception:
+                        pass  # 留痕失败不影响对话
+                    if not _p_empty:
                         preread_blocks.append(f"[系统已自动执行 {item['tool']}]\n{txt}")
                         executed.add(item["tool"])
-                        called_tools.append(item["tool"])
                 except Exception as e:
                     logger.warning("预执行 %s 失败（降级忽略）: %s", item["tool"], e)
 
@@ -297,7 +357,11 @@ async def _process_conv(
             round_text = ""
             round_tool_calls = []
 
-            async for chunk in chat_stream(messages, tools=TOOLS_SCHEMA, provider_name=provider_name):
+            # D3-1（2026-10-09）：tools schema 现为**逐字节静态** —— 不再按运行时集合清单
+            # 注入（那会让 tools 字节随网关变化，击穿其后全部前缀缓存）。
+            # 集合清单已改注入 system 尾部，见下方 collection_hint_text() 处。
+            _tools = await get_tools_schema()
+            async for chunk in chat_stream(messages, tools=_tools, provider_name=provider_name):
                 if chunk["type"] == "text":
                     round_text += chunk["content"]
                     assistant_text += chunk["content"]
@@ -510,11 +574,15 @@ async def _process_conv(
             if assessment:
                 _sug = [s["tool"] for s in (assessment.get("suggested") or [])]
                 _called = set(called_tools)
+                _preread = set(preread_tools)
+                # 2026-10-09（D-B）：拆开两种来源。`missed` 只统计**两种都没覆盖**的建议项 ——
+                # 预读已代执行的不算漏（hint 文案本就告知模型「无需重复调用」）。
                 db.trace_add(conv_id, "assess_outcome",
                              data={
                                  "suggested": _sug,
                                  "called": sorted(_called),
-                                 "missed": [t for t in _sug if t not in _called],
+                                 "preread": sorted(_preread),
+                                 "missed": [t for t in _sug if t not in _called and t not in _preread],
                              },
                              message_id=user_msg_id)
         except Exception:
@@ -564,7 +632,11 @@ async def _process_conv(
         event_queue.put_nowait(json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False))
     finally:
         event_queue.put_nowait(None)
-        _active_streams.pop(conv_id, None)
+        # 只清理「自己」的注册项：若本任务已被新一轮对话 cancel 并顶替，
+        # _active_streams[conv_id] 此时指向新任务，误 pop 会让新流彻底失联
+        # （/api/chat/stop 停不掉、再次发消息也不会 cancel 它 → 同会话并发流/重复回复）。
+        if _active_streams.get(conv_id) is asyncio.current_task():
+            _active_streams.pop(conv_id, None)
 
 
 @router.post("")
@@ -635,7 +707,8 @@ async def chat(request: Request):
     return _start_sse(conv_id, user_message, cfg, provider_name, persona_name, persist_user=False)
 
 
-def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_query: str = "") -> list:
+def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_query: str = "",
+                         user_msg_id: int = None) -> list:
     """构建 system + 历史消息（背景 / 学习进度 / Persona / 苏格拉底 / 审计 / 记忆 / 技能注入链）"""
     system_parts = [cfg["system_prompt"]]
 
@@ -736,9 +809,17 @@ def _build_chat_messages(conv_id: str, cfg: dict, persona_name: str, current_que
     )
 
 
-    memory_injection = build_memory_injection(current_query=current_query)
+    memory_injection, mem_meta = build_memory_injection(current_query=current_query, with_meta=True)
     if memory_injection:
         system_parts.append(memory_injection)
+    # 召回留痕（2026-10-09 新增，trace_type='mem_recall'）：
+    # 记录本轮**实际渲染进 prompt** 的记忆/笔记 id 与规模。此前「记忆到底有没有在用、
+    # 用了几条」无从直查（只能靠 tool_call 痕迹间接猜）。写失败不影响对话（fail-safe）。
+    if mem_meta:
+        try:
+            db.trace_add(conv_id, "mem_recall", data=mem_meta, message_id=user_msg_id)
+        except Exception:
+            logging.getLogger("zenith.chat").warning("mem_recall 留痕失败（不影响对话）", exc_info=True)
     skill_injection = _build_skill_injection(current_query=current_query)
     if skill_injection:
         system_parts.append(skill_injection)
@@ -805,7 +886,7 @@ def _start_sse(conv_id: str, user_message: str, cfg: dict,
         # 前端回读时无法交错归位，会堆在结论下方
         user_msg_id = db.msg_last_user_id(conv_id)
 
-    messages = _build_chat_messages(conv_id, cfg, persona_name, user_message)
+    messages = _build_chat_messages(conv_id, cfg, persona_name, user_message, user_msg_id=user_msg_id)
 
     event_queue = asyncio.Queue()
     process_task = asyncio.create_task(
@@ -902,7 +983,10 @@ async def edit_message(request: Request):
         return JSONResponse({"error": "消息不存在"}, status_code=404)
     if not db.msg_update(msg_id, content):
         return JSONResponse({"error": "更新失败"}, status_code=500)
-    db.msg_del_from(msg_id + 1)
+    # 删除该消息之后的历史。必须按 conversation_id 截断 —— messages.id 全局自增、
+    # 跨会话连续，此前用 msg_del_from(msg_id + 1) 会在 msg_id+1 属于**另一个会话**时
+    # 误删那个会话的消息（跨会话数据丢失，P0-1 残留）。
+    db.msg_del_after(conv_id, msg_id)
 
     cfg = load_config()
     if msg["role"] != "user":

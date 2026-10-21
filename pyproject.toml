@@ -1,8 +1,11 @@
 [tool.ruff]
 target-version = "py313"
 line-length = 120
-# 排除非源码目录（虚拟环境 / 前端构建产物 / 归档 / 已封存模块）
-extend-exclude = [".venv", "frontend", "_archive", "_archived", "node_modules"]
+# 排除非源码目录（虚拟环境 / 前端构建产物 / 归档 / 已封存模块 / 诊断归档）
+# 2026-10-17：补 `_diag_archive`。此前它不在排除表里，而里面放的是「一次性探针脚本 +
+# 测试残留（pytest-tmp）+ 审计报告」——`ruff check .` 会去扫这些本该丢弃的文件，
+# 本地和 CI 都会因此无故变红（实测 13 处 F821/F401 全部来自该目录）。
+extend-exclude = [".venv", "frontend", "_archive", "_archived", "_bak", "_diag_archive", "node_modules"]
 
 [tool.ruff.lint]
 # 只启用「真正的错误」类规则，暂缓风格规则（存量代码有大量中文注释/长行，

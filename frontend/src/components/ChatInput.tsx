@@ -85,7 +85,7 @@ export default function ChatInput({ onSend, isLoading, onStop }: ChatInputProps)
     setSanitizeDialog(null)
   }
 
-  /** 用户拒绝脱敏��原文粘贴 */
+  /** 用户拒绝脱敏，原文粘贴 */
   const handleSanitizeReject = () => {
     if (!sanitizeDialog) return
     const ta = textareaRef.current

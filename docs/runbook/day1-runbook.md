@@ -71,6 +71,12 @@ export LLM_MODEL="deepseek-ai/DeepSeek-V3"
 # 列出 Zotero Collection（挑选要索引的收藏夹）
 python zotero_parse_rag_core.py --list-collections
 
+# 列出全部 RAG 向量集合（多集合改造后；默认集合仍是 zotero_papers）
+python zotero_parse_rag_core.py --list-rag-collections
+
+# 指定写入的 RAG 向量集合（默认由 ZENITH_RAG_COLLECTION 决定，未设 = zotero_papers）
+python zotero_parse_rag_core.py --build --collection "投资" --rag-collection nomad_ref --limit 50
+
 # 先用小集合验证（推荐 50–100 篇）
 python zotero_parse_rag_core.py --build --collection "投资" --limit 50
 

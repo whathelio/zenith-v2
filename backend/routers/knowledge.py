@@ -30,7 +30,7 @@ async def knowledge_search(data: dict = Body(default=None)):
     q = (data or {}).get("question", "").strip()
     if not q:
         raise HTTPException(400, "question is required")
-    return await knowledge_service.search(q)
+    return await knowledge_service.search(q, collection=(data or {}).get("collection") or None)
 
 
 @router.post("/wiki")
@@ -48,13 +48,13 @@ async def knowledge_wiki(data: dict = Body(default=None)):
 
 
 @router.post("/ingest")
-async def knowledge_ingest(file: UploadFile = File(...)):
+async def knowledge_ingest(file: UploadFile = File(...), collection: str = ""):
     if not file.filename:
         raise HTTPException(400, "missing filename")
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
         raise HTTPException(400, "文件过大（>20MB）")
-    result = await knowledge_service.ingest_file(file.filename, content)
+    result = await knowledge_service.ingest_file(file.filename, content, collection=collection or None)
     if result.get("code") in ("GATEWAY_DOWN", "GATEWAY_TIMEOUT", "INGEST_ERROR"):
         raise HTTPException(503, result.get("error", "kb service down"))
     if result.get("error"):
@@ -62,14 +62,32 @@ async def knowledge_ingest(file: UploadFile = File(...)):
     return result
 
 
+@router.get("/collections")
+async def knowledge_list_collections():
+    """列出全部 RAG 集合（多集合改造 C-4 的读取入口）。"""
+    return await knowledge_service.list_collections()
+
+
+@router.post("/collections/{name}/archive")
+async def knowledge_archive_collection(name: str):
+    """归档集合（改名保留，不删除）。默认集合由网关侧拒绝归档。"""
+    result = await knowledge_service.archive_collection(name)
+    code = result.get("code")
+    if code == "GATEWAY_DOWN":
+        raise HTTPException(503, result.get("error", "kb service down"))
+    if code == "PROTECTED":
+        raise HTTPException(400, result.get("error", "默认集合不可归档"))
+    return result
+
+
 @router.get("/documents")
-async def knowledge_list_docs():
-    return await knowledge_service.list_docs()
+async def knowledge_list_docs(collection: str = ""):
+    return await knowledge_service.list_docs(collection or None)
 
 
 @router.get("/documents/{item_id}/chunks")
-async def knowledge_get_doc_chunks(item_id: int):
-    return await knowledge_service.get_doc_chunks(item_id)
+async def knowledge_get_doc_chunks(item_id: int, collection: str = ""):
+    return await knowledge_service.get_doc_chunks(item_id, collection or None)
 
 
 @router.post("/tasks")

@@ -1,17 +1,36 @@
-"""Zenith v2 网页工具 — 抓取网页正文 + 网页搜索（免 API Key）
+"""Zenith v2 网页工具 — 抓取网页正文 + 网页搜索
 
-- fetch_url: 抓取任意 http/https 链接，HTML → 可读文本，喂给模型
-- web_search: 用 Bing 网页搜索（无需 Key），返回标题/链接/摘要
+双轨 provider（2026-10-21）：
+- DeepSeek 官方 Search / Fetch（`backend/web_deepseek.py`）：结构化结果、服务端渲染抓取
+- 本地兜底：Bing HTML 解析 + httpx/BeautifulSoup 直抓（免 Key，不依赖配额）
+
+对外仍是两个函数：
+- fetch_url: 抓取任意 http/https 链接 → 可读文本 / markdown
+- web_search: 网页搜索 → 标题/链接/摘要
+
+provider 由环境变量决定（见 `_resolve_provider`）：
+- ZENITH_WEB_SEARCH_PROVIDER = auto | deepseek | bing   （auto=DeepSeek 优先，失败回退 Bing）
+- ZENITH_WEB_FETCH_PROVIDER  = auto | deepseek | local  （auto=DeepSeek 优先，失败回退直抓）
+- ZENITH_WEB_DAILY_LIMIT     = 每日 DeepSeek 调用上限（0=不限，默认 500）
+- ZENITH_WEB_SEARCH_CACHE_TTL / ZENITH_WEB_FETCH_CACHE_TTL = 进程内缓存秒数（0=关）
+- 测试环境（ZENITH_TESTING=1）强制走本地实现，绝不打真网/花配额
 
 依赖: httpx (已有) + beautifulsoup4
 """
 from __future__ import annotations
 
-import re
+import copy
+import json
 import logging
+import os
+import re
+import time
+from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 import httpx
+
+from . import web_deepseek as ds
 
 logger = logging.getLogger("zenith.web")
 
@@ -65,8 +84,161 @@ def _get_soup(html: str):
     return BeautifulSoup(html, "html.parser")
 
 
-async def fetch_url(url: str, max_chars: int = 8000) -> dict:
-    """抓取网页并提取正文文本。
+# ---------------------------------------------------------------------------
+# provider 选择 / 缓存 / 日限 / 记账
+# ---------------------------------------------------------------------------
+
+_PROVIDER_VALUES = {
+    "search": {"auto", "deepseek", "bing"},
+    "fetch": {"auto", "deepseek", "local"},
+}
+
+
+def _testing() -> bool:
+    return os.environ.get("ZENITH_TESTING") == "1"
+
+
+def _resolve_provider(kind: str, explicit: str | None = None) -> str:
+    """决定这次用哪个 provider。显式入参 > 环境变量 > auto。
+
+    测试环境（ZENITH_TESTING=1）强制本地：pytest 里调 web_search/fetch_url
+    不该打真网、更不该花真配额；需要测 DeepSeek 分支的用例直接调
+    web_deepseek.ds_* 或显式传 provider="deepseek"。
+    """
+    if explicit:
+        val = explicit.strip().lower()
+        if val in _PROVIDER_VALUES[kind]:
+            return val
+    if _testing():
+        return "bing" if kind == "search" else "local"
+    env_name = "ZENITH_WEB_SEARCH_PROVIDER" if kind == "search" else "ZENITH_WEB_FETCH_PROVIDER"
+    val = (os.environ.get(env_name) or "auto").strip().lower()
+    return val if val in _PROVIDER_VALUES[kind] else "auto"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+# 进程内 TTL 缓存：同一 query/url 在 TTL 内不重复计费。0 = 关闭。
+_CACHE: dict[str, tuple[float, dict]] = {}
+_CACHE_MAX_ENTRIES = 200
+
+
+def _cache_ttl(kind: str) -> int:
+    # 测试环境关闭缓存：否则同 query 的用例会互相污染（前一个用例的结果被后一个读到）
+    if _testing():
+        return 0
+    name = "ZENITH_WEB_SEARCH_CACHE_TTL" if kind == "search" else "ZENITH_WEB_FETCH_CACHE_TTL"
+    return _env_int(name, 300 if kind == "search" else 600)
+
+
+def _cache_key(kind: str, *parts) -> str:
+    return kind + "|" + "|".join(str(p) for p in parts)
+
+
+def _cache_get(key: str) -> dict | None:
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > _cache_ttl(key.split("|", 1)[0]):
+        _CACHE.pop(key, None)
+        return None
+    return copy.deepcopy(value)
+
+
+def _cache_put(key: str, value: dict) -> None:
+    if _cache_ttl(key.split("|", 1)[0]) <= 0:
+        return
+    if len(_CACHE) >= _CACHE_MAX_ENTRIES:
+        oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+        _CACHE.pop(oldest, None)
+    _CACHE[key] = (time.time(), copy.deepcopy(value))
+
+
+_USAGE_PATH = Path(__file__).resolve().parent.parent / "data" / "web_calls.jsonl"
+_usage_state: dict = {"date": "", "counts": {}}
+
+
+def _ensure_usage_loaded() -> None:
+    """按天懒加载调用计数（首次使用时扫一次当日 JSONL）。"""
+    today = time.strftime("%Y-%m-%d")
+    if _usage_state["date"] == today:
+        return
+    counts: dict[str, int] = {}
+    if _USAGE_PATH.exists():
+        try:
+            with open(_USAGE_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    if today not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("date") == today and rec.get("ok"):
+                        api = rec.get("api") or ""
+                        counts[api] = counts.get(api, 0) + 1
+        except OSError as e:  # 记账文件读不了不该阻塞抓取
+            logger.debug("读取 web_calls.jsonl 失败: %s", e)
+    _usage_state["date"] = today
+    _usage_state["counts"] = counts
+
+
+def _over_daily_limit(api: str) -> bool:
+    limit = _env_int("ZENITH_WEB_DAILY_LIMIT", 500)
+    if limit <= 0:
+        return False
+    _ensure_usage_loaded()
+    return _usage_state["counts"].get(api, 0) >= limit
+
+
+def _record_call(api: str, ok: bool, status: int, ms: float, target: str, chars: int = 0) -> None:
+    """记账：一行一条，失败不影响主流程。"""
+    if _testing():
+        # 测试环境不落盘：否则用例会把假调用写进真实日限计数
+        return
+    today = time.strftime("%Y-%m-%d")
+    rec = {
+        "date": today,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "api": api,
+        "ok": bool(ok),
+        "status": int(status or 0),
+        "ms": round(ms, 1),
+        "chars": int(chars),
+        "target": (target or "")[:120],
+        # 官方价：¥5/1000 次成功请求 → 0.005 元/次
+        "est_cost_cny": 0.005 if ok else 0.0,
+    }
+    try:
+        _USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_USAGE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.debug("写 web_calls.jsonl 失败: %s", e)
+    if ok:
+        _ensure_usage_loaded()
+        _usage_state["counts"][api] = _usage_state["counts"].get(api, 0) + 1
+
+
+def _join_failures(failures: list[str]) -> str:
+    """把各 provider 的失败说明合成一条可执行提示。"""
+    clean = [f for f in failures if f]
+    if not clean:
+        return "网页接口全部不可用，且没有拿到可用内容。"
+    if len(clean) == 1:
+        return clean[0]
+    return "DeepSeek 接口失败：\n" + clean[0] + "\n\n本地兜底也失败：\n" + clean[-1]
+
+
+
+async def _fetch_local(url: str, max_chars: int = 8000) -> dict:
+    """本地直抓：httpx GET + BeautifulSoup 提正文（免 Key 的兜底路径）。
 
     返回:
         {"success": True, "result": "可读文本", "url": final_url, "title": ...}
@@ -135,6 +307,67 @@ async def fetch_url(url: str, max_chars: int = 8000) -> dict:
 
     return {"success": True, "result": header + text + spa_hint,
             "url": final_url, "title": title}
+
+
+async def fetch_url(url: str, max_chars: int = 8000, provider: str | None = None) -> dict:
+    """抓取网页正文：DeepSeek Fetch 优先，失败自动回退本地直抓。
+
+    provider: None=按环境变量（默认 auto）/ "deepseek" / "local" / "auto"
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return {"success": False, "result": f"仅支持 http/https 链接，收到: {url}"}
+    if not parsed.netloc:
+        return {"success": False, "result": f"无效的链接: {url}"}
+
+    chosen = _resolve_provider("fetch", provider)
+    chain = ["deepseek", "local"] if chosen == "auto" else [chosen]
+    cache_key = _cache_key("fetch", url, max_chars)
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    failures: list[str] = []
+    for p in chain:
+        if p == "deepseek":
+            if not ds.available():
+                failures.append("DeepSeek 未配置 API Key")
+                continue
+            if _over_daily_limit("fetch"):
+                failures.append("DeepSeek 抓取已达今日调用上限（ZENITH_WEB_DAILY_LIMIT）")
+                continue
+            t0 = time.perf_counter()
+            out = await ds.ds_fetch(url, max_chars=max_chars)
+            _record_call("fetch", out.get("success", False), out.get("status") or (200 if out.get("success") else 0),
+                         (time.perf_counter() - t0) * 1000, url, len(out.get("content") or ""))
+            if out.get("success"):
+                res = {
+                    "success": True,
+                    "result": out["result"],
+                    "url": out.get("url", url),
+                    "title": out.get("title", ""),
+                    "provider": "deepseek",
+                    "truncated": out.get("truncated", False),
+                }
+                _cache_put(cache_key, res)
+                return res
+            failures.append(out.get("result", ""))
+            logger.info("DeepSeek fetch 失败，回退本地: %s | %s",
+                        url[:80], str(out.get("result", ""))[:120])
+            continue
+
+        out = await _fetch_local(url, max_chars)
+        if out.get("success"):
+            if failures:
+                out["result"] = (f"（DeepSeek 抓取失败：{failures[0][:80]}；已回退本地直抓）\n"
+                                 + out["result"])
+            out["provider"] = "local"
+            _cache_put(cache_key, out)
+            return out
+        failures.append(out.get("result", ""))
+
+    return {"success": False, "result": _join_failures(failures), "provider": chosen}
 
 
 def _extract_text(node) -> str:
@@ -227,12 +460,25 @@ def _select_relevant(query: str, results: list[dict]) -> tuple[list[dict], bool]
     return kept, False
 
 
+_FALLBACK_CJK_CHARS = 4
+
+
 def _fallback_query(query: str) -> str:
-    """降级搜索词：取首个有效词（通常是主实体），用于整体无关时重搜一次。"""
-    for tok in query.split():
-        if len(tok) >= 2:
-            return tok
-    return ""
+    """降级搜索词：取首个有效词（通常是主实体），用于整体无关时重搜一次。
+
+    多词查询按空白分词取首个；无空格中文查询不能交给 split()——整句会被当成
+    一个词原样返回、与入参相等，使调用点 ``alt != query`` 守卫恒假、降级重搜
+    形同失效。此时改取首个中文段的前若干字，得到一个更宽泛的主实体。
+    """
+    parts = [t for t in query.split() if len(t) >= 2]
+    if len(parts) >= 2:
+        return parts[0]
+    seg_match = _CJK_SEG.search(query)
+    if seg_match is not None:
+        seg = seg_match.group(0)
+        if len(seg) > _FALLBACK_CJK_CHARS:
+            return seg[:_FALLBACK_CJK_CHARS]
+    return parts[0] if parts else ""
 
 
 async def _bing_results(query: str, max_results: int) -> tuple[list[dict], str]:
@@ -284,8 +530,8 @@ async def _bing_results(query: str, max_results: int) -> tuple[list[dict], str]:
     return deduped, ""
 
 
-async def web_search(query: str, max_results: int = 5) -> dict:
-    """用 Bing 网页搜索（免 API Key），返回结果列表。
+async def _search_bing(query: str, max_results: int = 5) -> dict:
+    """本地兜底搜索：Bing HTML + 相关性过滤（免 API Key）。
 
     返回:
         {"success": True, "result": "格式化结果", "results": [...]}
@@ -326,3 +572,119 @@ async def web_search(query: str, max_results: int = 5) -> dict:
         if r["snippet"]:
             lines.append(f"   摘要: {r['snippet']}")
     return {"success": True, "result": "\n".join(lines), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek 结果格式化 + 对外 web_search（双轨调度）
+# ---------------------------------------------------------------------------
+
+_SUMMARY_MAX = 600   # 每条摘要上限：官方 summary 600~800 字，全量喂会白烧 token
+_CONTENT_MAX = 2000  # need_content=True 时每条正文上限
+
+_FULLTEXT_HINT = "\n💡 需要某条全文时，对该条链接调用 web_fetch。"
+
+
+def _format_ds_results(query: str, results: list[dict]) -> str:
+    """把 DeepSeek 结构化结果排成模型好读的块：日期/来源/权威/相关度都给。"""
+    lines = [f"🔍 搜索「{query}」(DeepSeek, {len(results)} 条)："]
+    for i, r in enumerate(results, 1):
+        lines.append(f"\n{i}. {r['title']}")
+        lines.append(f"   链接: {r['url']}")
+        meta = []
+        if r.get("date"):
+            meta.append(str(r["date"])[:10])
+        if r.get("site_name"):
+            meta.append(str(r["site_name"]))
+        authority = r.get("authority")
+        if isinstance(authority, int) and authority >= 0:
+            meta.append(f"权威 {authority}/4")
+        score = r.get("score")
+        if isinstance(score, (int, float)) and score:
+            meta.append(f"相关 {score:.2f}")
+        if meta:
+            lines.append("   " + " · ".join(meta))
+        body = (r.get("summary") or r.get("snippet") or "").strip()
+        if body:
+            lines.append(f"   摘要: {body[:_SUMMARY_MAX]}")
+        if r.get("content"):
+            lines.append(f"   正文: {r['content'][:_CONTENT_MAX]}")
+    lines.append(_FULLTEXT_HINT)
+    return "\n".join(lines)
+
+
+async def web_search(
+    query: str,
+    max_results: int = 5,
+    provider: str | None = None,
+    need_content: bool = False,
+    ori_question: str | None = None,
+) -> dict:
+    """联网搜索：DeepSeek Search 优先，失败自动回退 Bing。
+
+    provider: None=按环境变量（默认 auto）/ "deepseek" / "bing" / "auto"
+    need_content: 让接口直接返回网页正文（token 更贵，默认关）
+    ori_question: 触发搜索的用户原始问题，便于理解搜索意图
+    """
+    if not query.strip():
+        return {"success": False, "result": "搜索关键词不能为空"}
+
+    query = _sanitize_query(query)
+    chosen = _resolve_provider("search", provider)
+    chain = ["deepseek", "bing"] if chosen == "auto" else [chosen]
+    cache_key = _cache_key("search", query, max_results, need_content)
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    failures: list[str] = []
+    for p in chain:
+        if p == "deepseek":
+            if not ds.available():
+                failures.append("DeepSeek 未配置 API Key")
+                continue
+            if _over_daily_limit("search"):
+                failures.append("DeepSeek 搜索已达今日调用上限（ZENITH_WEB_DAILY_LIMIT）")
+                continue
+            t0 = time.perf_counter()
+            out = await ds.ds_search(
+                query,
+                count=max_results,
+                need_content=need_content,
+                ori_question=ori_question,
+            )
+            _record_call("search", out.get("success", False), out.get("status") or (200 if out.get("success") else 0),
+                         (time.perf_counter() - t0) * 1000, query)
+            if out.get("success"):
+                results = out.get("results") or []
+                if results:
+                    res = {
+                        "success": True,
+                        "result": _format_ds_results(query, results),
+                        "results": results,
+                        "provider": "deepseek",
+                    }
+                    _cache_put(cache_key, res)
+                    return res
+                # 官方明确：搜索正常结束但无匹配 → 空数组。此时试一次本地，不成也不亏。
+                failures.append("DeepSeek 搜索无结果")
+                logger.info("DeepSeek 搜索无结果，尝试本地兜底: %s", query)
+                continue
+            failures.append(out.get("result", ""))
+            logger.info("DeepSeek 搜索失败，回退 Bing: %s | %s",
+                        query[:60], str(out.get("result", ""))[:120])
+            continue
+
+        out = await _search_bing(query, max_results)
+        if out.get("success"):
+            if failures:
+                # 让模型/日志看得见「这次是回退来的」，避免把降级结果当官方结果用
+                out["result"] = (f"（DeepSeek 搜索不可用：{failures[0][:80]}；已回退 Bing）\n"
+                                 + out["result"])
+            out["provider"] = "bing"
+            _cache_put(cache_key, out)
+            return out
+        failures.append(out.get("result", ""))
+
+    return {"success": False, "result": _join_failures(failures), "provider": chosen}
+

@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
 
-SHIJI_KB = Path(os.environ.get("SHIJI_KB_DIR", "./shiji-kb"))
-ZENITH_DB = Path(os.environ.get("ZENITH_DB_PATH", "./data/zenith.db"))
+SHIJI_KB = Path(r"D:\下载文件\新建文件夹\shiji-kb")
+ZENITH_DB = Path(r"D:\下载文件\新建文件夹\zenith-v2\data\zenith.db")
 CHAPTER_DIR = SHIJI_KB / "chapter_md"
 ENTITY_INDEX = SHIJI_KB / "kg" / "entity_index.json"
 
@@ -33,7 +32,8 @@ TYPE_CN = {
 }
 
 
-def index_chapters(limit: int | None = None, dry_run: bool = False):
+def index_chapters(limit: int | None = None, dry_run: bool = False,
+                   collection: str | None = None):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from zotero_parse_rag_core import ingest_text_file
 
@@ -48,7 +48,9 @@ def index_chapters(limit: int | None = None, dry_run: bool = False):
 
     ok = fail = 0
     for f in files:
-        r = ingest_text_file(f, title=f.stem)
+        # 2026-10-08：补 collection 透传（多集合改造回归修复）。
+        # collection=None 时行为与改造前完全一致 → 落 DEFAULT_COLLECTION。
+        r = ingest_text_file(f, title=f.stem, collection=collection)
         if r.get("status") == "ok":
             ok += 1
         else:
@@ -99,22 +101,14 @@ def import_entities(top_n: int = 300, dry_run: bool = False):
     conn.commit()
     conn.close()
     print(f"导入 {imported} 个实体（跳过已存在 {skipped}）")
-    # 2026-09-11 备注（审计发现 B6）：
-    #   本脚本是唯一绕过 `backend.database.mem_add` 直接写 memories 的路径（其余调用点
-    #   2026-09-11 起已由 mem_add 内置门禁统一覆盖）。此处保留精确内容 + source_conv_id 的
-    #   幂等判据 —— 对「确定性批量灌入」这是恰当的（重跑不会翻倍）。
-    #   ⚠️ 但真正的问题不是去重，而是**层级**：KG 实体属于知识图谱/RAG 层，
-    #      塞进 memories 只是把 schema.check 里的 'fact' 当垃圾桶用。
-    #      这 300 条模板句（`X——类型（…出现 N 次）`）会稀释记忆检索。
-    #      处置方式（迁回 RAG 层 / 归档 / 保留）属数据层决策，未在本次改动中擅自处理。
 
 
-def stats():
+def stats(collection: str | None = None):
     # chromadb 片段数
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from zotero_parse_rag_core import get_store, load_progress
-        store = get_store()
+        store = get_store(collection)
         print(f"chromadb 片段数: {store.count()}")
         prog = load_progress()
         print(f"progress.json 记录: {len(prog)} 篇")
@@ -138,15 +132,17 @@ def main():
     ap.add_argument("--import-entities", nargs="?", const=300, type=int, help="导入 top-N 核心实体（默认 300）")
     ap.add_argument("--stats", action="store_true", help="查看库状态")
     ap.add_argument("--limit", type=int, default=None, help="限制索引篇数（测试用）")
+    ap.add_argument("--collection", default=None,
+                    help="目标 RAG 集合（默认走 DEFAULT_COLLECTION，即 zotero_papers）")
     ap.add_argument("--dry-run", action="store_true", help="只打印不执行")
     args = ap.parse_args()
 
     if args.index_chapters:
-        index_chapters(limit=args.limit, dry_run=args.dry_run)
+        index_chapters(limit=args.limit, dry_run=args.dry_run, collection=args.collection)
     if args.import_entities:
         import_entities(top_n=args.import_entities, dry_run=args.dry_run)
     if args.stats:
-        stats()
+        stats(collection=args.collection)
     if not (args.index_chapters or args.import_entities or args.stats):
         ap.print_help()
 

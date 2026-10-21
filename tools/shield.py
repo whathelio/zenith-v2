@@ -6,7 +6,6 @@ import re
 import json
 import os
 import sys
-from datetime import datetime
 
 MAP_FILE = os.path.join(os.path.dirname(__file__), "secure_map.json")
 
@@ -42,7 +41,7 @@ def load_map() -> dict:
             with open(MAP_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
-            print(f"⚠️  映射表损��，重新创建")
+            print("⚠️  映射表损坏，重新创建")
     return {}
 
 
@@ -144,7 +143,7 @@ if __name__ == "__main__":
     set_clipboard(masked)
 
     total = len(load_map())
-    print(f"✅ 已脱敏并复制到剪贴板！")
+    print("✅ 已脱敏并复制到剪贴板！")
     print(f"   本次新增: {count}  累计映射: {total}")
     print(f"   映射表: {MAP_FILE}")
     if masked != raw:

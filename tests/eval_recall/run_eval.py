@@ -6,7 +6,6 @@ pytest 可用时请优先用 pytest 跑，本文件仅作沙箱/最小环境回�
 from __future__ import annotations
 
 import json
-import sys
 import traceback
 
 import conftest

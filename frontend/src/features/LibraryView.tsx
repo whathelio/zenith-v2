@@ -51,6 +51,15 @@ const SKILL_CONFIRMED_COLORS: Record<number, { bg: string; text: string; label: 
   0: { bg: '#ff5c5c22', text: '#ff5c5c', label: '待确认' },
   1: { bg: '#1ae86522', text: '#1ae865', label: '已确认' },
 }
+/** A8（2026-10-14）：四类过程痕迹（assess/assess_outcome/mem_recall/preread）。
+ *  数据侧已在产（chat.py 写入），但 data 无 name/args/result_summary 字段，
+ *  旧 parseTraceData 会把它们渲染成空白行。配色对齐 TraceCard.tsx 的 KIND_META 约定。 */
+const TRACE_TYPE_META: Record<string, { label: string; color: string }> = {
+  assess:         { label: '评估',     color: '#c792ea' },
+  assess_outcome: { label: '评估对照', color: '#c792ea' },
+  mem_recall:     { label: '记忆召回', color: '#50fa7b' },
+  preread:        { label: '预读',     color: '#4fc3f7' },
+}
 
 type Tab = 'notes' | 'memories' | 'skills' | 'mcp' | 'traces'
 
@@ -417,6 +426,74 @@ export default function LibraryView() {
   const parseTraceData = (t: any): { name: string; args: any; result: string; duration?: number } => {
     let d: any = {}
     try { d = typeof t.data === 'string' ? JSON.parse(t.data) : (t.data || {}) } catch { d = {} }
+    // A8：四类过程痕迹的 data 形状（见 backend/routers/chat.py 写入点）——
+    //   assess:          {intents, suggested, preread, text_len}
+    //   assess_outcome:  {suggested, called, preread, missed}
+    //   mem_recall:      {mode, chars, truncated, replaced_by_summary, memory_ids, note_ids, groups}
+    //   preread:         {tool, args, ok, empty, injected, chars}
+    // 均无 name/args/result_summary，旧逻辑落到 `t.trace_type` 裸串 + 空展开区。
+    if (t.trace_type === 'assess') {
+      const intents: string[] = d.intents || []
+      const suggested: string[] = d.suggested || []
+      const preread: string[] = d.preread || []
+      return {
+        name: '意图评估',
+        args: { intents, suggested, preread, text_len: d.text_len ?? 0 },
+        result: [
+          `识别 ${intents.length} 个意图 · 建议 ${suggested.length} 项 · 可预读 ${preread.length} 项`,
+          intents.length ? `意图: ${intents.join('、')}` : '',
+          suggested.length ? `建议: ${suggested.join('、')}` : '',
+          preread.length ? `预读白名单: ${preread.join('、')}` : '',
+        ].filter(Boolean).join('\n'),
+        duration: d.duration_ms,
+      }
+    }
+    if (t.trace_type === 'assess_outcome') {
+      const suggested: string[] = d.suggested || []
+      const called: string[] = d.called || []
+      const preread: string[] = d.preread || []
+      const missed: string[] = d.missed || []
+      return {
+        name: '评估对照',
+        args: { suggested, called, preread, missed },
+        result: [
+          `建议 ${suggested.length} · 模型调用 ${called.length} · 系统预读 ${preread.length} · 遗漏 ${missed.length}`,
+          called.length ? `已调用: ${called.join('、')}` : '',
+          missed.length ? `遗漏: ${missed.join('、')}` : '',
+        ].filter(Boolean).join('\n'),
+        duration: d.duration_ms,
+      }
+    }
+    if (t.trace_type === 'mem_recall') {
+      const memoryIds: number[] = d.memory_ids || []
+      const noteIds: number[] = d.note_ids || []
+      const flags = [
+        d.truncated ? '已截断' : '',
+        d.replaced_by_summary ? '被周期摘要替换' : '',
+      ].filter(Boolean).join(' · ')
+      return {
+        name: '记忆召回',
+        args: { mode: d.mode || '', memory_ids: memoryIds, note_ids: noteIds, groups: d.groups || {} },
+        result: [
+          `记忆 ${memoryIds.length} 条 · 笔记 ${noteIds.length} 条 · ${d.chars ?? 0} 字`,
+          flags ? `状态: ${flags}` : '',
+          memoryIds.length ? `memory_ids: ${memoryIds.join(', ')}` : '',
+        ].filter(Boolean).join('\n'),
+        duration: d.duration_ms,
+      }
+    }
+    if (t.trace_type === 'preread') {
+      return {
+        name: `预读 ${d.tool || '未知工具'}`,
+        args: d.args || {},
+        result: [
+          d.ok === false ? '执行失败' : '执行成功',
+          d.injected ? '已注入 prompt' : d.empty ? '空结果，未注入' : '未注入',
+          `结果 ${d.chars ?? 0} 字`,
+        ].join(' · '),
+        duration: d.duration_ms,
+      }
+    }
     return {
       name: d.name || t.trace_type || 'unknown',
       args: d.args || {},
@@ -646,18 +723,6 @@ export default function LibraryView() {
                             }}
                             title="创建学习对话"
                           >📚</button>
-                          <button
-                            className="btn-icon"
-                            style={{ width: 24, height: 24, fontSize: 10, color: '#ff6e40' }}
-                            onClick={async () => {
-                              try {
-                                await api.transform('note', n.id, 'memory')
-                                showToast(`已转为记忆 ✓`)
-                                loadNotes()
-                              } catch { showToast('转化失败') }
-                            }}
-                            title="转为记忆"
-                          >🧠</button>
                           <TransformButton sourceType="note" sourceId={n.id} onTransformed={() => loadNotes()} />
                           <button className="btn-icon" style={{ width: 24, height: 24, fontSize: 11 }} onClick={() => startNoteEdit(n)} title="编辑">✎</button>
                           <button className="btn-icon" style={{ width: 24, height: 24, fontSize: 11 }} onClick={() => handleDeleteNote(n.id)} title="删除">×</button>
@@ -1081,6 +1146,10 @@ export default function LibraryView() {
                 <option value="llm_call">LLM 调用</option>
                 <option value="error">错误</option>
                 <option value="validation">校验</option>
+                <option value="assess">意图评估</option>
+                <option value="assess_outcome">评估对照</option>
+                <option value="mem_recall">记忆召回</option>
+                <option value="preread">预读</option>
               </select>
               <button className="btn btn-sm" onClick={loadTraces}>🔍 查询</button>
               <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>共 {traces.length} 条</span>
@@ -1134,14 +1203,14 @@ export default function LibraryView() {
             {tracesLoading ? (
               <div className="empty-state"><p style={{ fontSize: 13 }}>加载中...</p></div>
             ) : traces.length === 0 ? (
-              <div className="empty-state"><p style={{ fontSize: 13 }}>暂无执行痕迹（有工具调用后才会记录）</p></div>
+              <div className="empty-state"><p style={{ fontSize: 13 }}>暂无执行痕迹（有工具调用或对话后才会记录）</p></div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
                 {traces.map(t => {
                   const isExpanded = expandedTraceId === t.id
                   const info = parseTraceData(t)
                   const tType = t.trace_type || ''
-                  const tColor = tType === 'error' ? '#ff5555' : tType === 'validation' ? '#ffab40' : '#8be9fd'
+                  const tColor = tType === 'error' ? '#ff5555' : tType === 'validation' ? '#ffab40' : (TRACE_TYPE_META[tType]?.color ?? '#8be9fd')
                   return (
                     <div key={t.id} style={{
                       display: 'flex', alignItems: 'flex-start', gap: 10,
@@ -1154,7 +1223,7 @@ export default function LibraryView() {
                         background: tColor, color: '#111', padding: '2px 6px', borderRadius: 4,
                         fontSize: 10, fontWeight: 600, flexShrink: 0, whiteSpace: 'nowrap',
                       }}>
-                        {tType === 'error' ? '✗' : '✓'} {tType || 'trace'}
+                        {tType === 'error' ? '✗' : '✓'} {TRACE_TYPE_META[tType]?.label || tType || 'trace'}
                       </span>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)' }}>

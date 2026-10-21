@@ -19,7 +19,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `api_gateway.py` | FastAPI 中台：`/health` `/search` `/wiki` `/agent` `/tasks` |
+| `api_gateway.py` | FastAPI 中台（v0.2.0）：`/health` `/search` `/wiki` `/agent` `/tasks` `/ingest` `/documents` `/collections` |
 | `task_queue.py` | SQLite 轻量任务队列：pending/processing/done/failed + stale 兜底 |
 
 ---
@@ -40,7 +40,7 @@
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 返回 `{"status":"ok"}` |
-| POST | `/search` | 同步 RAG 问答，body: `{"question":"...","top_k":5}` |
+| POST | `/search` | 同步 RAG 问答，body: `{"question":"...","top_k":5,"collection":"..."}`（`collection` 可选，多集合改造新增） |
 | POST | `/wiki` | 同步 LLM Wiki 问答，body: `{"question":"..."}` |
 | POST | `/agent` | Agent 占位，body: `{"message":"..."}` |
 | POST | `/tasks` | 创建异步任务，body: `{"type":"search|wiki|agent","payload":{...}}` |
@@ -94,18 +94,18 @@ uvicorn api_gateway:app --host 0.0.0.0 --port 8788
 ```bash
 # 健康检查
 curl http://127.0.0.1:8788/health
-# => {"status":"ok","service":"zenith-knowledge-api","version":"0.1.0"}
+# => {"status":"ok","service":"zenith-knowledge-api","version":"0.2.0"}
 
 # 无 key → 401
 curl -X POST http://127.0.0.1:8788/tasks -H "Content-Type: application/json" -d '{"type":"wiki","payload":{"question":"test"}}'
 # => 401
 
 # 有 key → 创建任务
-curl -X POST http://127.0.0.1:8788/tasks -H "X-API-Key: test-key" -H "Content-Type: application/json" -d '{"type":"wiki","payload":{"question":"test"}}'
+curl -X POST http://127.0.0.1:8788/tasks -H "X-API-Key: $ZENITH_API_KEY" -H "Content-Type: application/json" -d '{"type":"wiki","payload":{"question":"test"}}'
 # => {"task_id":"172d309be609","status":"pending"}
 
 # 查询任务列表
-curl "http://127.0.0.1:8788/tasks?limit=5" -H "X-API-Key: test-key"
+curl "http://127.0.0.1:8788/tasks?limit=5" -H "X-API-Key: $ZENITH_API_KEY"
 ```
 
 ---

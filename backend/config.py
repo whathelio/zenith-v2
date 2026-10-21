@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import yaml
@@ -19,6 +20,8 @@ CONFIG_JSON = DATA_DIR / "config.json"
 CONFIG_YAML = CONFIG_DIR / "config.yaml"
 ENV_FILE = PROJECT_DIR / ".env"
 DB_PATH = DATA_DIR / "zenith.db"
+
+logger = logging.getLogger(__name__)
 
 
 def _load_dotenv() -> dict:
@@ -58,7 +61,7 @@ SYSTEM_PROMPT = (
     "4. 笔记管理 — 捕捉值得保存的想法和观点\n"
     "5. 代码执行 — 在代码运行器中执行 Python 代码（非隔离，仅限本地单用户）\n"
     "6. 上下文压缩 — 长对话自动生成摘要\n"
-    "7. 网页访问 — 读取网页内容或主动联网搜索最新信息\n"
+    "7. 网页访问 — 读取网页内容（服务端渲染抓取优先）或联网搜索最新信息\n"
     "8. 内容总结 — 分析任意链接（文章/B站/GitHub/视频），生成结构化摘要\n"
     "9. 学术检索 — 按关键词/日期/期刊检索论文（OpenAlex/Crossref），结果存入本地学术库\n"
     "\n"
@@ -72,7 +75,9 @@ SYSTEM_PROMPT = (
     "7. 需要分析时间安排 → 调用 time_plan\n"
     "8. 用户发来链接 / 让你看某个网页 / 总结这篇文章或视频 → 优先调用 analyze_content（自动识别B站/GitHub/文章/视频并生成摘要）\n"
     "9. 需要读取网页原始内容（如提取特定文字）→ 调用 web_fetch\n"
-    "10. 需要联网查最新信息 → 调用 web_search 搜索\n"
+    "10. 需要联网查最新信息 → 调用 web_search 搜索（默认 DeepSeek 引擎，不可用时自动回退 Bing；"
+    "query 支持 site: / after: / before: / lang: / \"精确短语\" 等运算符；"
+    "只有确实需要正文细节时才传 need_content=true，否则拿到摘要后再用 web_fetch 取全文）\n"
     "11. 需要查本地文献/论文/书籍内容 → 调用 retrieve_docs（RAG 检索；返回「未命中」时会自动附本地笔记/记忆回落结果）\n"
     "12. 用户问知识库状态 → 调用 kb_stats\n"
     "13. 需要记录日程/笔记/记忆/技能 → 调用 smart_classify（不要用 retrieve_docs 记录信息）\n"
@@ -213,21 +218,65 @@ def _config_file_signature() -> tuple | None:
         return None
 
 
+def _read_config_mapping(path: Path) -> dict:
+    """读 YAML 并保证返回 dict；损坏时抛 yaml.YAMLError（由调用方兜底）。"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        # 顶层是列表/字符串（例如写到一半被截断）都算损坏，不能当配置用
+        raise yaml.YAMLError(f"配置文件顶层不是映射，而是 {type(data).__name__}")
+    return data
+
+
+def _config_backup_path() -> Path:
+    return CONFIG_YAML.with_name(CONFIG_YAML.name + ".bak")
+
+
 def _load_config_uncached() -> dict:
-    """加载配置，优先级：YAML > JSON > 默认值"""
+    """加载配置，优先级：YAML > JSON > 默认值
+
+    2026-10-17 审计 A3-R4 修复：
+      原实现对 `yaml.safe_load` **零异常捕获**，而 save_config 又是截断重写。
+      一次写中断（断电/杀进程/磁盘满）留下的半截 YAML 会让此后**每次** load
+      都抛异常 —— 全站 500 且服务起不来，且用户没有任何自助恢复路径。
+      现改为：YAML 损坏 → 回退同目录 .bak → 仍不行则用默认值运行并**大声报错**。
+      注意：损坏时**不覆盖**原文件（保留现场供人工抢救），也不静默吞掉。
+    """
     ensure_dirs()
 
     # 1. 尝试 YAML
     if CONFIG_YAML.exists():
-        with open(CONFIG_YAML, "r", encoding="utf-8") as f:
-            saved = yaml.safe_load(f) or {}
-        return {**DEFAULT_CONFIG, **saved}
+        try:
+            return {**DEFAULT_CONFIG, **_read_config_mapping(CONFIG_YAML)}
+        except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+            logger.error("config.yaml 解析失败：%s", exc)
+            bak = _config_backup_path()
+            if bak.exists():
+                try:
+                    cfg = {**DEFAULT_CONFIG, **_read_config_mapping(bak)}
+                    logger.warning("已从 %s 恢复配置（损坏的原文件保留未覆盖）", bak.name)
+                    return cfg
+                except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc2:
+                    logger.error("%s 同样不可用：%s", bak.name, exc2)
+            logger.error(
+                "配置全部不可用，本次以默认值运行；请人工检查 %s（文件已保留，未被覆盖）",
+                CONFIG_YAML,
+            )
+            return dict(DEFAULT_CONFIG)
 
     # 2. 尝试 JSON（兼容 v1）
     if CONFIG_JSON.exists():
-        with open(CONFIG_JSON, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        return {**DEFAULT_CONFIG, **saved}
+        try:
+            with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise ValueError(f"顶层不是对象：{type(saved).__name__}")
+            return {**DEFAULT_CONFIG, **saved}
+        except (ValueError, OSError, UnicodeDecodeError) as exc:
+            logger.error("config.json 解析失败，本次以默认值运行：%s", exc)
+            return dict(DEFAULT_CONFIG)
 
     # 3. 首次运行，写入默认配置
     save_config(DEFAULT_CONFIG)
@@ -251,11 +300,35 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    """保存配置到 YAML（写后更新配置缓存）"""
+    """保存配置到 YAML（原子写 + 写后更新配置缓存）
+
+    2026-10-17 审计 A3-R4 修复：原实现 `open(path,'w')` 直接截断重写，
+    写到一半失败就留下半截文件。现改为「临时文件 → fsync → 上一版转 .bak →
+    os.replace 原子替换」，保证任何时刻磁盘上都有一个完整的 config.yaml。
+    """
     global _config_cache, _config_cache_sig
     ensure_dirs()
-    with open(CONFIG_YAML, "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    text = yaml.dump(cfg, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tmp = CONFIG_YAML.with_name(f"{CONFIG_YAML.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if CONFIG_YAML.exists():
+            try:
+                os.replace(CONFIG_YAML, _config_backup_path())
+            except OSError as exc:  # 备份失败不该挡住写入
+                logger.warning("保留 config.yaml.bak 失败：%s", exc)
+        os.replace(tmp, CONFIG_YAML)
+    except OSError:
+        # 落盘失败必须让调用方知道（否则界面提示"已保存"但实际没写）
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
     _config_cache = copy.deepcopy(cfg)
     _config_cache_sig = _config_file_signature()
 
@@ -326,6 +399,19 @@ def mask_sensitive_fields(obj):
 _DROP = object()
 
 
+def _has_blank_sensitive(d: dict) -> bool:
+    """该 dict 里是否存在「名字命敏感规则、值是空串」的字段。
+
+    用于区分「改名」（会把掩码原样发回来）与「同位置换成一个新 provider」
+    （敏感字段是空的）—— 后者绝不能继承上一个 provider 的密钥。
+    """
+    return any(
+        isinstance(k, str) and _SENSITIVE_NAME_RE.search(k)
+        and isinstance(v, str) and not v.strip()
+        for k, v in d.items()
+    )
+
+
 def restore_masked_fields(new, old):
     """把 new 中「看起来是本模块生成的掩码」的值换回 old 里的真实值。
 
@@ -335,20 +421,44 @@ def restore_masked_fields(new, old):
     if isinstance(new, dict):
         out = {}
         for k, v in new.items():
-            r = restore_masked_fields(v, old.get(k) if isinstance(old, dict) else None)
-            if r is not _DROP:
-                out[k] = r
+            old_v = old.get(k) if isinstance(old, dict) else None
+            r = restore_masked_fields(v, old_v)
+            if r is _DROP:
+                continue
+            # 2026-10-17 审计 0-2 修复：敏感字段被「清空」时保留旧值。
+            # 前端是「GET 掩码 → 改几处 → PUT 整包」，用户把 provider 的 api_key
+            # 输入框清空后保存会提交空串；而 is_masked("") 为 False → 空串原样落盘，
+            # 真实密钥被静默清空（界面还提示"已保存"）。
+            # 语义取舍：**UI 无法通过清空来删除密钥**（要删请直接改 config.yaml）——
+            # 宁可"删不掉"也不能"误删"。
+            if (
+                isinstance(r, str) and not r.strip()
+                and isinstance(old_v, str) and old_v.strip() and not is_masked(old_v)
+                and isinstance(k, str) and _SENSITIVE_NAME_RE.search(k)
+            ):
+                logger.info("字段 %s 被提交为空值，已保留原配置（不做删除）", k)
+                out[k] = old_v
+                continue
+            out[k] = r
         return out
     if isinstance(new, list):
         out = []
         for i, item in enumerate(new):
             old_item = old[i] if isinstance(old, list) and i < len(old) else None
             if isinstance(item, dict) and item.get("name") and isinstance(old, list):
-                old_item = next(
+                matched = next(
                     (o for o in old
                      if isinstance(o, dict) and o.get("name") == item.get("name")),
-                    old_item,
+                    None,
                 )
+                if matched is not None:
+                    old_item = matched
+                elif _has_blank_sensitive(item):
+                    # 名字对不上 + 敏感字段是空值 = 这一格被换成了一个新 provider，
+                    # 不能沿用 old[i] 的密钥（否则新 provider 会静默继承上一个的 key）。
+                    old_item = None
+                # 其余情况保留 index 兜底：改名场景下密钥跟着位置走，是既有设计
+                # （见 tests/backend/test_config_masking.py::test_rename_falls_back_to_index）。
             r = restore_masked_fields(item, old_item)
             if r is not _DROP:
                 out.append(r)

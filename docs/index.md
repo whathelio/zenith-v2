@@ -5,6 +5,7 @@
 |------|------|
 | [../README.md](../README.md) | 项目首页，快速开始 |
 | [../SECURITY.md](../SECURITY.md) | 🔴 安全策略（承重文档，被代码引用） |
+| [文件归属.md](./文件归属.md) | 🧭 **源 ↔ 路径 ↔ 维护者**（改任何文件前先查它有没有权改） |
 
 ## 治理评审
 | 文件 | 说明 |
@@ -13,14 +14,16 @@
 | [文档治理评审报告.md](./文档治理评审报告.md) | 2026-07-18 的文档治理评审 |
 | [前端模块清单与截图分析.md](./前端模块清单与截图分析.md) | 前端 10 页面的路由/组件/截图分析 |
 
-## ADR — 架构决策记录 (8 文件)
+## ADR — 架构决策记录
 | 文件 | 说明 |
 |------|------|
+| [adr/README.md](./adr/README.md) | 📐 **ADR 规范：编号规则 · 必含六节 · 编号映射建议（待裁定）** |
+| [adr/template.md](./adr/template.md) | 新增 ADR 的模板 |
 | [agent-driven-knowledge-workflow.md](./adr/agent-driven-knowledge-workflow.md) | 知识工作流设计 v1 |
 | [agent-driven-knowledge-workflow-v2.md](./adr/agent-driven-knowledge-workflow-v2.md) | 知识工作流设计 v2（当前版本） |
-| [agent-driven-knowledge-workflow-治理评审.md](./adr/agent-driven-knowledge-workflow-治理评审.md) | 知识工作流治理评审 |
+| [agent-driven-knowledge-workflow-治理评审.md](./adr/agent-driven-knowledge-workflow-治理评审.md) | 知识工作流治理评审（建议移到 audit/） |
 | [RAG-落地分析.md](./adr/RAG-落地分析.md) | RAG 知识库落地方案 |
-| [DeepSeek对话_Zenith整合分析报告.md](./adr/DeepSeek对话_Zenith整合分析报告.md) | LLM 选型与整合方案 |
+| [DeepSeek对话_Zenith整合分析报告.md](./adr/DeepSeek对话_Zenith整合分析报告.md) | LLM 选型与整合方案（建议移到 audit/） |
 | [zenith-超轻量Agent架构优化-v3.md](./adr/zenith-超轻量Agent架构优化-v3.md) | Agent 架构优化 v3 |
 | [pdf-ingest-governance.md](./adr/pdf-ingest-governance.md) | PDF 入库治理方案 |
 | [代码治理工作流借鉴.md](./adr/代码治理工作流借鉴.md) | 代码治理流程设计 |
@@ -72,4 +75,4 @@
 
 ---
 
-*最后更新：2026-07-23*
+*最后更新：2026-10-09（新增 ADR 规范与模板、文件归属表）*

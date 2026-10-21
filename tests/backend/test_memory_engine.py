@@ -1,10 +1,9 @@
 """记忆引擎测试 — FTS5 搜索 + n-gram TF-IDF 相似度 + 去重"""
-import pytest
 from backend.memory_engine import (
     _similarity, _is_duplicate, build_memory_injection,
     _extract_keywords, mem_consolidate,
 )
-from backend.database import mem_add, mem_search, mem_list, mem_del
+from backend.database import mem_add, mem_search
 
 
 class TestSemanticSimilarity:

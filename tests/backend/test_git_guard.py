@@ -1,6 +1,5 @@
 """git_guard 测试 — 快照/回退/列表（2026-08-20 治理：zenith 自改代码+版本回退）"""
 import pytest
-from pathlib import Path
 
 
 @pytest.fixture
@@ -24,7 +23,6 @@ class TestGitGuardLive:
     def test_commit_and_list(self, git_repo, monkeypatch):
         """真实 commit + list_snapshots 可见"""
         from backend import git_guard
-        repo, _ = git_repo, git_repo / "backend"
         monkeypatch.setattr(git_guard, "PROJECT_ROOT", git_repo)
         monkeypatch.setattr(git_guard, "_is_testing", lambda: False)
         # 初始文件

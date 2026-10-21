@@ -47,6 +47,8 @@ res = store.query(embedding, top_k=5)
 | `kb_stats` | 知识库统计 |
 | `deploy_rag_stack` | 拉取并部署 RAG 服务（白名单+确认） |
 
+> 注（2026-10-08 多集合改造）：上表的 `list_collections` 指 **Zotero 收藏夹**；RAG 侧向量集合另由 `zotero_parse_rag_core.list_rag_collections()`（网关 `GET /collections`）列出，检索 / 入库入口均新增可选 `collection` 参数（默认集合由 `ZENITH_RAG_COLLECTION` 决定）。
+
 调用方式：
 ```python
 from zenith_rag_tools import TOOLS_SCHEMA, handle_tool

@@ -28,6 +28,7 @@ Zotero → 本地 RAG 核心脚本（Day1 增强版）
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -59,7 +60,17 @@ _DEFAULT_RAG_WORK_DIR = (
 WORK_DIR = Path(os.environ.get("ZENITH_RAG_WORK_DIR", str(_DEFAULT_RAG_WORK_DIR)))
 CHROMA_PATH = WORK_DIR / "chroma_db"
 PROGRESS_FILE = WORK_DIR / "progress.json"
-COLLECTION_NAME = "zotero_papers"
+# 🔴 C-4 改造（2026-10-08）：集合名**参数化**。
+# 原实现把 "zotero_papers" 硬编码在 get_store() 里 ⇒ 任何外部语料（如 NOMAD）
+# 只能灌进论文集合，**无法隔离、无法整块回滚**（import_shiji.py 即被这条挡住的先例）。
+# 现在：DEFAULT_COLLECTION 仍是原值（旧行为不变），但所有入库/检索入口都接受显式 collection。
+DEFAULT_COLLECTION = os.environ.get("ZENITH_RAG_COLLECTION", "zotero_papers")
+COLLECTION_NAME = DEFAULT_COLLECTION          # 兼容旧引用，勿删
+
+# 🔴 本地路径入库白名单（仅 /ingest/local 与 worker 的 ingest 用到）。
+# 默认**空 = 该能力关闭**，避免出现「任意本地文件读取」面。迁移时显式开。
+_INGEST_ROOTS_RAW = os.environ.get("ZENITH_INGEST_ROOTS", "")
+INGEST_ROOTS = [Path(x).resolve() for x in _INGEST_ROOTS_RAW.split(os.pathsep) if x.strip()]
 
 _LOCAL_BGE = Path(__file__).resolve().parent / "bge-small-model"
 _DEFAULT_EMBED_MODEL = str(_LOCAL_BGE) if _LOCAL_BGE.exists() else "BAAI/bge-small-zh-v1.5"
@@ -87,6 +98,36 @@ ANSWER_MAX_TOKENS = int(os.environ.get("ZENITH_RAG_ANSWER_TOKENS", "2048"))
 #    改走别的判据）。此前写的 0.45 是照搬 kb-v2 在另一个语料上的值，
 #    在本语料上会放过「莎士比亚四大悲剧」(0.4582) 这类假命中。
 MIN_SCORE = float(os.environ.get("ZENITH_RAG_MIN_SCORE", "0.53"))
+
+# 🟡 2026-10-08（多集合改造 C-4 的延伸）：MIN_SCORE 允许**按集合覆盖**。
+# 实测（_diag_archive/2026-10-08/min_score_recheck.py，chunk↔chunk 口径）两个语料
+# 的 Youden 最优阈值相差 0.08（nomad_ref 0.708 / zotero_papers 0.788）——
+# 语料不同，单个全局值必然让其中一方妥协。故开一个**可选**覆盖通道：
+#   ZENITH_RAG_MIN_SCORE_MAP='{"nomad_ref": 0.53, "zotero_papers": 0.53}'
+# 未配置 / 未命中 / 解析失败 → 一律回落全局 MIN_SCORE（**默认行为完全不变**）。
+# ⚠️ 覆盖值同样必须来自该语料的实测分布，不要照搬别的语料。
+_MIN_SCORE_MAP: dict = {}
+try:
+    _raw_min_map = os.environ.get("ZENITH_RAG_MIN_SCORE_MAP", "").strip()
+    if _raw_min_map:
+        import json as _json_minmap
+        _MIN_SCORE_MAP = {str(k): float(v)
+                          for k, v in _json_minmap.loads(_raw_min_map).items()}
+except Exception:  # noqa: BLE001 —— 环境变量写坏不能拖垮整个 RAG 服务
+    _MIN_SCORE_MAP = {}
+
+
+def min_score_for(collection: "str | None" = None) -> float:
+    """取该集合生效的相关性地板；未覆盖则回落全局 MIN_SCORE。
+
+    🔴 2026-10-08 修复（code-reviewer 查出、我实测复现）：
+    `collection=None` 必须按 **DEFAULT_COLLECTION** 解析，不能直接回落全局值 ——
+    因为 `get_store(None)` 用的就是 DEFAULT_COLLECTION。否则「给默认集合设的
+    覆盖永远不生效」。实测：map={"zotero_papers":0.70} 时
+    `min_score_for(None)` 仍返回 0.53，而 `min_score_for("zotero_papers")` 返回 0.70。
+    """
+    return _MIN_SCORE_MAP.get(collection or DEFAULT_COLLECTION, MIN_SCORE)
+
 DEFAULT_WORKERS = int(os.environ.get("ZENITH_RAG_WORKERS", "4"))
 
 
@@ -102,14 +143,27 @@ class VectorStore(Protocol):
 
 
 class ChromaStore:
-    """Chroma 实现。后续可新增 LEANNStore / ZvecStore / CairnStore。"""
+    """Chroma 实现。后续可新增 LEANNStore / ZvecStore / CairnStore。
 
-    def __init__(self, path: Path, name: str):
-        import chromadb
-        self._client = chromadb.PersistentClient(path=str(path))
-        self._col = self._client.get_or_create_collection(
-            name=name, metadata={"hnsw:space": "cosine"}
-        )
+    C-4 改造：client 可注入（多集合共用同一 PersistentClient），name 即集合名。
+    """
+
+    def __init__(self, path: Path, name: str, client=None):
+        if client is None:
+            import chromadb
+            path.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(path=str(path))
+        self._client = client
+        self.name = name
+        try:
+            self._col = self._client.get_or_create_collection(
+                name=name, metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as e:
+            # 已存在但 metadata 声明不一致时，退化为直接取用（**不重建、不清空**）
+            print(f"[warn] get_or_create_collection({name}) 失败，退化为 get_collection: {e}",
+                  file=sys.stderr)
+            self._col = self._client.get_collection(name=name)
 
     def upsert(self, ids, embeddings, documents, metadatas):
         self._col.upsert(ids=ids, embeddings=embeddings,
@@ -220,9 +274,175 @@ class ChromaStore:
                 conn.close()
 
 
-def get_store() -> VectorStore:
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    return ChromaStore(CHROMA_PATH, COLLECTION_NAME)
+# ------------------------------------------------------------------
+# 集合与存储（C-4 改造：多集合）
+# ------------------------------------------------------------------
+_CHROMA_CLIENT = None
+_CHROMA_LOCK = threading.Lock()
+_STORES: dict[str, "ChromaStore"] = {}
+_STORES_LOCK = threading.Lock()
+
+
+def _get_chroma_client():
+    """进程内复用的 PersistentClient（同一 path 只建一次）。
+
+    多集合共用同一 client，只按集合名取不同 handle —— 避免反复构造 client
+    （ChromaDB 的 client 构造含 sqlite 连接与目录扫描，不是免费的）。
+    """
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        with _CHROMA_LOCK:
+            if _CHROMA_CLIENT is None:
+                import chromadb
+                WORK_DIR.mkdir(parents=True, exist_ok=True)
+                _CHROMA_CLIENT = chromadb.PersistentClient(path=str(CHROMA_PATH))
+    return _CHROMA_CLIENT
+
+
+def get_store(collection: str | None = None) -> VectorStore:
+    """取指定集合的 store。collection=None → 默认集合（旧行为不变）。"""
+    name = collection or COLLECTION_NAME
+    with _STORES_LOCK:
+        st = _STORES.get(name)
+        if st is None:
+            st = ChromaStore(CHROMA_PATH, name, client=_get_chroma_client())
+            _STORES[name] = st
+        return st
+
+
+def stable_item_id(p: Path, extra: str = "") -> int:
+    """稳定 item_id（C-7 改造）。
+
+    🔴 原实现 `abs(hash(p.name + str(mtime))) % 1000000`：
+    Python 的 str hash **每进程随机化**（PYTHONHASHSEED）⇒ 同一文件重启后
+    算出不同 id ⇒ 重灌产生**重复数据**且无法按 id 清理。
+
+    改为 sha1(name|extra) 前 12 hex → int。**不含 mtime**：这样同一文件的
+    重复入库是幂等 upsert（同 id 覆盖），而不是不断新增。
+    ⚠️ 旧库中已有条目仍是旧的 hash-id，**不重算**（避免打乱既有 13,134 chunk）。
+    """
+    h = hashlib.sha1(f"{p.name}|{extra}".encode("utf-8")).hexdigest()
+    return int(h[:12], 16)
+
+
+def resolve_item_id(store, p: Path, extra: str = "") -> tuple[int, bool]:
+    """撞名 guard（N-1 §5，附加式、零迁移，未实施前的待办项）。
+
+    `stable_item_id` 仅以 basename(+extra) 为键 ⇒ 不同目录下的**同名文件**会算出
+    **同一个 item_id**：后灌者先 `delete_by_item()` 再覆盖，静默丢数据；同时
+    progress.json（扁平的 str(item_id) → 记录）也会互相覆盖。
+
+    此处在 upsert **之前**探测：base_id 已在 store 中 **且** 已存 source 的 basename
+    与 `p.name` 相同 **且** 两者规范化绝对路径不同 ⇒ 命中，把 extra 升级为
+    `f"{extra}|{全路径}"`（extra 为空时即纯全路径键）后重算 item_id。
+    **保留原 extra**：ingest_pdf 的抽取器名不能被路径键顶掉，否则同一 PDF 用不同
+    抽取器入库会塌成同一 id、互相覆盖。
+
+    :returns: `(item_id, collided)`
+        - 未命中：item_id **逐字节等于** `stable_item_id(p, extra)` ——
+          未撞名的文件 id 完全不变（零迁移）。
+        - 命中：collided=True，item_id 为含全路径的新键。
+
+    ⚠️ 已存 source 的取回：`ChromaStore.get_by_item()`（本文件 :188-198）只回传
+    id/chunk_index/text/title，**不含 source_file** ⇒ 无法从 store 取回旧路径。
+    故优先读 chunk dict（若某 store 实现带 source_file），否则回落到 progress.json
+    （写入侧 :1052/:1115 的 "source_file"，键为 str(item_id)）。
+    """
+    item_id = stable_item_id(p, extra)
+    try:
+        existing = store.get_by_item(item_id)
+    except Exception:
+        existing = []
+    if not existing:
+        return item_id, False
+    prev = ""
+    for item in existing:
+        prev = str((item or {}).get("source_file") or "")
+        if prev:
+            break
+    if not prev:
+        try:
+            prev = str((load_progress().get(str(item_id)) or {}).get("source_file") or "")
+        except Exception:
+            prev = ""
+    if (prev and Path(prev).name == p.name
+            and os.path.normcase(os.path.abspath(prev))
+            != os.path.normcase(os.path.abspath(str(p)))):
+        _path_key = str(p.resolve()).replace("\\", "/").lower()
+        # 保留 extra 语义：ingest_pdf 的抽取器名不能被路径键顶掉，否则同一 PDF
+        # 用不同抽取器入库会塌成同一 id、互相覆盖（语义退化）。
+        new_extra = f"{extra}|{_path_key}" if extra else _path_key
+        new_id = stable_item_id(p, new_extra)
+        print(f"[warn] item_id 撞名：{prev} 与 {p} 同名（{p.name}）但路径不同 "
+              f"⇒ 改用含路径键 {new_id}（原 {item_id}）")
+        return new_id, True
+    return item_id, False
+
+
+def _assert_ingest_allowed(p: Path) -> None:
+    """本地路径入库白名单校验。未配置白名单时一律拒绝。"""
+    if not INGEST_ROOTS:
+        raise PermissionError(
+            "本地路径入库未启用（需设 ZENITH_INGEST_ROOTS 白名单目录）")
+    rp = p.resolve()
+    for root in INGEST_ROOTS:
+        try:
+            rp.relative_to(root)
+            return
+        except ValueError:
+            continue
+    raise PermissionError(f"路径不在白名单内: {rp}")
+
+
+def list_rag_collections() -> list[dict]:
+    """列出向量库内全部集合（含 chunk 数）与 progress 内的文档数。"""
+    try:
+        client = _get_chroma_client()
+        cols = client.list_collections()
+    except Exception as e:
+        print(f"[warn] list_collections 失败: {e}")
+        return []
+    prog = load_progress()
+    out = []
+    for c in cols:
+        try:
+            nm = c.name if hasattr(c, "name") else str(c)
+        except Exception:
+            nm = str(c)
+        try:
+            cnt = get_store(nm).count()
+        except Exception:
+            cnt = -1
+        docs = sum(1 for v in prog.values()
+                   if isinstance(v, dict)
+                   and (v.get("collection") or DEFAULT_COLLECTION) == nm)
+        out.append({"collection": nm, "chunks": cnt, "docs": docs})
+    out.sort(key=lambda d: d["collection"])
+    return out
+
+
+def archive_collection(name: str, suffix: str | None = None) -> dict:
+    """集合**归档**（重命名墓碑），不做物理删除。
+
+    对应「零删除」红线：把集合改名成 `<name>__archived_<日期>`，数据仍在磁盘上，
+    随时可改回。物理删除需另行人工处置。
+    """
+    ts = suffix or time.strftime("%Y%m%d")
+    new_name = f"{name}__archived_{ts}"
+    try:
+        client = _get_chroma_client()
+        col = client.get_collection(name=name)
+    except Exception as e:
+        return {"status": "error", "reason": f"集合不存在或读取失败: {e}"}
+    try:
+        col.modify(name=new_name)
+    except Exception as e:
+        return {"status": "error", "reason": f"改名失败: {e}"}
+    with _STORES_LOCK:
+        _STORES.pop(name, None)
+    return {"status": "ok", "from": name, "to": new_name,
+            "note": "已归档（重命名），数据未删除"}
+
 
 
 _EMBEDDER = None
@@ -264,9 +484,19 @@ def load_progress() -> dict:
 
 
 def save_progress(prog: dict):
+    """落盘 progress.json。
+
+    🟡 2026-10-08：改为**原子写**（写临时文件 + os.replace）。
+    原实现是 `open(PROGRESS_FILE, "w")` 直接截断目标文件再写 ——
+    若写入中途进程被杀/Ctrl+C/磁盘满，progress.json 会**半截损坏**，
+    而 build_index 是「每篇落盘」，命中概率不低。
+    `os.replace` 在同分区是原子操作，读端永远只会看到完整的旧版或完整的新版。
+    """
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+    tmp = PROGRESS_FILE.with_suffix(PROGRESS_FILE.suffix + f".tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(prog, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROGRESS_FILE)
 
 
 # ------------------------------------------------------------------
@@ -462,13 +692,14 @@ def process_one(item: Tuple[int, str, Path, float]) -> Tuple[int, str, str, floa
 def build_index(collection_name: str | None = None,
                 workers: int = DEFAULT_WORKERS,
                 limit: int | None = None,
-                force: bool = False):
+                force: bool = False,
+                target_collection: str | None = None):
     try:
         from tqdm import tqdm
     except ImportError:
         tqdm = lambda x, **k: x  # noqa: E731
 
-    store = get_store()
+    store = get_store(target_collection)
     embedder = get_embedder()
     pdfs = list_zotero_pdfs(collection_name, limit)
     prog = {} if force else load_progress()
@@ -521,6 +752,10 @@ def build_index(collection_name: str | None = None,
             prog[str(item_id)] = {
                 "mtime": mtime, "title": title2,
                 "chunks": len(chunks), "source": source,
+                # 2026-10-08 回归修复（#3）：build_index 这条路径原来不写 collection，
+                # 导致它入库的文档在 /documents 里只能靠「字段缺失 → 落默认集合」兜底。
+                # 一旦 ZENITH_RAG_COLLECTION 被改动，这批记录会被整体重挂到新默认集合。
+                "collection": target_collection or DEFAULT_COLLECTION,
             }
             save_progress(prog)  # 每篇落盘，可随时 Ctrl+C
 
@@ -534,15 +769,26 @@ def build_index(collection_name: str | None = None,
 # ------------------------------------------------------------------
 # 问答
 # ------------------------------------------------------------------
-def answer(question: str) -> str:
+def answer(question: str, collection: str | None = None) -> str:
     import openai
-    store = get_store()
+    store = get_store(collection)
     embedder = get_embedder()
     q_emb = embedder.encode([question], normalize_embeddings=True).tolist()[0]
     results = store.query(q_emb, top_k=TOP_K)
+    # 2026-10-08 间歇性未命中排查：分支级埋点（仅 ZENITH_SEARCH_DEBUG=1 时输出）。
+    # 背景：同一进程内、同一入参，answer() 时好时坏；此处记录 chroma 返回的**结构**，
+    # 用以区分「distances 缺失 → 全被地板滤掉」与「docs 本身为空」。
+    if os.environ.get("ZENITH_SEARCH_DEBUG", "0") == "1":
+        _dd = results.get("distances")
+        print(f"[dbg-ans] stage=query keys={sorted(results.keys())} "
+              f"n_docs={len((results.get('documents') or [[]])[0])} "
+              f"n_meta={len((results.get('metadatas') or [[]])[0])} "
+              f"dist_type={type(_dd).__name__} dists={_dd}", file=sys.stderr)
     docs = results["documents"][0]
     metas = results["metadatas"][0]
     if not docs:
+        if os.environ.get("ZENITH_SEARCH_DEBUG", "0") == "1":
+            print("[dbg-ans] stage=A_empty_docs", file=sys.stderr)
         return "知识库中未找到相关内容。"
 
     # 🔴 2026-10-03 补相关性闸门（往期日志 §2 的延长线）。
@@ -555,11 +801,18 @@ def answer(question: str) -> str:
     # 地板值 0.53 来自实测正负样本分布（见 MIN_SCORE 处注释）：
     #   正样本 min 0.5904 / 负样本 max 0.4731 → 区间中点。
     # ⚠️ 换嵌入模型或换语料**必须重测分布**再改这个值。
+    # 2026-10-08：地板值改为「按集合取」—— 不同语料的分布不同，
+    # 由 min_score_for(collection) 决定，未配置覆盖时与旧的全局 MIN_SCORE 等价。
+    _floor = min_score_for(collection)
     _dist = (results.get("distances") or [[]])[0]
     kept = [(d, m, 1.0 - float(_dist[i]))
             for i, (d, m) in enumerate(zip(docs, metas))
-            if i < len(_dist) and (1.0 - float(_dist[i])) >= MIN_SCORE]
+            if i < len(_dist) and (1.0 - float(_dist[i])) >= _floor]
     if not kept:
+        if os.environ.get("ZENITH_SEARCH_DEBUG", "0") == "1":
+            print(f"[dbg-ans] stage=B_floor_filtered floor={_floor} "
+                  f"n_docs={len(docs)} n_dist={len(_dist)} "
+                  f"sims={[round(1.0 - float(x), 4) for x in _dist]}", file=sys.stderr)
         return "知识库中未找到相关内容。"
     docs = [k[0] for k in kept]
     metas = [k[1] for k in kept]
@@ -573,22 +826,54 @@ def answer(question: str) -> str:
     # 于是模型会先用自己的统计学常识答一遍、末尾再补一句"知识库中未找到相关内容"
     # —— 两句自相矛盾，且"未找到"那句是脑补的、并非检索结论。
     # 现在明确：片段没答案就**只**输出未命中声明，**禁止**先答后 disclaim。
-    prompt = (
-        "你是 Zenith，一个基于本地文献知识库回答问题的助手。\n"
-        "请仅根据下面提供的文献片段回答问题，并引用来源。\n"
-        "如果片段中没有答案，请明确说明“知识库中未找到相关内容”。\n"
-        "**禁止**先用模型自身的通用知识作答、再补一句“知识库中未找到相关内容”"
-        " —— 这两句自相矛盾，会让调用方无法判断到底有没有查到。\n"
-        "片段里没有就直接答“知识库中未找到相关内容”，一个字都不要多写。\n\n"
-        f"---\n{context}\n---\n\n"
-        f"用户问题：{question}"
-    )
+    #
+    # 🔴🔴 2026-10-08 复查：上面这两条**引入了新的回归**——间歇性假阴性。
+    # 实测（_diag_archive/2026-10-08/prompt_fix_ab.py，同 context、同问题）：
+    #   旧模板 10/10 输出「知识库中未找到相关内容。」，而检索完全正常
+    #   （[dbg-ans] stage=query 恒 5 docs / 5 distances，sims 0.68~0.74 全过 floor；
+    #     stage=A_empty_docs 与 stage=B_floor_filtered **0 次触发**）。
+    # 根因：旧模板把「知识库中未找到相关内容」这一**精确字符串写了两遍**去强调，
+    #   而模型拿不到距离分数、无法自行判断"片段够不够答"，于是这个字符串成了
+    #   它的**逃离出口（attractor）**：temperature=0.5 一采样就随机吐出来。
+    #   后果是"未命中"信号完全不可信 —— 对真相关（Catholicism 史）与真不相关
+    #   （南非史，检索到 African_Americans/Washington/Singapore）输出**一模一样**，
+    #   地板闸门形同虚设。
+    # 修法：ZENITH_RAG_ANSWER_PROMPT_V2=1 切到「去吸引子」模板 ——
+    #   **彻底不出现"未找到"字样**（去掉吸引子本身，而不是换句更严厉的命令），
+    #   并明确告知"系统已判定片段相关"，把免责决策权收回系统侧。
+    #   实测 0/10 假阴性；且真不相关时会给出可诊断回答
+    #   （"片段涉及 A/B/C，没有关于 X 的信息"）而非不可区分的"未找到"。
+    # ⚠️ 默认仍走旧模板，**零行为变更**；切换只需一个环境变量。
+    if os.environ.get("ZENITH_RAG_ANSWER_PROMPT_V2", "0") == "1":
+        prompt = (
+            "你是 Zenith，一个基于本地文献知识库回答问题的助手。\n"
+            "下面这些是你检索到的、与问题最相关的文献片段。"
+            "**系统已判定它们与问题相关**，请直接依据它们作答。\n"
+            "要求：只使用片段中出现的信息；不要引入片段之外的常识；"
+            "在回答末尾用 [来源: 标题] 标注你实际用到的片段。\n\n"
+            f"---\n{context}\n---\n\n"
+            f"用户问题：{question}"
+        )
+    else:
+        prompt = (
+            "你是 Zenith，一个基于本地文献知识库回答问题的助手。\n"
+            "请仅根据下面提供的文献片段回答问题，并引用来源。\n"
+            "如果片段中没有答案，请明确说明“知识库中未找到相关内容”。\n"
+            "**禁止**先用模型自身的通用知识作答、再补一句“知识库中未找到相关内容”"
+            " —— 这两句自相矛盾，会让调用方无法判断到底有没有查到。\n"
+            "片段里没有就直接答“知识库中未找到相关内容”，一个字都不要多写。\n\n"
+            f"---\n{context}\n---\n\n"
+            f"用户问题：{question}"
+        )
     client = openai.OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     messages = [
         {"role": "system", "content": "简洁回答，标注引用来源。"},
         {"role": "user", "content": prompt},
     ]
     content = _extract_content(_chat_once(client, messages))
+    if os.environ.get("ZENITH_SEARCH_DEBUG", "0") == "1":
+        print(f"[dbg-ans] stage=C_llm has_content={bool(content)} "
+              f"head={(content or '')[:60]!r}", file=sys.stderr)
     if content:
         return content
     # 不静默返回空串 —— 否则前端显示空白，且调用方无法区分「库中没有」与「模型没答出来」
@@ -685,6 +970,17 @@ def main():
     parser.add_argument("--stats", action="store_true", help="显示索引统计")
     parser.add_argument("--test-pdf", type=str, help="测试单个 PDF 提取")
     parser.add_argument("--ingest-pdf", type=str, help="审查并入库单个 PDF")
+    # —— 2026-10-08 新增（多集合 / 批量）——
+    parser.add_argument("--rag-collection", type=str,
+                        help="目标向量集合名（默认 zotero_papers）")
+    parser.add_argument("--list-rag-collections", action="store_true",
+                        help="列出向量库内全部集合")
+    parser.add_argument("--archive-collection", type=str,
+                        help="归档集合（重命名为墓碑，不物理删除）")
+    parser.add_argument("--ingest-dir", type=str,
+                        help="批量入库目录下的 .md/.txt/.pdf")
+    parser.add_argument("--pattern", type=str, default="*.md",
+                        help="配合 --ingest-dir 的匹配模式")
     args = parser.parse_args()
 
     if args.rebuild:
@@ -696,7 +992,20 @@ def main():
         print("[info] 已清空向量库与进度，开始重建")
         args.build = True
 
-    if args.list_collections:
+    if args.list_rag_collections:
+        for d in list_rag_collections():
+            print(f"  {d['chunks']:>9,} chunk  {d['docs']:>6,} 文档  {d['collection']}")
+    elif args.archive_collection:
+        import json as _json
+        print(_json.dumps(archive_collection(args.archive_collection),
+                          ensure_ascii=False, indent=2))
+    elif args.ingest_dir:
+        import json as _json
+        import glob as _glob
+        files = sorted(_glob.glob(str(Path(args.ingest_dir) / args.pattern)))
+        res = ingest_paths(files, collection=args.rag_collection)
+        print(_json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.list_collections:
         for name, cnt in list_collections():
             print(f"{cnt:5d}  {name}")
     elif args.stats:
@@ -705,11 +1014,13 @@ def main():
         cmd_test_pdf(args.test_pdf)
     elif args.ingest_pdf:
         import json as _json
-        print(_json.dumps(ingest_pdf(args.ingest_pdf), ensure_ascii=False, indent=2))
+        print(_json.dumps(ingest_pdf(args.ingest_pdf, collection=args.rag_collection),
+                          ensure_ascii=False, indent=2))
     elif args.build:
-        build_index(args.collection, args.workers, args.limit, args.force)
+        build_index(args.collection, args.workers, args.limit, args.force,
+                    target_collection=args.rag_collection)
     elif args.query:
-        print(answer(args.query))
+        print(answer(args.query, collection=args.rag_collection))
     else:
         parser.print_help()
 
@@ -743,8 +1054,12 @@ def review_pdf(pdf_path: str | Path) -> dict:
     }
 
 
-def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
-    """单 PDF 入库：提取 → 分块 → 向量化 → upsert。返回状态。"""
+def ingest_pdf(pdf_path: str | Path, title: str | None = None,
+               collection: str | None = None) -> dict:
+    """单 PDF 入库：提取 → 分块 → 向量化 → upsert。返回状态。
+
+    collection=None → 默认集合（旧行为不变）。
+    """
     p = Path(pdf_path)
     review = review_pdf(p)
     if not review["passed"]:
@@ -755,9 +1070,12 @@ def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
     if not chunks:
         return {"status": "rejected", "reason": "无可入库文本", "coverage": coverage}
 
-    store = get_store()
+    col_name = collection or COLLECTION_NAME
+    store = get_store(col_name)
     embedder = get_embedder()
-    item_id = abs(hash(p.name + str(p.stat().st_mtime))) % 1000000
+    # C-7：稳定 id（跨进程可复现）→ 重复入库是幂等 upsert，不再堆积重复
+    # N-1 §5：同名异路径 guard（未撞名时 id 完全不变）
+    item_id, _ = resolve_item_id(store, p, source)
     title = title or p.stem
     ids = [f"{item_id}_{i}" for i in range(len(chunks))]
     metadatas = [
@@ -768,10 +1086,16 @@ def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
             "chunk_index": i,
             "coverage": round(coverage, 3),
             "source": source,
+            "collection": col_name,
         }
         for i in range(len(chunks))
     ]
     embeddings = embedder.encode(chunks, normalize_embeddings=True, batch_size=32, show_progress_bar=False).tolist()
+    # 先清同 id 旧 chunk：避免「新版块数变少」时残留高序号旧块
+    try:
+        store.delete_by_item(item_id)
+    except Exception:
+        pass
     store.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
 
     prog = load_progress()
@@ -781,16 +1105,22 @@ def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
         "chunks": len(chunks),
         "source": source,
         "source_file": str(p),
+        "collection": col_name,
     }
     save_progress(prog)
-    return {"status": "ok", "chunks": len(chunks), "coverage": round(coverage, 3), "source": source, "title": title}
+    return {"status": "ok", "chunks": len(chunks), "coverage": round(coverage, 3),
+            "source": source, "title": title, "item_id": item_id,
+            "collection": col_name}
 
 
-def ingest_text_file(path: str | Path, title: str | None = None) -> dict:
+def ingest_text_file(path: str | Path, title: str | None = None,
+                     collection: str | None = None) -> dict:
     """单文本文件（.md/.txt/.tagged.md）入库：读文本 → 分块 → 向量化 → upsert。
 
     复用 split_text/get_embedder/store.upsert，跳过 PDF/OCR 逻辑。
     保留标注符号（〖@人名〗〖=地名〗⟦◈动词⟧等），利于实体问答。
+
+    collection=None → 默认集合（旧行为不变）。
     """
     p = Path(path)
     if not p.exists():
@@ -806,9 +1136,10 @@ def ingest_text_file(path: str | Path, title: str | None = None) -> dict:
     if not chunks:
         return {"status": "rejected", "reason": "无可入库文本"}
 
-    store = get_store()
+    col_name = collection or COLLECTION_NAME
+    store = get_store(col_name)
     embedder = get_embedder()
-    item_id = abs(hash(p.name + str(p.stat().st_mtime))) % 1000000
+    item_id, _ = resolve_item_id(store, p)   # C-7 内容地址化 + N-1 §5 同名异路径 guard
     title = title or p.stem
     ids = [f"{item_id}_{i}" for i in range(len(chunks))]
     metadatas = [
@@ -819,10 +1150,15 @@ def ingest_text_file(path: str | Path, title: str | None = None) -> dict:
             "chunk_index": i,
             "coverage": 1.0,
             "source": "text",
+            "collection": col_name,
         }
         for i in range(len(chunks))
     ]
     embeddings = embedder.encode(chunks, normalize_embeddings=True, batch_size=32, show_progress_bar=False).tolist()
+    try:
+        store.delete_by_item(item_id)
+    except Exception:
+        pass
     store.upsert(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
 
     prog = load_progress()
@@ -832,9 +1168,41 @@ def ingest_text_file(path: str | Path, title: str | None = None) -> dict:
         "chunks": len(chunks),
         "source": "text",
         "source_file": str(p),
+        "collection": col_name,
     }
     save_progress(prog)
-    return {"status": "ok", "chunks": len(chunks), "coverage": 1.0, "source": "text", "title": title}
+    return {"status": "ok", "chunks": len(chunks), "coverage": 1.0, "source": "text",
+            "title": title, "item_id": item_id, "collection": col_name}
+
+
+def ingest_paths(paths: list[str | Path], collection: str | None = None,
+                 title_prefix: str = "") -> dict:
+    """批量入库（C-2）。逐个调 ingest_text_file/ingest_pdf，汇总结果。
+
+    不走本地路径白名单（白名单只约束**跨进程**的 /ingest/local 端点）；
+    本函数是进程内调用，由调用方自行控制输入来源。
+    """
+    ok, failed, total_chunks = 0, [], 0
+    for raw in paths:
+        p = Path(raw)
+        try:
+            if p.suffix.lower() == ".pdf":
+                r = ingest_pdf(p, title=(title_prefix + p.stem) if title_prefix else None,
+                               collection=collection)
+            else:
+                r = ingest_text_file(p, title=(title_prefix + p.stem) if title_prefix else None,
+                                     collection=collection)
+        except Exception as e:
+            failed.append({"file": str(p), "error": f"{type(e).__name__}: {e}"})
+            continue
+        if r.get("status") == "ok":
+            ok += 1
+            total_chunks += int(r.get("chunks", 0))
+        else:
+            failed.append({"file": str(p), "error": r.get("reason", str(r))})
+    return {"status": "ok", "ingested": ok, "failed": len(failed),
+            "chunks": total_chunks, "collection": collection or COLLECTION_NAME,
+            "failures": failed[:50]}
 
 
 if __name__ == "__main__":

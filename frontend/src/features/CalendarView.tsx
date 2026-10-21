@@ -16,6 +16,26 @@ function getToday(): string {
   return formatDate(new Date())
 }
 
+// 0-3（2026-10-17）逾期判定改为数值比较。
+// 旧实现 `s.end_time < new Date().toISOString()` 是字符串比较：end_time 是本地时间串
+// （'YYYY-MM-DD HH:MM' 或 'YYYY-MM-DDTHH:MM:00'），now 是 UTC 的 '...Z' 串，
+// 跨格式时第 10 位 ' ' < 'T' → 当天日程恒被判为逾期并被默认隐藏。
+// Safari 不认空格分隔的日期时间，故先归一成 'T'；无时区标记时按本地时间解释。
+function parseLocalMs(dt?: string | null): number {
+  if (!dt) return NaN
+  const normalized = dt.trim().replace(' ', 'T')
+  if (!normalized) return NaN
+  const t = new Date(normalized).getTime()
+  return Number.isFinite(t) ? t : NaN
+}
+
+/** 逾期 = 有可解析的 end_time 且已早于 nowMs（脏值一律不算逾期） */
+function isOverdue(s: { end_time?: string | null }, nowMs: number): boolean {
+  if (!s.end_time) return false
+  const t = parseLocalMs(s.end_time)
+  return Number.isFinite(t) && t < nowMs
+}
+
 function getWeekRange(date: Date): { monday: Date; sunday: Date; mondayStr: string; sundayStr: string } {
   const dow = date.getDay() || 7 // Sunday=7 for ISO
   const monday = new Date(date)
@@ -159,11 +179,11 @@ export default function CalendarView() {
     setListLoading(true)
     try {
       const list = await api.listSchedules(listFilter)
-      const now = new Date().toISOString()
+      const nowMs = Date.now()
       const filtered = listFilter ? list : list.filter((s: Schedule) => {
         if (s.status === 'done' || s.status === 'cancelled') return false
         // 已过期的默认隐藏（避免噪音）；打开「显示逾期」后保留，便于追溯
-        if (!showOverdue && s.end_time && s.end_time < now && (s.status === 'proposed' || s.status === 'confirmed')) return false
+        if (!showOverdue && isOverdue(s, nowMs) && (s.status === 'proposed' || s.status === 'confirmed')) return false
         return true
       })
       setAllSchedules(filtered)
@@ -233,9 +253,29 @@ export default function CalendarView() {
   // Submit form
   const handleSubmit = async () => {
     if (!formTitle.trim()) return
+    const startTime = formDate + (formTime ? `T${formTime}:00` : 'T00:00:00')
+    // 0-4（2026-10-17）原先 payload 从不写 end_time → 逾期检测与「显示逾期」开关失效，
+    // 列表渲染成「10/17 09:00 →」（箭头后为空）。补齐规则：
+    //  1) 表单没有独立的结束时间输入，跳过；
+    //  2) 编辑既有日程、且开始时间未被改动、且原记录已有 end_time → 保留原值
+    //     （只改标题不应把结束时间冲成 start+1h；但改了 start 就必须重算，否则 end_time < start_time）；
+    //  3) 否则 = start + 60min，输出与 start_time 完全相同的本地格式
+    //     （不能用 toISOString()，那会转成 UTC 造成 8 小时漂移）；
+    //  4) 起点解析失败 → 不写 end_time（不塞 Invalid Date 字符串）。
+    // start 的格式后端存的是 'YYYY-MM-DDTHH:MM:00'，与本函数拼出的一致；仍用毫秒值比对以容忍空格格式差异。
+    const startMs = parseLocalMs(startTime)
+    let endTime: string | undefined
+    if (editingEvent && editingEvent.end_time
+      && (!Number.isFinite(startMs) || parseLocalMs(editingEvent.start_time) === startMs)) {
+      endTime = editingEvent.end_time
+    } else if (Number.isFinite(startMs)) {
+      const d = new Date(startMs + 60 * 60 * 1000)
+      const pad = (n: number) => String(n).padStart(2, '0')
+      endTime = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:00`
+    }
     const payload: Partial<Schedule> = {
       title: formTitle.trim(),
-      start_time: formDate + (formTime ? `T${formTime}:00` : 'T00:00:00'),
+      start_time: startTime,
       category: formCategory,
       importance: formImportance,
       impact: formImpact || '',
@@ -244,6 +284,7 @@ export default function CalendarView() {
       goal_id: formGoalId,
       recurrence: formRecurrence,
     }
+    if (endTime) payload.end_time = endTime
 
     try {
       if (editingEvent) {
@@ -656,7 +697,7 @@ export default function CalendarView() {
                     const isProposed = s.status === 'proposed'
                     const isCancelled = s.status === 'cancelled'
                     // 逾期：未完成且已过结束时间（仅供展示标记，是否被提醒由后端提醒记录决定）
-                    const sOverdue = !!s.end_time && s.end_time < new Date().toISOString()
+                    const sOverdue = isOverdue(s, Date.now())
                       && s.status !== 'done' && s.status !== 'cancelled'
                     const borderColor = STATUS_COLORS[s.status] || '#717e95'
                     const bgColor = STATUS_BG_COLORS[s.status] || 'var(--color-bg-panel)'

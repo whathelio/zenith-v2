@@ -7,11 +7,9 @@ Fact Check MCP Server — 事实核查验证
 """
 
 import asyncio
-import json
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 from difflib import SequenceMatcher
 
 from mcp.server import MCPServer

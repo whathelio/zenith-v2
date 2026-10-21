@@ -51,8 +51,30 @@ export LLM_BASE_URL=$(grep "api_base:" "$CONFIG_FILE" | head -1 | sed 's/.*api_b
 export LLM_MODEL=$(grep "^model:" "$CONFIG_FILE" | head -1 | sed 's/.*model:[[:space:]]*//' || true)
 
 # ── 知识库网关认证（与 api_gateway.py 保持一致） ──
-export ZENITH_API_KEY="${ZENITH_API_KEY:-zenith-local}"
-export KNOWLEDGE_API_KEY="${KNOWLEDGE_API_KEY:-zenith-local}"
+# 2026-10-14 安全债 D9b：去掉公开默认值（原 `zenith-local`）。
+# 取值优先级与 start.py 的 _read_env_key 对齐：`.env` 优先 → 既有 shell 环境变量；
+# 两者都缺 → 显式报错退出，绝不静默回落公开默认值（=已知后门）。
+_read_env_value() {
+    _f="$SCRIPT_DIR/.env"
+    [ -f "$_f" ] || return 0
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$_f" \
+        | head -1 | sed 's/[[:space:]]*#.*$//; s/^["'"'"']//; s/["'"'"']$//'
+}
+_ENV_Z="$(_read_env_value ZENITH_API_KEY)"
+_ENV_K="$(_read_env_value KNOWLEDGE_API_KEY)"
+ZENITH_API_KEY="${_ENV_Z:-${ZENITH_API_KEY:-}}"
+KNOWLEDGE_API_KEY="${_ENV_K:-${KNOWLEDGE_API_KEY:-}}"
+# 两个键名须同值：只配了一个时以已配置的那个补齐另一个
+ZENITH_API_KEY="${ZENITH_API_KEY:-$KNOWLEDGE_API_KEY}"
+KNOWLEDGE_API_KEY="${KNOWLEDGE_API_KEY:-$ZENITH_API_KEY}"
+if [ -z "$ZENITH_API_KEY" ]; then
+    echo "错误: .env 未设置 ZENITH_API_KEY / KNOWLEDGE_API_KEY（两者须同值）。" >&2
+    echo "     请在 $SCRIPT_DIR/.env 中设置后重试。可如此生成：" >&2
+    echo "       python3 -c \"import secrets;print('ZENITH_API_KEY='+secrets.token_urlsafe(32))\"" >&2
+    exit 1
+fi
+unset _ENV_Z _ENV_K
+export ZENITH_API_KEY KNOWLEDGE_API_KEY
 
 # ── embedding 模型本地路径（若存在） ──
 if [ -d "$WORKSPACE_ROOT/bge-small-model" ]; then
