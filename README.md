@@ -2,6 +2,12 @@
 
 一个运行在本地的 AI 对话助手，支持流式对话、记忆引擎、日程管理、笔记系统、目标追踪、知识库（RAG）等功能。
 
+[![Release](https://img.shields.io/github/v/release/whathelio/zenith-v2)](https://github.com/whathelio/zenith-v2/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+> **只想用，不想折腾** → [下载最新发布包](https://github.com/whathelio/zenith-v2/releases/latest)（约 7.4MB，解压后双击 `install.bat`）
+> **想改代码** → `git clone` 之后看下面第 4 节「手动安装」
+
 ## 功能
 
 - **流式对话** — DeepSeek / OpenAI 兼容 API
