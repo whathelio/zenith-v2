@@ -16,77 +16,85 @@
 
 ## 快速开始
 
-### 1. 环境要求
+### 1. 一键安装
 
-- Python 3.10+
-- Node.js 18+（如需重新构建前端）
-- 支持 Windows / Linux / macOS
+> **不需要 Node.js。** 前端已预构建在 `frontend/dist/`，普通用户只需要 Python 3.10+。
 
-### 2. 安装依赖
+- **Windows** — 双击 `install.bat`
+- **Linux / macOS** — `bash install.sh`
 
-```bash
-cd zenith-v2
-python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# 或 .venv\Scripts\activate  # Windows
-pip install -r requirements.txt        # 只跑服务（运行依赖）
-# pip install -r requirements-dev.txt  # 开发者：另加 pytest / pytest-cov / ruff
+脚本做四件事：校验 Python ≥ 3.10 → 创建 `.venv` → 安装运行依赖（PyPI 失败自动回退阿里云镜像）→ 从模板生成 `config/config.yaml`。**幂等**，重复运行不会破坏已有环境。
+
+### 2. 启动
+
+- **Windows**：双击 `zenith.bat`
+- **Linux / macOS**：`bash zenith.sh`
+
+浏览器会自动打开 <http://127.0.0.1:8766>。
+
+### 3. 填入 API Key
+
+首次进入后到**设置**页填写 API Key 与 API Base，保存在本地 `config/config.yaml`：
+
+| 服务 | API Base |
+|---|---|
+| DeepSeek | `https://api.deepseek.com/v1` |
+| SiliconFlow | `https://api.siliconflow.cn/v1` |
+| 自建 / 其他 | 任何 OpenAI 兼容接口 |
+
+也可以跳过设置页，直接把 key 写进 `.env`（复制 `.env.example` 为 `.env`）：
+
+```ini
+ZENITH_LLM_API_KEY=sk-...
 ```
 
-> **国内网络**：PyPI 直连常失败，加镜像参数（2026-10-04 实测 aliyun 可用）：
+> `.env` 可以完全留空 —— 知识库网关密钥缺失时，启动会自动生成一次性会话密钥，不影响使用。
+
+### 4. 手动安装（不想用脚本时）
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python start.py 8766
+```
+
+> 国内网络 PyPI 直连常失败，加镜像：
 > `pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/`
 
-### 3. 配置 API Key
 
-启动后首次访问会自动打开设置页面，填写你的 API Key 和 API Base URL。
+### 5. 知识库 RAG（可选，默认不启用）
 
-默认兼容 DeepSeek (https://api.deepseek.com/v1)，也支持任何 OpenAI 兼容接口。
+知识库（RAG 检索 + PDF 入库 + LLM Wiki）依赖**不在本仓库内**的外部网关进程。主功能（对话/日程/笔记/目标）完全不依赖它；没部署时 `/knowledge` 页面显示离线，其余一切照常。
 
-### 4. 启动
-
-**Windows**:
-```bash
-zenith.bat          # 一键启动（含知识库网关 + worker）
-# 或
-python start.py 8766
-```
-
-**Linux / macOS**:
-```bash
-bash zenith.sh      # 一键启动（含知识库网关 + worker）
-# 或
-python start.py 8766
-```
-
-访问 http://localhost:8766
-
-### 5. 知识库功能（可选）
-
-知识库（RAG 检索 + PDF 入库 + LLM Wiki）依赖外部网关进程。`zenith.bat` / `zenith.sh` 会自动尝试启动（若脚本存在于上级目录）：
+需要的组件（自行放在仓库**同级目录**）：
 
 - `api_gateway.py` — 知识库 API 中台（端口 8788）
 - `task_worker.py` — 异步任务消费
 - `zotero_parse_rag_core.py` — PDF 解析 + 向量化
 - `bge-small-model/` — 本地 embedding 模型
 
-若未部署这些外部脚本，Zenith 主功能（对话/日程/笔记/目标）不受影响，仅 `/knowledge` 页面显示离线。
+`start.py` 会检测这些文件是否存在：存在就拉起并挂 watchdog，不存在就静默跳过。
 
 > ⚠️ **部署要点（2026-08-25 排障沉淀）**：
-> - `zotero_parse_rag_core.py` 的 Chroma 向量库（HNSW）**必须放在纯 ASCII 路径**（如 `D:\dshs\zenith_rag_new`），否则 chromadb 1.5 Rust HNSW reader 在中文路径下加载失败（报 `Error loading hnsw index`）。
-> - embedding 模型默认回退本地 `bge-small-model/`，无需依赖 `ZENITH_RAG_EMBED_MODEL` 环境变量注入。
-> - 参考副本见 `rag/zotero_parse_rag_core.py`（与工作区根的生产脚本逐字节同步，仓库内留档防止重建环境踩坑）。
+> - `zotero_parse_rag_core.py` 的 Chroma 向量库（HNSW）**必须放在纯 ASCII 路径**，否则 chromadb 1.5 Rust HNSW reader 在中文路径下加载失败（报 `Error loading hnsw index`）。
+> - embedding 模型默认回退同级 `bge-small-model/`，也可用 `ZENITH_RAG_EMBED_MODEL` 指定。
+> - 参考副本见 `rag/zotero_parse_rag_core.py`。
 > - `tools/zotero_parse_rag_core.py` 是**旧版单集合快照，已过时**（缺 collection 参数化 / 多集合），请勿据此重建环境。
 
-### 6. 构建前端（可选）
+### 6. 构建前端（仅改前端时需要）
 
-前端已预构建在 `frontend/dist/`，如需修改前端：
+前端已预构建在 `frontend/dist/`，跑起来不需要 Node.js。只有要改 UI 时才需要：
 
 ```bash
 cd frontend
 npm install
-npm run build    # 构建
+npm run build    # 产物直接覆盖 dist/
 npm run dev      # 开发模式 (localhost:5173)
 ```
+
+> 改了 `frontend/src/` 却忘了 `npm run build`，浏览器里看到的还是旧界面 —— 这是最常见的坑。
+
 
 ## 项目结构
 
@@ -111,9 +119,12 @@ zenith-v2/
 │   ├── src/                # React + TypeScript 源码
 │   ├── dist/               # 构建产物（已包含）
 │   └── package.json
+├── install.bat             # Windows 一键安装（建 venv + 装依赖）
+├── install.sh              # Linux/macOS 一键安装
 ├── start.py                # 入口脚本（跨平台单实例锁）
 ├── zenith.bat              # Windows 启动脚本
 ├── zenith.sh               # Linux/macOS 启动脚本
+├── .env.example            # 环境变量模板（可选，全留空也能跑）
 ├── requirements.txt        # 运行依赖
 ├── requirements-dev.txt    # 开发依赖（pytest / pytest-cov / pytest-timeout / ruff）
 └── README.md
@@ -133,6 +144,25 @@ zenith-v2/
 
 - **技术栈**: Python FastAPI + SQLite + React + TypeScript + Vite
 - **LLM**: DeepSeek v4 Pro（兼容 OpenAI Chat Completions API）
+
+## 分发形态：源码 + 预构建前端
+
+本项目**不提供** PyInstaller 单文件 exe，只发源码：
+
+| 你想做什么 | 需要装什么 | 怎么做 |
+|---|---|---|
+| 直接使用 | 只要 Python 3.10+ | `install.bat` → `zenith.bat` |
+| 改界面 | + Node.js 18+ | 改 `frontend/src/` → `npm run build` |
+| 改后端 | 只要 Python | 改 `backend/*.py` → 重启 |
+
+**为什么不做 exe**：FastAPI + uvicorn 的动态路由、`data/` 与 `config/` 的相对路径解析，打包进单文件后要逐个打补丁；体积从 11MB 涨到 200MB+；Windows 下 Defender / 火绒 对 PyInstaller 产物误报率极高。一键安装脚本的体验已经接近了，代价却小得多。
+
+## 数据与隐私
+
+- 所有数据（对话、记忆、笔记、日程、目标）都在本地 `data/zenith.db`（SQLite），**不上传任何服务器**
+- `.env`、`config/config.yaml`、`data/*.db`、`data/*.jsonl` 均已 gitignore，不会被提交
+- 只有调用 LLM 时，你的 prompt 才会发给你自己配置的那家 API 服务商
+- ⚠️ 内置的代码执行功能（`/api/code/run`）**不是沙箱**，默认关闭。多用户 / 公网部署必须先做容器隔离，详见 [`SECURITY.md`](SECURITY.md)
 
 ## License
 
