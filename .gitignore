@@ -143,3 +143,12 @@ _diag_archive/
 #    data/ 目录在仓库里只应保留 .gitkeep 与 backgrounds/ 默认壁纸
 data/*.jsonl
 
+# 3) 用户上传的背景图（2026-10-21 发现：这不是素材目录，是运行时上传目录）
+#    backend/app.py 的 /api/backgrounds 与 /api/conversations/{cid}/background
+#    会把用户上传的图片写到这里：对话背景 {conv_id}{ext}、全局背景 global{ext}。
+#    此前 7 个文件（含 2 张 2MB PNG）被误提交，并随 v2.0.0 公开发布。
+#    规则：整个目录一律不入库，目录结构用 .gitkeep 保留（代码也会 mkdir）。
+data/backgrounds/*
+!data/backgrounds/.gitkeep
+
+
