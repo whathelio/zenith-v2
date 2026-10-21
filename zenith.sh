@@ -68,13 +68,19 @@ KNOWLEDGE_API_KEY="${_ENV_K:-${KNOWLEDGE_API_KEY:-}}"
 ZENITH_API_KEY="${ZENITH_API_KEY:-$KNOWLEDGE_API_KEY}"
 KNOWLEDGE_API_KEY="${KNOWLEDGE_API_KEY:-$ZENITH_API_KEY}"
 if [ -z "$ZENITH_API_KEY" ]; then
-    echo "错误: .env 未设置 ZENITH_API_KEY / KNOWLEDGE_API_KEY（两者须同值）。" >&2
-    echo "     请在 $SCRIPT_DIR/.env 中设置后重试。可如此生成：" >&2
-    echo "       python3 -c \"import secrets;print('ZENITH_API_KEY='+secrets.token_urlsafe(32))\"" >&2
-    exit 1
+    # 2026-10-21 开源分发：此处不再 exit 1。
+    # start.py 的 _resolve_auth_key() 在缺少该键时会生成本次会话的一次性随机密钥，
+    # 并同时下发给主服务（KNOWLEDGE_API_KEY）与知识库网关（ZENITH_API_KEY），
+    # 所以首次运行无需任何手工配置即可启动，只是重启后密钥会变（仅影响本机网关鉴权）。
+    # 注意：这里必须 unset 而不是 export 空值 —— 空字符串会干扰 start.py 的降级判断。
+    unset ZENITH_API_KEY KNOWLEDGE_API_KEY
+    echo "提示: 未设置 ZENITH_API_KEY —— 本次启动将使用一次性会话密钥（知识库功能正常）。"
+    echo "      想固定该密钥：在 $SCRIPT_DIR/.env 中设置 ZENITH_API_KEY 与 KNOWLEDGE_API_KEY（同值）。"
+else
+    export ZENITH_API_KEY KNOWLEDGE_API_KEY
 fi
 unset _ENV_Z _ENV_K
-export ZENITH_API_KEY KNOWLEDGE_API_KEY
+
 
 # ── embedding 模型本地路径（若存在） ──
 if [ -d "$WORKSPACE_ROOT/bge-small-model" ]; then

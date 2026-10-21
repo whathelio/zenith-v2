@@ -2,9 +2,12 @@ import sys
 import re
 import os
 from collections import defaultdict
-sys.path.insert(0, r"D:\下载文件\新建文件夹\zenith-v2")
 
-root = r"D:\下载文件\新建文件夹\zenith-v2\backend"
+# 2026-10-21 开源分发：改用相对本文件推导（tools/audit/x.py → 上三级 = 项目根）
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _PROJECT_ROOT)
+
+root = os.path.join(_PROJECT_ROOT, "backend")
 files = []
 for base, dirs, fs in os.walk(root):
     if "_archive" in base:

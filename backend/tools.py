@@ -4385,7 +4385,13 @@ def _handle_shiji_wiki_lookup(args: dict) -> dict:
         max_chars = 800
     max_chars = max(200, min(max_chars, 3000))
 
-    pages_dir = Path(r"D:\下载文件\新建文件夹\shiji-kb\wiki\public\pages")
+    # 2026-10-21 开源分发：移除硬编码的本机绝对路径。
+    # 优先读 ZENITH_SHIJI_WIKI_DIR；未设置则默认「项目目录的同级 shiji-kb」，
+    # 这样 clone 到任意位置都能工作，找不到目录时走下面的 exists() 分支降级。
+    _shiji_env = os.environ.get("ZENITH_SHIJI_WIKI_DIR", "").strip()
+    pages_dir = Path(_shiji_env) if _shiji_env else (
+        Path(__file__).resolve().parents[2] / "shiji-kb" / "wiki" / "public" / "pages"
+    )
     if not pages_dir.exists():
         return {"success": False, "result": "《史记》wiki 目录不存在"}
 

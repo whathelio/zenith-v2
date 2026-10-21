@@ -1,8 +1,10 @@
 import re
 import os
 from collections import defaultdict
+from pathlib import Path
 
-ROOT = r"D:\下载文件\新建文件夹\zenith-v2"
+# 2026-10-21 开源分发：改用相对本文件推导（tools/audit/x.py → 上三级 = 项目根）
+ROOT = str(Path(__file__).resolve().parents[2])
 FE = os.path.join(ROOT, "frontend", "src")
 BE = os.path.join(ROOT, "backend")
 

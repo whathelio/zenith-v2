@@ -42,7 +42,7 @@ if not errorlevel 1 (
 
 if not exist "%PY_EXE%" (
     echo [ERROR] Python interpreter not found: %PY_EXE%
-    echo Please ensure .venv exists, or run: python start.py
+    echo Please run install.bat first to create .venv and install dependencies.
     pause
     exit /b 1
 )

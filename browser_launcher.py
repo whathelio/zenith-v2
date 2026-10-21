@@ -29,7 +29,7 @@
 
     browser:
       enabled: true
-      path: "D:/下载文件/Tabbit Browser/Application/Tabbit Browser.exe"
+      path: "C:/Program Files/Tabbit Browser/Application/Tabbit Browser.exe"
       args: []          # 附加在 URL 之前的参数，一般留空
 
 **回退语义（重要）**：未配置 / `enabled: false` / 路径不存在 / 启动抛异常

@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-SHIJI_KB = Path(r"D:\下载文件\新建文件夹\shiji-kb")
-ZENITH_DB = Path(r"D:\下载文件\新建文件夹\zenith-v2\data\zenith.db")
+# 2026-10-21 开源分发：路径全部改为「相对本文件推导」，不再硬编码本机目录。
+# PROJECT_DIR = 仓库根（rag/ 的上一级）；shiji-kb 默认放在仓库同级，可用环境变量覆盖。
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+SHIJI_KB = Path(os.environ.get("ZENITH_SHIJI_KB", "").strip() or (PROJECT_DIR.parent / "shiji-kb"))
+ZENITH_DB = Path(os.environ.get("ZENITH_DB_PATH", "").strip() or (PROJECT_DIR / "data" / "zenith.db"))
 CHAPTER_DIR = SHIJI_KB / "chapter_md"
 ENTITY_INDEX = SHIJI_KB / "kg" / "entity_index.json"
+
 
 # 实体类型 → 中文
 TYPE_CN = {
