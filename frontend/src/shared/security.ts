@@ -43,7 +43,7 @@ function saveMap(map: Record<string, string>) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
 }
 
-/** 查找 raw 值是否已��映射 */
+/** 查找 raw 值是否已有映射 */
 function findExisting(raw: string, map: Record<string, string>): string | null {
   for (const [k, v] of Object.entries(map)) {
     if (v === raw) return k;

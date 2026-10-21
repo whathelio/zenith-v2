@@ -7,11 +7,9 @@ Fact Check MCP Server — 事实核查验证
 """
 
 import asyncio
-import json
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 from difflib import SequenceMatcher
 
 from mcp.server import MCPServer
@@ -74,16 +72,13 @@ def _get_zenith_db_path() -> str | None:
     env_path = os.environ.get("ZENITH_DB_PATH", "").strip()
     if env_path and os.path.exists(env_path):
         return env_path
-    # 默认路径（Windows 开发环境）
+    # 2026-10-21 开源分发：默认值改为「相对本文件推导」（tools/reference/x.py → 上三级 = 项目根），
+    # 不再猜测开发机的目录结构。仍可用 ZENITH_DB_PATH 显式覆盖。
     default = os.path.join(
-        os.environ.get("USERPROFILE", os.path.expanduser("~")),
-        "下载文件", "新建文件夹", "zenith-v2", "data", "zenith.db"
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data", "zenith.db",
     )
-    # 尝试多个候选路径
-    candidates = [
-        default,
-        r"D:\下载文件\新建文件夹\zenith-v2\data\zenith.db",
-    ]
+    candidates = [default]
     for p in candidates:
         if os.path.exists(p):
             return p

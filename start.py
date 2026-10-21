@@ -42,6 +42,7 @@ import socket
 import tempfile
 import subprocess
 import shutil
+import secrets
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -86,7 +87,14 @@ _RAG_WORK_DIR = Path(os.environ.get(
     "ZENITH_RAG_WORK_DIR",
     r"D:\dshs\zenith_rag_new" if os.name == "nt" else str(PROJECT_DIR.parent / "zenith_rag_new"),
 ))
-_RAG_API_KEY = "test-key"  # 与 backend/knowledge_service.py 默认一致
+# 知识库网关鉴权密钥**不再有公开默认值**（2026-10-14 安全债 D9b）：
+# 取值与兜底策略见 _resolve_auth_key()，未配置时改用一次性随机密钥 + stderr WARNING，
+# 绝不回落公开默认值（那是已知后门）。
+#
+# 会话级一次性随机密钥（仅当 .env 与环境变量都未设时使用）：缓存在模块级，
+# 保证同一进程内多次调用 _build_aux_env()（含 watchdog 补拉 aux 进程）拿到
+# **同一个值**，避免二次随机导致主服务/网关异值 → /api/knowledge/* 401。
+_SESSION_AUTH_KEY: Optional[str] = None
 
 DEFAULT_PORT = 8766
 
@@ -638,7 +646,11 @@ def _is_cmdline_running(keyword: str) -> bool:
 
 
 def _read_env_key(name: str) -> Optional[str]:
-    """从 zenith-v2/.env 读取单个键值（零依赖，与 backend/config.py 同款逻辑）。"""
+    """从 zenith-v2/.env 读取单个键值（零依赖，与 backend/config.py 同款逻辑）。
+
+    行内注释处理（2026-10-14 加固）：`KEY=value  # 备注` 只取 `value`；
+    引号内的 `#`（如密码）与无空白前缀的 `#`（如 URL 片段）不误剥。
+    """
     env_file = PROJECT_DIR / ".env"
     if not env_file.exists():
         return None
@@ -649,8 +661,21 @@ def _read_env_key(name: str) -> Optional[str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, value = line.partition("=")
-                if key.strip() == name:
-                    return value.strip().strip('"').strip("'")
+                if key.strip() != name:
+                    continue
+                value = value.strip()
+                if value[:1] in ('"', "'"):
+                    # 引号值：取到配对引号为止，引号后的 # 一律视为注释
+                    quote = value[0]
+                    end = value.find(quote, 1)
+                    return value[1:end] if end != -1 else value[1:]
+                # 未加引号：仅当 # 前有空白（dotenv 惯例）才视为行内注释起点，
+                # 避免误剥 URL 片段（http://host/#frag）或紧凑写法里的 #
+                for i, ch in enumerate(value):
+                    if ch == "#" and i > 0 and value[i - 1] in " \t":
+                        value = value[:i]
+                        break
+                return value.strip()
     except OSError:
         return None
     return None
@@ -693,18 +718,89 @@ def _read_provider_setting(name: str, provider_name: str = "deepseek") -> Option
 
 
 
+def _resolve_auth_key(env: dict) -> str:
+    """解析知识库网关鉴权密钥（.env 优先 → 环境变量 → 本会话缓存 → 一次性随机）。
+
+    绝不回落公开默认值（2026-10-14 安全债 D9b）。随机值缓存在模块级 _SESSION_AUTH_KEY，
+    保证同进程多次调用（含 watchdog 补拉 aux）得到同一个值；并写回 os.environ，
+    让本进程主服务（knowledge_service 读 os.environ["KNOWLEDGE_API_KEY"]）与子进程同值。
+    """
+    global _SESSION_AUTH_KEY
+    key = (_read_env_key("ZENITH_API_KEY") or env.get("ZENITH_API_KEY")
+           or env.get("KNOWLEDGE_API_KEY") or _SESSION_AUTH_KEY)
+    if not key:
+        print("[start] WARNING: .env 未设 ZENITH_API_KEY，本次会话使用一次性随机密钥"
+              "（重启即变，且主服务/网关必须同值）。请固定设置。", file=sys.stderr)
+        key = secrets.token_urlsafe(32)
+        _SESSION_AUTH_KEY = key
+    os.environ["KNOWLEDGE_API_KEY"] = key
+    return key
+
+
 def _build_aux_env() -> dict:
     """构造 api_gateway / task_worker 的运行环境：
     本地 embedding 模型、固定工作目录、网关鉴权、复用 zenith 的 LLM 凭据。"""
     env = os.environ.copy()
     env.setdefault("ZENITH_RAG_EMBED_MODEL", str(_RAG_EMBED_DIR))
     env.setdefault("ZENITH_RAG_WORK_DIR", str(_RAG_WORK_DIR))
-    env.setdefault("ZENITH_API_KEY", _RAG_API_KEY)
-    llm_key = env.get("ZENITH_LLM_API_KEY") or _read_env_key("ZENITH_LLM_API_KEY") or _read_yaml_key("api_key")
+    # 🔴 2026-10-14 修复（R2 变量名错配）：网关读 `ZENITH_API_KEY`（rag/api_gateway.py:41），
+    #   而主服务读的是**另一个名字** `KNOWLEDGE_API_KEY`（backend/knowledge_service.py:21）。
+    #   两个名字必须同值 —— 否则「给网关设了真 key」会让主服务仍发旧值
+    #   → /api/knowledge/* 全量 401（这正是红队复核抓到的坑）。
+    #   取值与兜底策略见 _resolve_auth_key()（.env 优先 → 环境变量 → 本会话缓存 →
+    #   一次性随机，并写回 os.environ），**不再有公开默认兜底**（2026-10-14 安全债 D9b）。
+    _auth = _resolve_auth_key(env)
+    env["ZENITH_API_KEY"] = _auth
+    env["KNOWLEDGE_API_KEY"] = _auth
+    # 🟡 2026-10-08（回归复核 #6）：以下 3 个 RAG 变量是本次多集合改造新增的，
+    # 但**必须显式注入** —— 桌面 launcher 链路（launcher.pyw → start.py）不带
+    # shell 环境变量，只在 `.env` 里写它们到不了 api_gateway / task_worker 子进程。
+    # 这三个都是「不设 = 退回旧行为」，所以未配置时行为与改造前完全一致：
+    #   ZENITH_INGEST_ROOTS      本地路径入库白名单（未设 = 该能力整体禁用）
+    #   ZENITH_RAG_COLLECTION    默认集合名（未设 = zotero_papers）
+    #   ZENITH_RAG_MIN_SCORE_MAP 按集合覆盖的相关性地板（未设 = 全局 0.53）
+    #   ZENITH_QUERY_BRIDGE      中文提问→英文检索的翻译桥（未设 = 关闭）
+    #   ZENITH_RAG_ANSWER_PROMPT_V2  去吸引子版回答 prompt（未设 = 旧模板，零变更）
+    #   ZENITH_COLLECTION_LANG   集合语言声明（未设 = 回退探测）
+    #   ZENITH_COLLECTION_HINTS  集合语料说明 JSON（未设 = 工具不展示集合描述）
+    #
+    # 🔴🔴 2026-10-09 修正优先级：这里**必须让 `.env` 优先于 os.environ**。
+    # 事故链（实测，非推测）：
+    #   backend/config.py:24-45 的 _load_dotenv() 在**模块导入时**执行
+    #     os.environ.setdefault(key, value)  → 把 .env 的每个键写进主进程 os.environ；
+    #   start.py:1365 uvicorn.run("backend.app:app") → 导入 backend.config
+    #     ⇒ start.py 启动那一刻，就把当时 .env 的全部键**冻结**进自己的 os.environ。
+    #   于是原来的 `env.get(_k) or _read_env_key(_k)` 里，`env.get` 永远命中冻结值，
+    #   下面这个「重读 .env」的回退对 `.env` 里出现的每个键都是**死代码**。
+    # 后果：改完 .env 后，看门狗（:881）补拉的 api_gateway / task_worker 全拿旧值，
+    #   表现为「改了 .env、也重启了服务，但就是不生效」——science_zh / nomad_ref 的
+    #   相关性地板曾因此长期停留在旧值（详见 2026-10-09 落地报告 §4.5）。
+    # 修法：反转优先级 —— `.env` 为准，未配置时才回落 os.environ。
+    # ⚠️⚠️ 这里**绝不能用 `env.setdefault`** —— `env` 是 os.environ 的副本，而被
+    #   config.py 冻结过的键**已经存在**，setdefault 会直接放弃写入、静默失败。
+    #   2026-10-09 实测教训：只反转优先级（env.get → _read_env_key）**依然不生效**，
+    #   就是卡在这个 setdefault 上。两道 bug 是**叠加**的：
+    #     ① `env.get(_k)` 取到冻结值 → 回退死代码；
+    #     ② `env.setdefault(_k, _v)` 写不进已存在的键 → 即便取到新值也落不下去。
+    #   修法：直接赋值 `env[_k] = _v`。
+    for _k in ("ZENITH_INGEST_ROOTS", "ZENITH_RAG_COLLECTION", "ZENITH_RAG_MIN_SCORE_MAP",
+               "ZENITH_QUERY_BRIDGE", "ZENITH_RAG_ANSWER_PROMPT_V2", "ZENITH_COLLECTION_LANG",
+               "ZENITH_COLLECTION_HINTS"):
+        _v = _read_env_key(_k) or env.get(_k)
+        if _v:
+            env[_k] = _v                                     # ← 直接赋值，不用 setdefault
+    llm_key = _read_env_key("ZENITH_LLM_API_KEY") or env.get("ZENITH_LLM_API_KEY") or _read_yaml_key("api_key")
     if llm_key:
-        env.setdefault("LLM_API_KEY", llm_key)
-    env.setdefault("LLM_BASE_URL", _read_provider_setting("api_base") or "https://api.deepseek.com/v1")
-    env.setdefault("LLM_MODEL", _read_provider_setting("model") or "deepseek-flash")
+        env["LLM_API_KEY"] = llm_key
+    # 🟡 2026-10-08：`.env` 优先于硬编码兜底 —— core 的内置默认是
+    #    api.siliconflow.cn，而 ZENITH_LLM_API_KEY 是 DeepSeek 官方的 key，
+    #    配错时表现为 401「Token is invalid.」（看着像 key 坏，实为 base_url 错）。
+    # 🔴 2026-10-09：同样改为直接赋值 —— LLM_BASE_URL / LLM_MODEL 也写在 `.env` 里，
+    #    一样会被 config.py 冻结，用 setdefault 同样改不动。
+    env["LLM_BASE_URL"] = (_read_env_key("LLM_BASE_URL") or env.get("LLM_BASE_URL")
+                           or _read_provider_setting("api_base") or "https://api.deepseek.com/v1")
+    env["LLM_MODEL"] = (_read_env_key("LLM_MODEL") or env.get("LLM_MODEL")
+                        or _read_provider_setting("model") or "deepseek-flash")
     return env
 
 

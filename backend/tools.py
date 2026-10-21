@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
+import os
 import json
+import copy
 import asyncio
 import logging
 import contextvars
@@ -138,11 +140,14 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_memory",
-            "description": "搜索已存储的记忆。需要回忆用户之前说过的重要信息时调用。",
+            "description": "搜索已存储的记忆。需要回忆用户之前说过的重要信息时调用。"
+                           "可直接传用户原话/整句（如「之前聊过的那个量化宽松」）——"
+                           "词法未命中时会自动转为语义联想匹配，无需自己拆词；"
+                           "若确知专有名词/缩写（如 MT5、Footprint），直接传该词更准。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "搜索关键词"}
+                    "keyword": {"type": "string", "description": "搜索词，或用户原话（整句亦可）"}
                 },
                 "required": ["keyword"]
             }
@@ -324,11 +329,12 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "抓取并读取一个外部网页链接的内容（http/https）。用户发来链接、让你看某个网页、或需要读取在线文档时调用。返回网页正文文本。",
+            "description": "抓取并读取外部网页正文（http/https），服务端渲染优先，失败回退本地直抓。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "要访问的完整网页链接，如 https://example.com/article"}
+                    "url": {"type": "string", "description": "要访问的完整网页链接，如 https://example.com/article"},
+                    "max_chars": {"type": "integer", "description": "正文最大字符数，默认 8000，上限 20000（可选）"}
                 },
                 "required": ["url"]
             }
@@ -338,12 +344,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "联网搜索网络信息（免 API Key，使用 Bing）。当用户问的最新信息超出你的知识范围、或需要查网络资料时调用。返回标题、链接、摘要。",
+            "description": "联网搜索（DeepSeek 优先，失败回退 Bing）。支持 site:、after:、before:、lang: 运算符，返回标题、链接、日期与摘要。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "max_results": {"type": "integer", "description": "返回结果数量，默认 5（可选）"}
+                    "query": {"type": "string", "description": "搜索关键词，可用 site:/after: 运算符"},
+                    "max_results": {"type": "integer", "description": "返回结果数量，默认 5（可选）"},
+                    "need_content": {"type": "boolean", "description": "是否同时返回网页正文（更贵，默认 false）"}
                 },
                 "required": ["query"]
             }
@@ -436,7 +443,11 @@ TOOLS_SCHEMA = [
                 "properties": {
                     "symbol": {"type": "string", "description": "交易品种，默认XAUUSD"},
                     "timeframe": {"type": "string", "description": "时间周期: M1/M5/M15/M30/H1/H4/D1/W1/MN1", "enum": ["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"]},
-                    "count": {"type": "integer", "description": "K线数量，默认100，最大1000"}
+                    "count": {"type": "integer", "description": "K线数量，默认100，最大1000"},
+                    "tail_n": {
+                        "type": "integer",
+                        "description": "返回最近 N 根逐根 OHLCV（自己算指标时用）。默认 0=只返回摘要"
+                    }
                 },
                 "required": []
             }
@@ -446,7 +457,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "mt5_volume_profile",
-            "description": "计算MT5成交量分布(Volume Profile)，找出POC(最大成交量价位)和价值区域。用户问成交量分布/POC/主力成本区时调用。",
+            "description": "计算MT5成交量分布(Volume Profile)与VWAP，给出POC(最大成交量价位)、价值区域和成交量加权均价线。用户问成交量分布/POC/主力成本区/VWAP/均价/机构成本线时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -486,12 +497,14 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "mt5_trade_history",
-            "description": "获取MT5历史成交记录(deals)：每笔开仓/平仓的时间、品种、方向、手数、成交价、盈亏、手续费、库存费，并给出区间累计盈亏。用户问交易记录/历史成交/交易明细/最近赚了多少/亏损多少/交易流水时调用。",
+            "description": "获取MT5历史成交记录(deals)：每笔开仓/平仓的时间、品种、方向、手数、成交价、盈亏、平仓原因，并给出区间累计盈亏。用户问交易记录/历史成交/交易流水时调用；查去年用 date_from/date_to。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-365"},
-                    "limit": {"type": "integer", "description": "最多返回条数，默认200"}
+                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-3650"},
+                    "limit": {"type": "integer", "description": "最多返回条数，默认200"},
+                    "date_from": {"type": "string", "description": "起始日期，如 2025-01-01；给了就忽略 days"},
+                    "date_to": {"type": "string", "description": "结束日期，如 2025-12-31（含当天）"}
                 },
                 "required": []
             }
@@ -505,8 +518,10 @@ TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-365"},
-                    "limit": {"type": "integer", "description": "最多返回条数，默认200"}
+                    "days": {"type": "integer", "description": "回溯天数，默认7，范围1-3650"},
+                    "limit": {"type": "integer", "description": "最多返回条数，默认200"},
+                    "date_from": {"type": "string", "description": "起始日期，如 2025-01-01"},
+                    "date_to": {"type": "string", "description": "结束日期，如 2025-12-31"}
                 },
                 "required": []
             }
@@ -520,6 +535,50 @@ TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mt5_history_span",
+            "description": "查询该MT5账户在终端里可读的历史范围（最早/最晚成交时间）。用户问某年有没有交易、或查更早记录前先调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trade_profile",
+            "description": "分析交易习惯（确定性统计）：胜率/盈亏比/PF/持仓时长/时段分布/回撤，并把每笔交易对照行情算日内入场位置与MFE/MAE。用户问交易习惯、胜率、复盘、为什么总亏时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "回溯天数，默认90，范围1-3650"},
+                    "symbol": {"type": "string", "description": "品种过滤，如 XAUUSD；留空=全部品种"},
+                    "date_from": {"type": "string", "description": "起始日期，如 2025-01-01；给了就忽略 days"},
+                    "date_to": {"type": "string", "description": "结束日期，如 2025-12-31（含当天）"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "trade_review",
+            "description": "多角色深度交易复盘：行为分析师+行情对照官并行出结论，风控审计官逐条核对证据并驳回无依据结论。约20-90秒，仅在用户要求深度复盘时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "回溯天数，默认90，范围1-365"},
+                    "symbol": {"type": "string", "description": "品种过滤，留空=全部"}
+                },
                 "required": []
             }
         }
@@ -709,6 +768,31 @@ TOOLS_SCHEMA = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_calendar_events",
+            "description": "读取本地缓存的财经事件明细（只读）。用户问今天/这两天有什么数据、几点公布时调用。含星级、前值、预期、实际值；已公布项 actual 有值。返回 0 条则先调 sync_calendar。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "查询天数（含今天），默认 3"
+                    },
+                    "min_star": {
+                        "type": "integer",
+                        "description": "最小星级，默认 2（顶级事件用 4）"
+                    },
+                    "name_search": {
+                        "type": "string",
+                        "description": "事件名关键词过滤（可选）"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
     # --- 智能分类工具 (P0) ---
     {
         "type": "function",
@@ -736,12 +820,16 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "retrieve_docs",
-            "description": "从本地知识库检索与问题相关的文献片段。适用：用户问论文/书籍/文献内容、要求总结资料、查原文出处。不用于记录日程或笔记。",
+            "description": "从本地知识库检索与问题相关的文献片段。适用：用户问论文/书籍/文献内容、要求总结资料、查原文出处。不用于记录日程或笔记。知识库分为多个集合，各自语料领域不同；不确定该用哪个集合时留空用默认集合。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string", "description": "检索问题"},
-                    "top_k": {"type": "integer", "description": "返回片段数，默认5"}
+                    "top_k": {"type": "integer", "description": "返回片段数，默认5"},
+                    # D3-1（2026-10-09）：**不再**在运行时把集合清单注入此处 ——
+                    # 那会让 tools 字节随网关返回而变，击穿其后**全部**前缀缓存。
+                    # 清单改由 collection_hint_text() 注入 **system 尾部**；此处只留静态指针。
+                    "collection": {"type": "string", "description": "知识库集合名，可选。可用集合并其语料见系统提示末尾的「知识库集合」段。留空=使用默认集合。"}
                 },
                 "required": ["question"]
             }
@@ -802,7 +890,10 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "call_mcp",
-            "description": "调用已配置的 MCP 服务中的某个工具。例如事实核查(fact-check-mcp 的 verify_claim/check_groundedness/scan_contradictions/check_memory_conflict)、代码验证(code-verify-mcp 的 verify_execution/check_imports)、执行门控(guard-mcp)、缓存调度(cache-scheduler)。当用户要求严格验证/核查/硬性检查，或命中需要 MCP 工具的技能（如 zenith-auditor）时调用。不填 tool_name 则返回该服务可用工具列表。",
+            # C2（2026-10-09）：顶层 description 硬上限 120 码点。原 293 字符里那串
+            # 「某服务 → 某工具」枚举与本工具 `mcp_name` / `tool_name` 的参数说明**完全重复**，
+            # 删去不丢信息（服务名与工具名在参数 description 中仍完整保留）。
+            "description": "调用 MCP 服务（fact-check-mcp / code-verify-mcp / guard-mcp / cache-scheduler）中的工具，用于严格核查/验证。不填 tool_name 则列出该服务可用工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -988,6 +1079,107 @@ _DISABLED_TOOLS = {
 TOOLS_SCHEMA = [t for t in TOOLS_SCHEMA if t["function"]["name"] not in _DISABLED_TOOLS]
 
 
+# ── 运行时集合清单：注入 system 尾部，而**不是** tools schema（D3-1，2026-10-09）────
+# 背景：多集合改造后 `retrieve_docs` 多了 `collection` 参数，但**模型没法猜**有哪些集合、
+# 各装什么语料 —— 集合名（如 nomad_ref）本身不携带语义。所以必须把清单告诉模型。
+#
+# 🔴 **为什么不能放进 tools schema**（= 2026-10-08 的原实现）：
+#   tools 会被渲染在 prompt 的**最前面**，而这份清单是**运行时探测**的
+#   （随入库任务变化）⇒ 只要 `docs`/`chunks` 计数一变，tools 字节就变
+#   ⇒ **其后全部内容的前缀缓存作废**。这不是「某轮慢一点」，是**每 60 秒就可能重置一次前缀**。
+#
+# ✅ **改法**：清单移到 **system 尾部**（`routers/chat.py` 的 `system_parts` 最后一个元素）。
+#   于是 tools 数组**逐字节静态**；system 尾部的变动只影响其后的 token，代价小一个量级。
+#
+# 设计取舍（沿用原实现，理由不变）：
+#   · 动态而非写死 —— 集合可增可删，写死的清单必然过时（本仓已多次踩「文档漂移」）。
+#   · 60 秒进程内缓存 —— chat_stream 每轮都会取，不能每轮打一次网关。
+#   · **任何失败都返回空串** —— 清单缺失只是「模型不知道有哪些集合」，
+#     而它绝不该阻断对话、也不该往 system 里塞半截内容。
+_COLL_HINT_CACHE: dict = {"at": 0.0, "text": None}
+_COLL_HINT_TTL = 60.0
+
+
+def _collection_hints() -> dict:
+    """各集合的语料说明，来自环境变量 ZENITH_COLLECTION_HINTS（JSON）。
+
+    放环境变量而非硬编码：代码保持通用，具体语料属于部署配置。
+    例：ZENITH_COLLECTION_HINTS={"nomad_ref":"NOMAD 英文维基语料"}
+    """
+    raw = os.environ.get("ZENITH_COLLECTION_HINTS", "").strip()
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("ZENITH_COLLECTION_HINTS 解析失败（忽略）: %s", e)
+        return {}
+
+
+def _collection_desc(colls: list, default: str) -> str:
+    """把集合列表渲染成一行清单：`名（N篇/M段，说明）[【默认】]`，分号分隔。
+
+    只渲染**清单本身**（不含前后引导语）—— 引导语由调用方按注入位置决定，
+    这样同一份渲染结果既能进 system 尾部的独立小节，也能在日志/审计里单独用。
+    """
+    hints = _collection_hints()
+    parts = []
+    for c in colls:
+        name = (c or {}).get("collection")
+        if not name:
+            continue
+        seg = f"{name}（{(c or {}).get('docs', '?')}篇/{(c or {}).get('chunks', '?')}段"
+        h = hints.get(name)
+        seg += f"，{h}）" if h else "）"
+        if name == default:
+            seg += "【默认】"
+        parts.append(seg)
+    return "；".join(parts)
+
+
+async def collection_hint_text() -> str:
+    """「知识库集合」段落 —— 供 `routers/chat.py` 追加到 system **尾部**。
+
+    返回形如::
+
+        ## 知识库集合
+        `retrieve_docs` 的 `collection` 参数可选以下集合（留空=默认）：
+        nomad_ref（12345篇/67890段）【默认】；science_zh（2795篇/13134段）
+
+    失败 / 网关无集合 → 返回 `""`（不注入、不阻断）。
+    """
+    import time as _time
+    now = _time.time()
+    if _COLL_HINT_CACHE["text"] is not None and now - _COLL_HINT_CACHE["at"] < _COLL_HINT_TTL:
+        return _COLL_HINT_CACHE["text"]
+    try:
+        r = await knowledge_service.list_collections()
+        body = _collection_desc(r.get("collections") or [], r.get("default") or "")
+        text = ("" if not body else
+                "## 知识库集合\n"
+                "`retrieve_docs` 的 `collection` 参数可选以下集合（留空=默认）：\n" + body)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("知识库集合清单获取失败（system 尾部不注入）: %s", e)
+        text = ""
+    _COLL_HINT_CACHE.update({"at": now, "text": text})
+    return text
+
+
+async def get_tools_schema() -> list:
+    """返回 tools schema —— **逐字节静态**（D3-1 起不再做任何运行时注入）。
+
+    保留 `async` 与函数名只是为了不改调用点契约（`routers/chat.py` 有 1 处 `await`）。
+    运行时变化的「可用集合清单」已改由 `collection_hint_text()` 注入 system 尾部，
+    原因见本文件上方 `_COLL_HINT_CACHE` 的说明。
+
+    返回**副本**（非 `TOOLS_SCHEMA` 本身）：调用方一律只读，但副本能防止
+    某处未来「顺手 pop/append」污染全局常量。内容与 `TOOLS_SCHEMA` 完全一致，
+    因此渲染出的 token 序列逐字节相同 —— 前缀缓存照常命中。
+    """
+    return copy.deepcopy(TOOLS_SCHEMA)
+
+
 # ── 工具处理器注册表 ──
 # 当前执行对话 ID（上下文变量：每个异步任务独立，多对话并发不串号）
 # 由 execute_tool 在当前 task 上下文里 set，供 update_background 等工具读取
@@ -1018,6 +1210,9 @@ _TOOL_HANDLERS = {
     "mt5_trade_history":   lambda a: _handle_mt5_trade_history(a),
     "mt5_order_history":   lambda a: _handle_mt5_order_history(a),
     "mt5_pending_orders":  lambda a: _handle_mt5_pending_orders(),
+    "mt5_history_span":    lambda a: _handle_mt5_history_span(),
+    "trade_profile":       lambda a: _handle_trade_profile(a),
+    "trade_review":        lambda a: _handle_trade_review(a),
     "distill_conversation": lambda a: _handle_distill_conv(a),
     "distill_schedules":   lambda a: _handle_distill_schedules(a),
     "distill_memories":    lambda a: _handle_distill_memories(a),
@@ -1028,6 +1223,7 @@ _TOOL_HANDLERS = {
     "distill_yearly":      lambda a: _handle_distill_yearly(a),
     "consolidate_memories": lambda a: _handle_consolidate_memories(a),
     "sync_calendar":       lambda a: _handle_sync_calendar(a),
+    "list_calendar_events": lambda a: _handle_list_calendar_events(a),
     "smart_classify":      lambda a: _handle_smart_classify(a),
     "distill_note":        lambda a: _handle_distill_note(a),
     "check_duplicate":     lambda a: _handle_check_duplicate(a),
@@ -1096,8 +1292,10 @@ def _verify_tool_result(name: str, args: dict, result: dict) -> dict | None:
                 return {"level": "warning", "message": "代码执行未产生输出"}
 
         elif name == "web_search":
-            data = result.get("result", {})
-            if isinstance(data, dict) and not data.get("results"):
+            # 2026-10-21 修复：原先读 result["result"]（字符串）再判 isinstance(dict)，
+            # 恒为 False → 「搜索无结果」告警从来没触发过。真正的结果列表在顶层 results。
+            data = result.get("results") or []
+            if not data:
                 return {"level": "warning", "message": "搜索未返回结果，信息可能不完整"}
 
         elif name in ("add_schedule", "add_note"):
@@ -1392,7 +1590,28 @@ async def _handle_execute_code(args: dict) -> dict:
 
 
 def _handle_search_memory(args: dict) -> dict:
-    items = mem_search(keyword=args.get("keyword", ""))
+    keyword = args.get("keyword", "")
+    items = mem_search(keyword=keyword)
+    source = ""  # "" = 词法精确命中；"assoc" = 词法空手后由联想召回补上
+    if not items:
+        # 2026-10-09（根因修复）：词法通道对「口语化追问」必然空手 ——
+        #   memories_fts 建表无 tokenize 子句 → 连续中文串 = 一个 token；
+        #   兜底 LIKE 又是整串匹配（`%整句%`）。生产库实测：
+        #     「之前我们聊过日本泡沫经济的事，你还记得吗」→ FTS 0 / LIKE 0
+        #     「我是不是说过黄金怎么操作」            → FTS 0 / LIKE 0
+        #   而字符 n-gram 联想召回同句 top 分数 97.9、top1 内容正确；换关键词
+        #   （泡沫经济/黄金/MT5）才有 1/34/11 命中。
+        #   ⇒ 词法空手时的正确通道是**联想召回**，不是把句子切得更碎。
+        #   recall_by_association 只取真命中（不做重要度兜底），避免把不相干的
+        #   记忆当成「找回来的结果」——那是噪音。
+        try:
+            from .memory_engine import recall_by_association
+            items = recall_by_association(keyword, limit=10)
+            if items:
+                source = "assoc"
+        except Exception as e:  # noqa: BLE001 — 联想失败不得让检索整体失败
+            logger.warning("联想召回失败（降级为未找到）: %s", e)
+            items = []
     if not items:
         return {"success": True, "result": "未找到相关记忆。"}
     # 命中即提升重要度 + 刷新 last_touched_at（引用提升机制，限前 10 条避免过度膨胀）
@@ -1402,7 +1621,9 @@ def _handle_search_memory(args: dict) -> dict:
             mem_touch(m["id"])
     except Exception:
         pass
-    lines = ["🧠 相关记忆："]
+    header = ("🧠 相关记忆（按语义联想匹配，非精确词命中，可能包含近似项）："
+              if source == "assoc" else "🧠 相关记忆：")
+    lines = [header]
     for m in items:
         lines.append(f"  [ID:{m['id']}][{m['type']}] {m['content']}")
     # 机器可读 ID 清单（锚点，供 LLM 逐字核对，避免编造 ID；限前 50 条防截断）
@@ -1486,15 +1707,31 @@ async def _handle_web_fetch(args: dict) -> dict:
     url = args.get("url", "").strip()
     if not url:
         return {"success": False, "result": "url 不能为空"}
-    return await fetch_url(url)
+    try:
+        max_chars = int(args.get("max_chars") or 8000)
+    except (TypeError, ValueError):
+        max_chars = 8000
+    # 上限 20000：再大就是拿 token 换噪声，真要长文让模型分段抓
+    max_chars = max(1000, min(max_chars, 20000))
+    return await fetch_url(url, max_chars=max_chars)
 
 
 async def _handle_web_search(args: dict) -> dict:
-    """联网搜索（Bing，免 Key）"""
+    """联网搜索（DeepSeek 优先，回退 Bing）"""
     from .web_tools import web_search
     query = args.get("query", "").strip()
-    max_results = args.get("max_results", 5)
-    return await web_search(query, max_results=max_results)
+    try:
+        max_results = int(args.get("max_results") or 5)
+    except (TypeError, ValueError):
+        max_results = 5
+    max_results = max(1, min(max_results, 10))
+    ori_question = (args.get("ori_question") or "").strip() or None
+    return await web_search(
+        query,
+        max_results=max_results,
+        need_content=bool(args.get("need_content", False)),
+        ori_question=ori_question,
+    )
 
 
 async def _handle_analyze_content(args: dict) -> dict:
@@ -1642,6 +1879,7 @@ def _handle_mt5_rates(args: dict) -> dict:
     symbol = args.get("symbol", "XAUUSD")
     timeframe = args.get("timeframe", "M5")
     count = args.get("count", 100)
+    tail_n = int(args.get("tail_n") or 0)
 
     result = get_rates(symbol, timeframe, count)
     if not result.get("success"):
@@ -1657,12 +1895,33 @@ def _handle_mt5_rates(args: dict) -> dict:
         f"  涨跌: {stats.get('change', 'N/A')} ({stats.get('change_pct', 'N/A')}%)",
         f"  均量: {stats.get('avg_volume', 'N/A')}",
     ]
+
+    # B 项（2026-10-16 诊断）：逐根 OHLCV。
+    # 关键约束：chat.py 只把 result["result"] 这个字符串送进模型，
+    # {"rates": [...]} 会被丢弃 —— 所以必须拼进 lines，不能只放在 result 字典里。
+    # 上限 120 根：tool_result_prune 默认 head 4096 + tail 1024，超了会被截断。
+    if tail_n > 0:
+        bars = result.get("rates") or []
+        limit = min(tail_n, 120, len(bars))
+        if limit < tail_n:
+            lines.append(f"  ⚠️ tail_n={tail_n} 已截到 {limit} 根（上限 120，防工具结果被裁剪）")
+        if limit > 0:
+            lines.append(f"  最近 {limit} 根 (时间 开 高 低 收 量):")
+            for b in bars[-limit:]:
+                t = str(b.get("time", ""))[5:16].replace("T", " ")
+                lines.append(
+                    f"    {t} {b.get('open')} {b.get('high')} {b.get('low')} "
+                    f"{b.get('close')} {b.get('volume')}"
+                )
+        else:
+            lines.append("  ⚠️ 无逐根数据（rates 为空）")
+
     return {"success": True, "result": "\n".join(lines), **result}
 
 
 def _handle_mt5_volume_profile(args: dict) -> dict:
-    """获取 MT5 成交量分布"""
-    from .mt5_service import get_volume_profile
+    """获取 MT5 成交量分布 + VWAP（C 项并入本工具，原因见函数尾部注释）"""
+    from .mt5_service import get_volume_profile, get_vwap
 
     symbol = args.get("symbol", "XAUUSD")
     timeframe = args.get("timeframe", "M5")
@@ -1688,6 +1947,27 @@ def _handle_mt5_volume_profile(args: dict) -> dict:
         lines.append("\n  成交量最大的5个价位:")
         for i, b in enumerate(top_bins):
             lines.append(f"    {i+1}. {b['price_low']:.2f}-{b['price_high']:.2f} ({b['pct']}%)")
+
+    # C 项（2026-10-16 诊断）：VWAP 并入本工具，而非独立 `mt5_vwap`。
+    # 理由：VWAP 与 Volume Profile 同属「成交量派生指标」，语义上本就该放一起；
+    # 而 tools schema 是**每轮请求都发出去的常驻载荷**（`test_tools_schema.py`
+    # 的总预算 7000 字符），单开一个工具要多付 ~150 字符的固定成本。
+    # 服务端算好再下发，避免模型自己用 K 线手算（历史上就是算不出来才缺这一环）。
+    vwap = get_vwap(symbol, timeframe, count)
+    if vwap.get("success"):
+        lines.append("")
+        lines.append(
+            f"  VWAP(成交量加权均价): {vwap['vwap']}（收盘 {vwap['close']}，"
+            f"偏离 {vwap['deviation_pct']}%，{vwap['position']}）"
+        )
+        b = vwap.get("bands") or {}
+        if b:
+            lines.append(
+                f"  VWAP带: +1σ {b['上轨 +1σ']} / -1σ {b['下轨 -1σ']} / "
+                f"+2σ {b['上轨 +2σ']} / -2σ {b['下轨 -2σ']}"
+            )
+        lines.append("  VWAP 常作日内多空分界：价在上方偏多、下方偏空。")
+        lines.append("  ⚠️ MT5 volume 是 tick_volume（报价跳动数），非真实手数，VWAP 为近似值。")
 
     return {"success": True, "result": "\n".join(lines), **result}
 
@@ -1734,8 +2014,8 @@ def _handle_mt5_account() -> dict:
         f"💼 账户 {r.get('login')}（{r.get('name')}）",
         f"  服务器: {r.get('server')} / {r.get('company')}",
         f"  币种: {r.get('currency')}   杠杆: 1:{r.get('leverage')}",
-        f"  余额: {r.get('balance')}   信用: {r.get('credit')}",
-        f"  净值: {r.get('equity')}   浮动盈亏: {r.get('profit')}",
+        f"  余额(balance=已结算，不含浮盈): {r.get('balance')}   信用: {r.get('credit')}",
+        f"  净值(equity=余额+浮盈): {r.get('equity')}   浮动盈亏: {r.get('profit')}",
         f"  已用保证金: {r.get('margin')}   可用保证金: {r.get('margin_free')}",
         f"  保证金水平: {ml}%" + (f"（{r.get('margin_level_note')}）" if r.get("margin_level_note") else ""),
         f"  强平预警线: {r.get('margin_so_call')}%   强平执行线: {r.get('margin_so_so')}%",
@@ -1750,23 +2030,63 @@ def _handle_mt5_trade_history(args: dict) -> dict:
 
     days = int(args.get("days") or 7)
     limit = int(args.get("limit") or 200)
-    r = get_trade_history(days, limit)
+    df = args.get("date_from") or None
+    dt = args.get("date_to") or None
+    r = get_trade_history(days, limit, df, dt)
     if not r.get("success"):
         return r
 
+    win = r.get("window") or {}
+    span = f"{win.get('from', '')} ~ {win.get('to', '')}"
     if r["count"] == 0:
-        return {"success": True, "result": f"最近 {days} 天没有成交记录", "count": 0, "days": days}
+        # ⚠️ 空结果必须自动附上「账户可读历史范围」，否则模型会拿「窗口内没数据」
+        #    推断成「这个账户从来没交易过」（2026-10-19 实测：模型据此断言
+        #    「2025 年 6 月没有任何成交」，而实际有 356 条）。
+        from .mt5_service import get_history_span
+        sp = get_history_span()
+        if sp.get("success") and sp.get("count"):
+            hint = (
+                f"该账户可读历史：{sp.get('earliest')} ~ {sp.get('latest')}"
+                f"（{sp.get('count')} 条 deal）"
+            )
+        else:
+            hint = "无法确认账户可读历史范围"
+        return {
+            "success": True,
+            "result": (
+                f"查询区间 {span} 内没有成交记录。\n"
+                f"{hint}\n"
+                "结论要分清两种情况：区间在可读范围内 → 确实没交易；"
+                "区间早于最早成交 → 是查询范围问题，不是账户没交易。"
+            ),
+            "count": 0,
+            "window": win,
+            "account_span": {
+                "earliest": sp.get("earliest"), "latest": sp.get("latest"),
+                "count": sp.get("count"),
+            } if sp.get("success") else None,
+        }
 
+    fs = r.get("funding_summary") or {}
     lines = [
-        f"📊 最近 {days} 天成交记录（共 {r['count']} 条，显示 {r['returned']} 条）:",
+        f"📊 成交记录（{span}，共 {r['count']} 条，显示 {r['returned']} 条）:",
+        f"  真实交易 {r['trade_count']} 条 / 资金流水 {r['funding_count']} 条",
         f"  平仓盈亏合计: {r['closed_profit']}（{r['closed_count']} 笔平仓）",
         f"  扣手续费/库存费后净额: {r['net_after_costs']}",
+        f"  资金流水：累计入金 {fs.get('deposit_total')} / 累计出金 {fs.get('withdrawal_total')} "
+        f"/ 余额调整 {fs.get('adjustment_total')} / 净额 {fs.get('net')}（不计入交易盈亏）",
     ]
     for d in r["deals"][:60]:
+        if d.get("kind") == "funding":
+            label = d.get("funding_label") or d["type"]
+            lines.append(f"  {d['time']}  [{label}]  {d['profit']:+.2f}  {d['comment'][:24]}")
+            continue
         action = {"in": "开仓", "out": "平仓", "inout": "反向", "out_by": "对冲平仓"}.get(d["entry"], d["entry"])
         seg = f"  {d['time']}  {d['symbol']} {d['type']} {d['volume']}手 @ {d['price']}  [{action}]"
         if d["profit"]:
             seg += f"  盈亏={d['profit']}"
+        if d.get("reason_text") and d["entry"] in ("out", "out_by", "inout"):
+            seg += f"  原因={d['reason_text']}"
         if d["commission"]:
             seg += f"  手续费={d['commission']}"
         if d["swap"]:
@@ -1778,7 +2098,8 @@ def _handle_mt5_trade_history(args: dict) -> dict:
     return {
         "success": True,
         "result": "\n".join(lines),
-        "days": days,
+        "days": r.get("days"),
+        "window": win,
         "count": r["count"],
         "truncated": r["truncated"],
         "total_profit": r["total_profit"],
@@ -1794,23 +2115,39 @@ def _handle_mt5_order_history(args: dict) -> dict:
 
     days = int(args.get("days") or 7)
     limit = int(args.get("limit") or 200)
-    r = get_order_history(days, limit)
+    df = args.get("date_from") or None
+    dt = args.get("date_to") or None
+    r = get_order_history(days, limit, df, dt)
     if not r.get("success"):
         return r
 
+    win = r.get("window") or {}
+    span = f"{win.get('from', '')} ~ {win.get('to', '')}"
     if r["count"] == 0:
-        return {"success": True, "result": f"最近 {days} 天没有历史订单", "count": 0, "days": days}
+        return {"success": True, "result": f"查询区间 {span} 内没有历史订单", "count": 0, "window": win}
 
-    lines = [f"📑 最近 {days} 天订单记录（共 {r['count']} 条，显示 {r['returned']} 条）:"]
+    lines = [f"📑 订单记录（{span}，共 {r['count']} 条，显示 {r['returned']} 条）:"]
     for o in r["orders"][:60]:
         lines.append(
-            f"  {o['time_setup']}  {o['symbol']} type={o['type']} state={o['state']} "
-            f"vol={o['volume_initial']} @ {o['price_open']} SL={o['sl']} TP={o['tp']}"
+            f"  {o['time_setup']}  {o['symbol']} {o.get('type_text') or o['type']} "
+            f"({o.get('state_text') or o['state']}) vol={o['volume_initial']} "
+            f"@ {o.get('price_effective') or o['price_open']} SL={o['sl']} TP={o['tp']}"
         )
     if r["count"] > 60:
         lines.append(f"  ...（其余 {r['count'] - 60} 条已省略）")
+    lines.append(
+        "  注：orders 是委托，不等于成交；市价单 price_open 常为 0，真实成交价看成交记录。"
+        "止损/止盈挂在持仓上，order 上 SL/TP=0 不能据此判断「没设止损」。"
+    )
 
-    return {"success": True, "result": "\n".join(lines), "days": days, "count": r["count"], "truncated": r["truncated"]}
+    return {
+        "success": True,
+        "result": "\n".join(lines),
+        "days": r.get("days"),
+        "window": win,
+        "count": r["count"],
+        "truncated": r["truncated"],
+    }
 
 
 def _handle_mt5_pending_orders() -> dict:
@@ -1831,6 +2168,123 @@ def _handle_mt5_pending_orders() -> dict:
             f"@ {o['price_open']}（当前 {o['price_current']}）SL={o['sl']} TP={o['tp']}"
         )
     return {"success": True, "result": "\n".join(lines), "count": r["count"]}
+
+
+def _handle_mt5_history_span() -> dict:
+    """探测该账户在 MT5 终端里可读的历史范围。"""
+    async def _run():
+        from .mt5_service import get_history_span
+
+        r = await asyncio.to_thread(get_history_span)
+        if not r.get("success"):
+            return r
+        if r.get("count", 0) == 0:
+            return {"success": True, "result": r.get("note", "该账户无可读历史"), "count": 0}
+        text = (
+            f"🗓️ 该账户可读历史：{r['earliest']} ~ {r['latest']}\n"
+            f"  共 {r['count']} 条 deal；首次资金流水：{r.get('funded_from') or '无'}\n"
+            f"  {r.get('note', '')}"
+        )
+        return {
+            "success": True,
+            "result": text,
+            "count": r["count"],
+            "earliest": r["earliest"],
+            "latest": r["latest"],
+        }
+
+    return _run()
+
+
+# ---------------------------------------------------------------------------
+# 交易习惯分析 Handler（2026-10-19 新增）
+# ⚠️ 与 mt5 handler 同样的原则：**不把完整 profile 塞回上下文**，
+#    只给文本摘要 + 少量关键字段。明细走 /api/trade/profile。
+# ---------------------------------------------------------------------------
+
+def _fmt_trade_profile(p: dict) -> str:
+    """文本摘要（实现见 trade_analytics.format_profile，命令行脚本共用）。"""
+    from .trade_analytics import format_profile
+    return format_profile(p)
+
+
+def _handle_trade_profile(args: dict) -> dict:
+    """交易习惯画像（纯统计，无 LLM）。
+
+    同步函数 → 返回 coroutine 交给 execute_tool await，
+    用 to_thread 避免 K 线遍历阻塞事件循环。
+    """
+    async def _run():
+        from .trade_analytics import build_profile
+
+        days = int(args.get("days") or 90)
+        symbol = (args.get("symbol") or "").strip()
+        df = args.get("date_from") or None
+        dt = args.get("date_to") or None
+        p = await asyncio.to_thread(build_profile, days, symbol, True, df, dt)
+        if not p.get("success"):
+            return p
+        return {
+            "success": True,
+            "result": _fmt_trade_profile(p),
+            "closed_trades": (p.get("overview") or {}).get("closed_trades"),
+            "win_rate_pct": (p.get("overview") or {}).get("win_rate_pct"),
+            "net_profit": (p.get("overview") or {}).get("net_profit"),
+        }
+
+    return _run()
+
+
+def _handle_trade_review(args: dict) -> dict:
+    """多角色交易复盘（行为 / 行情 / 审计）。"""
+    async def _run():
+        from .trade_review import run_review
+
+        days = int(args.get("days") or 90)
+        symbol = (args.get("symbol") or "").strip()
+        r = await run_review(days=days, symbol=symbol)
+        if not r.get("success"):
+            return r
+
+        roles = r.get("roles") or {}
+        lines = [f"🧠 多角色交易复盘（{days} 天）"]
+
+        beh = (roles.get("behavior") or {}).get("data") or {}
+        if beh:
+            lines.append("\n【行为分析师】")
+            for h in beh.get("habits") or []:
+                lines.append(f"  · {h.get('tag')}：{h.get('detail')}（{h.get('evidence_text')}）")
+            for s in beh.get("strengths") or []:
+                lines.append(f"  + 优势：{s.get('tag')}（{s.get('evidence_text')}）")
+
+        mkt = (roles.get("market") or {}).get("data") or {}
+        if mkt:
+            lines.append("\n【行情对照官】")
+            for o in mkt.get("observations") or []:
+                lines.append(f"  · {o.get('tag')}：{o.get('detail')}（{o.get('evidence_text')}）")
+            if mkt.get("regime_fit"):
+                lines.append(f"  小结：{mkt['regime_fit']}")
+
+        aud = (roles.get("auditor") or {}).get("data") or {}
+        if aud:
+            lines.append(f"\n【风控审计官】置信度 {aud.get('overall_confidence')}")
+            for c in aud.get("reliable_conclusions") or []:
+                lines.append(f"  ✓ {c.get('tag')}：{c.get('detail')}（{c.get('evidence_text')}）")
+            for c in aud.get("rejected_conclusions") or []:
+                lines.append(f"  ✗ 驳回 {c.get('tag')}：{c.get('reason')}")
+            if aud.get("audit_note"):
+                lines.append(f"  审计备注：{aud['audit_note']}")
+
+        for name in ("behavior", "market", "auditor"):
+            role = roles.get(name) or {}
+            if not role.get("ok"):
+                lines.append(f"\n⚠️ {name} 角色失败：{role.get('error', '未知')}")
+
+        meta = r.get("meta") or {}
+        lines.append(f"\n协同模式：{meta.get('note')}（耗时 {meta.get('elapsed_ms')} ms）")
+        return {"success": True, "result": "\n".join(lines), "meta": meta}
+
+    return _run()
 
 
 # ---------------------------------------------------------------------------
@@ -3188,6 +3642,85 @@ async def _handle_sync_calendar(args: dict) -> dict:
         return {"success": False, "result": f"同步失败: {e}"}
 
 
+async def _handle_list_calendar_events(args: dict) -> dict:
+    """A 项（2026-10-16 诊断）：读本地财经事件缓存。
+
+    背景：`schedule_events` 表里早有数据（本次实测 1211 行），`db.event_list()`
+    也早已实现，但**从未暴露给 LLM** —— 模型因此答不出「今天几点有数据」，
+    而用户的交易规则第一条就是「财经事件前 30 分钟清仓观望」。
+    本函数是该表的第一个只读工具入口，零写操作。
+    """
+    from .database import event_list
+    from datetime import datetime, timedelta
+
+    days = max(1, min(int(args.get("days", 3) or 3), 30))
+    min_star = max(1, int(args.get("min_star", 2) or 2))
+    name_search = (args.get("name_search") or "").strip()
+
+    now = datetime.now()
+    # ⚠️ event_time 实际存的是 ISO 8601 带时区（'2026-10-21T17:00:00+08:00'）。
+    # 边界必须用 'T' 作分隔符：用空格会让字符串比较整体错位（'T' > ' '），
+    # 结果是「未来事件全被漏掉」—— 静默、且看起来像"没数据"。
+    date_from = now.strftime("%Y-%m-%dT00:00:00")
+    date_to = (now + timedelta(days=days - 1)).strftime("%Y-%m-%dT23:59:59")
+
+    try:
+        rows = event_list(
+            date_from=date_from,
+            date_to=date_to,
+            name_search=name_search,
+            min_star=min_star,
+            limit=200,
+        )
+    except Exception as e:
+        logger.error("list_calendar_events tool failed: %s", e)
+        return {"success": False, "result": f"读取财经事件失败: {e}"}
+
+    if not rows:
+        hint = "缓存为空或该区间无数据，先调 sync_calendar 同步。" if not name_search else "无匹配事件，可放宽 name_search 或降低 min_star。"
+        return {"success": True, "result": f"📅 {date_from[:10]} 起 {days} 天内无星级≥{min_star} 的事件。{hint}", "count": 0}
+
+    lines = [f"📅 财经事件 {date_from[:10]} 起 {days} 天，星级≥{min_star}，共 {len(rows)} 条："]
+    pending = []
+    for r in rows:
+        t = str(r.get("event_time", ""))[5:16].replace("T", " ")
+        star = "★" * int(r.get("star") or 1)
+        name = r.get("name", "")
+        actual = str(r.get("actual") or "").strip()
+        consensus = str(r.get("consensus") or "").strip()
+        previous = str(r.get("previous") or "").strip()
+        tag = "已公布" if actual else "待公布"
+        extras = []
+        if previous:
+            extras.append(f"前值{previous}")
+        if consensus:
+            extras.append(f"预期{consensus}")
+        if actual:
+            extras.append(f"实际{actual}")
+        detail = f" {' '.join(extras)}" if extras else ""
+        lines.append(f"  {t} [{tag}] {star} {name}{detail}")
+        if not actual:
+            pending.append(r)
+
+    # 30 分钟内待公布单独高亮 —— 这是他「事件前 30 分钟清仓」规则的直接输入
+    soon = []
+    for r in pending:
+        try:
+            et = datetime.fromisoformat(str(r.get("event_time", "")))
+            if et.tzinfo is not None:
+                et = et.replace(tzinfo=None)
+            delta = (et - now).total_seconds()
+            if 0 <= delta <= 1800:
+                soon.append(f"{int(delta // 60)} 分钟后：{r.get('name')}")
+        except Exception:
+            continue
+    if soon:
+        lines.append("\n⏰ 30 分钟内待公布（重要）：")
+        lines.extend(f"  - {x}" for x in soon)
+
+    return {"success": True, "result": "\n".join(lines), "count": len(rows)}
+
+
 # consolidate「生成计划」阶段的超时上限（秒）。
 # 2026-08-20 实测一次 consolidate_memories 耗时 3972 秒（66.2 分钟）且全程无心跳，
 # SSE 对话被拖死 → 在此加硬超时闸门。需要调参时只改这一处。
@@ -3300,13 +3833,18 @@ def _local_kb_fallback(question: str, limit: int = 5) -> str:
 
 
 async def _handle_retrieve_docs(args: dict) -> dict:
-    """RAG 检索：转发到 knowledge_service.search；无实质结果时回落本地笔记/记忆"""
+    """RAG 检索：转发到 knowledge_service.search；无实质结果时回落本地笔记/记忆
+
+    2026-10-08：支持 `collection` 参数（多集合改造的最后一环）。
+    此前恒走网关默认集合（zotero_papers）⇒ **对话里永远取不到 nomad_ref**。
+    """
     question = args.get("question", "").strip()
     if not question:
         return {"success": False, "result": "question 不能为空"}
     top_k = int(args.get("top_k", 5))
+    collection = (args.get("collection") or "").strip() or None
     try:
-        r = await knowledge_service.search(question, top_k)
+        r = await knowledge_service.search(question, top_k, collection)
         if "error" in r:
             raw = r.get("error")
             detail = raw
@@ -3324,12 +3862,16 @@ async def _handle_retrieve_docs(args: dict) -> dict:
                 merged += f"\n\n{fb}"
             return {"success": False, "result": merged, "code": code, "fellback": bool(fb)}
         answer = r.get("answer", "") or ""
+        # 网关回显实际命中的集合；若走了查询翻译桥则一并回传（便于前端/日志追溯）
+        meta = {"collection": r.get("collection")}
+        if r.get("bridge"):
+            meta["bridge"] = r["bridge"]
         if _rag_answer_is_empty(answer):
             fb = _local_kb_fallback(question, limit=top_k)
             if fb:
                 head = answer.strip() or "（知识库未返回实质内容）"
-                return {"success": True, "result": f"{head}\n\n{fb}", "fellback": True}
-        return {"success": True, "result": answer}
+                return {"success": True, "result": f"{head}\n\n{fb}", "fellback": True, **meta}
+        return {"success": True, "result": answer, **meta}
     except Exception as e:
         merged = f"知识库检索失败: {e}"
         fb = _local_kb_fallback(question, limit=top_k)
@@ -3754,7 +4296,11 @@ async def _handle_read_document_chunk(args: dict) -> dict:
         return {"success": False, "result": "chunk_index 从 1 开始"}
 
     try:
-        data = await knowledge_service.get_doc_chunks(int(item_id))
+        # 2026-10-08 多集合回归修复（#2）：item_id 是「按文件名稳定哈希」得出的，
+        # 跨集合会重名 → 必须允许调用方显式指定 collection，否则可能读到另一个
+        # 集合的同名文档段落。不传时行为与改造前一致（落默认集合）。
+        data = await knowledge_service.get_doc_chunks(
+            int(item_id), args.get("collection") or None)
     except Exception as e:
         return {"success": False, "result": f"读取段落失败（知识库服务不可用？）: {e}"}
     if data.get("error") or not data.get("chunks"):
@@ -3839,7 +4385,13 @@ def _handle_shiji_wiki_lookup(args: dict) -> dict:
         max_chars = 800
     max_chars = max(200, min(max_chars, 3000))
 
-    pages_dir = Path(r"D:\下载文件\新建文件夹\shiji-kb\wiki\public\pages")
+    # 2026-10-21 开源分发：移除硬编码的本机绝对路径。
+    # 优先读 ZENITH_SHIJI_WIKI_DIR；未设置则默认「项目目录的同级 shiji-kb」，
+    # 这样 clone 到任意位置都能工作，找不到目录时走下面的 exists() 分支降级。
+    _shiji_env = os.environ.get("ZENITH_SHIJI_WIKI_DIR", "").strip()
+    pages_dir = Path(_shiji_env) if _shiji_env else (
+        Path(__file__).resolve().parents[2] / "shiji-kb" / "wiki" / "public" / "pages"
+    )
     if not pages_dir.exists():
         return {"success": False, "result": "《史记》wiki 目录不存在"}
 

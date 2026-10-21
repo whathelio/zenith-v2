@@ -37,7 +37,7 @@ market_analysis_time: "07:00"
 #
 #   browser:
 #     enabled: true
-#     path: "D:/下载文件/Tabbit Browser/Application/Tabbit Browser.exe"
+#     path: "C:/Program Files/Tabbit Browser/Application/Tabbit Browser.exe"
 #     args: []
 #
 # ⚠️ path 用正斜杠（/），避免 YAML 反斜杠转义踩坑。

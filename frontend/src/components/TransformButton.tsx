@@ -47,12 +47,16 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
     setPreview(null)
   }
 
-  const handleCancel = () => {
+  const handleCancel = async () => {
     // 删除已创建的 proposed 条目
-    if (preview?.created_id && preview?.target_type) {
-      if (preview.target_type === 'schedule') api.deleteSchedule(preview.created_id)
-      else if (preview.target_type === 'note') api.deleteNote(preview.created_id)
-      else if (preview.target_type === 'memory') api.deleteMemory(preview.created_id)
+    if (preview?.id && preview?.target_type) {
+      try {
+        if (preview.target_type === 'schedule') await api.deleteSchedule(preview.id)
+        else if (preview.target_type === 'note') await api.deleteNote(preview.id)
+        else if (preview.target_type === 'memory') await api.deleteMemory(preview.id)
+      } catch (e: any) {
+        setError(`撤销失败: ${e?.message || e}`)
+      }
     }
     setPreview(null)
   }
@@ -156,7 +160,10 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
                 {typeIcons[preview.target_type]} 转化为{typeLabels[preview.target_type]}
               </div>
               <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-                从 {typeLabels[preview.source_type]} #{preview.source_id} 转化而来 · 待确认
+                从 {typeLabels[preview.source_type]} #{sourceId} 转化而来
+                {/* 2026-10-17 审计 B1-C38：memory 目标没有 proposed 态（memories 表无
+                    status 列，mem_add 直接 INSERT），写"待确认"是谎报；这里如实分叉。 */}
+                {preview.target_type === 'memory' ? ' · 已写入（无需确认）' : ' · 待确认'}
               </div>
             </div>
 
@@ -174,20 +181,20 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
               {preview.target_type === 'schedule' && (
                 <>
                   <div style={{ fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: 6 }}>
-                    {preview.preview.title}
+                    {preview.item.title}
                   </div>
-                  {preview.preview.description && <div style={{ color: 'var(--color-text-secondary)' }}>{preview.preview.description}</div>}
+                  {preview.item.description && <div style={{ color: 'var(--color-text-secondary)' }}>{preview.item.description}</div>}
                   <div style={{ color: 'var(--color-text-muted)', fontSize: 11, marginTop: 6 }}>
-                    {preview.preview.start_time && `⏰ ${preview.preview.start_time}`}
-                    {preview.preview.end_time && ` → ${preview.preview.end_time}`}
-                    {preview.preview.location && ` 📍 ${preview.preview.location}`}
+                    {preview.item.start_time && `⏰ ${preview.item.start_time}`}
+                    {preview.item.end_time && ` → ${preview.item.end_time}`}
+                    {preview.item.location && ` 📍 ${preview.item.location}`}
                   </div>
                   <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
                     <span style={{ fontSize: 10, background: 'var(--color-bg-panel)', padding: '2px 8px', borderRadius: 4 }}>
-                      优先级: {preview.preview.priority}
+                      优先级: {preview.item.priority}
                     </span>
                     <span style={{ fontSize: 10, background: 'var(--color-bg-panel)', padding: '2px 8px', borderRadius: 4 }}>
-                      分类: {preview.preview.category}
+                      分类: {preview.item.category}
                     </span>
                   </div>
                 </>
@@ -195,14 +202,14 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
               {preview.target_type === 'note' && (
                 <>
                   <div style={{ fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: 6 }}>
-                    {preview.preview.title}
+                    {preview.item.title}
                   </div>
                   <div style={{ color: 'var(--color-text-secondary)', whiteSpace: 'pre-wrap' }}>
-                    {preview.preview.content}
+                    {preview.item.content}
                   </div>
-                  {preview.preview.tags && (
+                  {preview.item.tags && (
                     <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-accent-secondary)' }}>
-                      #{preview.preview.tags}
+                      #{preview.item.tags}
                     </div>
                   )}
                 </>
@@ -211,16 +218,16 @@ export function TransformButton({ sourceType, sourceId, onTransformed }: Transfo
                 <>
                   <div style={{ marginBottom: 6, display: 'flex', gap: 8 }}>
                     <span style={{ fontSize: 10, background: 'var(--color-bg-panel)', padding: '2px 8px', borderRadius: 4, color: 'var(--color-accent-primary)' }}>
-                      {preview.preview.type}
+                      {preview.item.type}
                     </span>
                     <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
-                      重要度: {preview.preview.importance}/5
+                      重要度: {preview.item.importance}/5
                     </span>
                   </div>
-                  <div style={{ color: 'var(--color-text-primary)' }}>{preview.preview.content}</div>
-                  {preview.preview.keywords && (
+                  <div style={{ color: 'var(--color-text-primary)' }}>{preview.item.content}</div>
+                  {preview.item.keywords && (
                     <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-muted)' }}>
-                      关键词: {preview.preview.keywords}
+                      关键词: {preview.item.keywords}
                     </div>
                   )}
                 </>

@@ -132,3 +132,14 @@ data/last_exit.json
 config/config.yaml.*
 !config/config.yaml.example
 
+# ══════════════════════════════════════════════════════════════
+# 2026-10-21 补：对外开源分发前审查（release/prep 分支）
+# ══════════════════════════════════════════════════════════════
+
+# 1) 诊断归档：临时探针 / .bak 备份 / pytest 残留，26MB，不入库
+_diag_archive/
+
+# 2) 运行时调用日志：含用户的真实查询词与访问过的 URL（web_calls.jsonl）
+#    data/ 目录在仓库里只应保留 .gitkeep 与 backgrounds/ 默认壁纸
+data/*.jsonl
+

@@ -149,7 +149,8 @@ def _gather_daily(date: str) -> dict:
     schedules = sch_list(date_from=date_start, date_to=date_end)
     sch_lines = []
     for s in schedules:
-        sch_lines.append(f"- [{s.get('status', '?')}] {s.get('start_time', '?')[:16]} | {s['title']}")
+        # start_time 可为 NULL（sch_update 允许显式清空为 NULL），必须容错，否则整日/整周蒸馏崩溃
+        sch_lines.append(f"- [{s.get('status', '?')}] {(s.get('start_time') or '?')[:16]} | {s['title']}")
     schedule_text = "\n".join(sch_lines) if sch_lines else "（当日无日程）"
 
     # 笔记
@@ -247,7 +248,8 @@ def _gather_weekly(week_start: str) -> dict:
     schedules = sch_list(date_from=date_start, date_to=date_end)
     sch_lines = []
     for s in schedules:
-        sch_lines.append(f"- [{s.get('status', '?')}] {s.get('start_time', '?')[:16]} | {s['title']}")
+        # start_time 可为 NULL（sch_update 允许显式清空为 NULL），必须容错
+        sch_lines.append(f"- [{s.get('status', '?')}] {(s.get('start_time') or '?')[:16]} | {s['title']}")
     schedule_text = "\n".join(sch_lines) if sch_lines else "（本周无日程）"
 
     # 笔记

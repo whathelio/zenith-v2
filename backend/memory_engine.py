@@ -9,7 +9,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from .database import DB_PATH, mem_add, mem_for_inject, mem_search, mem_list, note_list, db, _now
+from .database import (
+    DB_PATH, mem_add, mem_for_inject, mem_search, mem_list, note_list, db, _now,
+    settings_get, settings_put,
+)
 
 if TYPE_CHECKING:
     import numpy as np  # 仅类型注解用（np.ndarray），运行时走函数内延迟导入
@@ -113,6 +116,12 @@ MERGE_SIM_THRESHOLD = 0.85
 # 取值与语义见 mem_consolidate 内注释（2026-09-11 修复 B3）。
 DECAY_DAYS = 30
 
+# 衰减的「上次执行日期」存在 settings 表。2026-10-17 审计 A4-R1 修复：
+# 原实现每 6 小时就跑一次衰减、且**不回写 last_touched_at** → 同一批记忆
+# 一天被砍 4 点，从 importance=5 掉到 1 只需 24 小时。现改为整个衰减窗口
+# （DECAY_DAYS）只跑一次，语义回到「30 天未引用降 1 点」。
+_DECAY_LAST_RUN_KEY = "memory_decay_last_run"
+
 # 召回结果是否回写 last_touched_at。设为 False 可一键退回旧行为（不改结构，仅停回写）。
 MARK_READ_ON_RECALL = True
 
@@ -198,32 +207,50 @@ def search_related_memories(keywords: list[str], limit: int = 15, min_keyword_re
     return relevant
 
 
-def build_memory_injection(current_query: str = "") -> str:
+def build_memory_injection(current_query: str = "", with_meta: bool = False):
     """
     构建注入到 system prompt 的记忆摘要（记忆 + 笔记）。
     若提供 current_query，走语义联想召回（字符 n-gram 重叠打分，不依赖精确关键词）；
     否则按重要度取 top 记忆。
+
+    `with_meta=True` 时返回 `(text, meta)`；`meta` 记录本轮**实际渲染进 prompt** 的
+    记忆/笔记 id 与规模，供调用方留痕（`trace_type='mem_recall'`）——
+    2026-10-09 新增：此前无法回答「记忆到底有没有在用、用了几条」，
+    只能靠 tool_call 痕迹间接猜。meta 结构：
+        {"mode": "query"|"importance", "chars": int, "truncated": bool,
+         "replaced_by_summary": bool, "memory_ids": [int], "note_ids": [int],
+         "groups": {type: 条数}}
+    ⚠️ 语义边界（2026-10-09 独立复核后修正）：`memory_ids` 只在**未被周期摘要整体替换**
+    时才有意义 —— `replaced_by_summary=True` 表示正文已被摘要顶掉，此时 ids 已清空。
+    若 `truncated=True` 且未替换，则尾部条目可能被硬截断（ids 是"参与渲染"的超集）。
+    默认 `with_meta=False`，返回值与改动前完全一致（既有调用点零影响）。
     """
-    memories: list[dict] = []
+    meta: dict = {
+        "mode": "query" if current_query else "importance",
+        "chars": 0,
+        "truncated": False,
+        "replaced_by_summary": False,
+        "memory_ids": [],
+        "note_ids": [],
+        "groups": {},
+    }
+
+    def _ret(text: str):
+        meta["chars"] = len(text or "")
+        return (text, meta) if with_meta else text
+
+    scored_mems: list[tuple[float, dict]] = []  # [(score, mem)]，全局按相关度降序
     notes: list[dict] = []
 
     if current_query:
-        memories, notes = search_related_items(current_query, limit=15, include_notes=True)
+        scored_mems, notes = search_related_items(
+            current_query, limit=15, include_notes=True, return_scores=True)
     else:
-        # 默认模式：按重要度取 top 20
-        memories = mem_for_inject(limit=20)
+        # 默认模式：按重要度取 top 20（无 query → 用 importance 作伪分数，保持降序语义）
+        scored_mems = [(float(m.get("importance") or 0), m) for m in mem_for_inject(limit=20)]
 
-    if not memories and not notes:
-        return ""
-
-    lines = ["## 记忆库（关于用户）"]
-
-    # 分组（排除 skill：技能由 _build_skill_injection 单独注入，避免重复 + 超长 content 浪费 token）
-    groups: dict[str, list] = {}
-    for m in memories:
-        if m["type"] == "skill":
-            continue
-        groups.setdefault(m["type"], []).append(m)
+    if not scored_mems and not notes:
+        return _ret("")
 
     type_names = {
         "personal_info": "关于用户的信息",
@@ -233,37 +260,96 @@ def build_memory_injection(current_query: str = "") -> str:
         "fact": "知道的事实",
         "experience": "经验与技巧",
     }
+
+    # ── 预算装填（2026-10-09 D-A 修复 + 装载公平性优化）──────────────────────
+    # 旧行为①：整段文本超预算 → 一律用 `psum_list()` 的周期摘要**整体替换**正文。
+    #   线上实测（conv f83fcd8e）：有 query 时 `replaced_by_summary=True` 常态化，
+    #   联想召回的条目**全部被顶掉** → 注入路径上等于白干。
+    # 旧行为②（本次优化）：改成「按预算逐条渲染」后，装填顺序是**按 type 分组**的
+    #   → 排在前面的分组会用**低分条目**挤掉后面分组的**高分条目**。
+    #   40 条真实查询实测 **78%** 存在该偏差（最严重：全局第 5 相关被第 14 相关挤掉）。
+    # 现行为：**全局按相关度装填 top-k**（`break` 保证入选集合恰是相关度前缀），
+    #   渲染时**再按 type 分组**（保持可读格式）。
+    #   `truncated` 只表示「还有条目没装下」；周期摘要仅在 **importance 模式**
+    #   或「一条都没装下」时启用。
+    MAX_INJECT_CHARS = 1500  # 约 1000 tokens
+    budget = MAX_INJECT_CHARS - len("## 记忆库（关于用户）") - 1  # 扣掉首行标题
+    used = 0
+    truncated = False
+    rendered_mems: list[dict] = []
+    _seen_types: set[str] = set()
+
+    for _score, m in scored_mems:
+        if m["type"] == "skill":
+            continue  # 技能由 _build_skill_injection 单独注入，避免重复 + 超长 content 浪费 token
+        cost = len(f"  - {m['content']}") + 1
+        if m["type"] not in _seen_types:
+            cost += len(f"\n**{type_names.get(m['type'], m['type'])}**：") + 1
+        if used + cost > budget:
+            truncated = True
+            break
+        used += cost
+        _seen_types.add(m["type"])
+        rendered_mems.append(m)
+
+    # 渲染：按 type 分组（组内保持全局相关度序；组间顺序 = 各组最高分条目的排名）
+    lines = ["## 记忆库（关于用户）"]
+    groups: dict[str, list] = {}
+    for m in rendered_mems:
+        groups.setdefault(m["type"], []).append(m)
     for tp, items in groups.items():
-        name = type_names.get(tp, tp)
-        lines.append(f"\n**{name}**：")
-        for item in items[:5]:
+        lines.append(f"\n**{type_names.get(tp, tp)}**：")
+        for item in items:
             lines.append(f"  - {item['content']}")
 
     # 2026-09-11（修复 B2 — 引用回写）：
     #   只有**真正被渲染进 prompt** 的记忆才算「被引用」，故回写点放在渲染之后、
-    #   且只取实际渲染的 items[:5]（groups 里超过 5 条的并未进 prompt，不该被记为引用）。
+    #   且只取实际装进预算的那批（2026-10-09 修正：旧代码在预算判断**之前**回写，
+    #   会把被摘要顶掉/被预算砍掉的条目也记成"已引用"）。
     #   不放在 search_related_memories / search_related_items 里的原因：
     #     ① 那两个函数也服务于去重参考检索（只是「看一眼候选」）
     #     ② 评估集会对全量记忆批量召回，逐次回写会产生大量无意义写事务并拖慢基线
     #   这里是每轮对话恰好一次、且集合最小的位置。
-    mem_mark_read([it["id"] for items in groups.values() for it in items[:5]])
+    mem_mark_read([it["id"] for it in rendered_mems])
+    meta["memory_ids"] = [it["id"] for it in rendered_mems]
+    _grp_count: dict[str, int] = {}
+    for _it in rendered_mems:
+        _grp_count[_it["type"]] = _grp_count.get(_it["type"], 0) + 1
+    meta["groups"] = _grp_count
 
+    note_ids: list[int] = []
     if notes:
-        lines.append("\n## 相关笔记")
+        header = "\n## 相关笔记"
+        header_added = False
         for nt in notes[:5]:
             title = nt.get("title", "") or "未命名"
             content = (nt.get("content", "") or "").strip().replace("\n", " ")
-            snippet = content[:120]
-            lines.append(f"  - 【{title}】{snippet}")
+            line = f"  - 【{title}】{content[:120]}"
+            extra = len(line) + 1 + (0 if header_added else len(header) + 1)
+            if used + extra > budget:
+                truncated = True
+                break
+            if not header_added:
+                lines.append(header)
+                used += len(header) + 1
+                header_added = True
+            lines.append(line)
+            used += len(line) + 1
+            note_ids.append(nt.get("id"))
+    meta["note_ids"] = note_ids
 
     # 无有效记忆分组也无笔记时返回空
     if not groups and not notes:
-        return ""
+        return _ret("")
 
-    # 预算控制（知识压缩：超限优先用周期摘要替代低层记忆，避免逐条原文撑爆上下文）
-    MAX_INJECT_CHARS = 1500  # 约 1000 tokens
+    meta["truncated"] = truncated
     text = "\n".join(lines)
-    if len(text) > MAX_INJECT_CHARS:
+
+    # 周期摘要替代低层记忆（知识压缩）：**仅在 importance 模式**（无 query，无语境可言）
+    # 或「一条都没装下」（避免注入只有标题的空壳）时启用；
+    # **query 模式一律保留召回条目** —— 这正是 D-A 要修的场景。
+    _need_summary = truncated and (not current_query or (not rendered_mems and not note_ids))
+    if _need_summary:
         try:
             from .database import psum_list
             summary_lines = []
@@ -274,11 +360,19 @@ def build_memory_injection(current_query: str = "") -> str:
             if summary_lines:
                 text = ("## 记忆库（关于用户）\n（已压缩为周期摘要，细节可在对话中按需追问）\n"
                         + "\n".join(summary_lines))
+                # 2026-10-09（独立复核修正）：正文被**整体替换**为周期摘要 → 上面记下的
+                # memory_ids / note_ids / groups **并未进入 prompt**，必须清空。
+                # 否则 mem_recall 痕迹会把「其实没在场」的记忆记成「已注入」，
+                # 与该 meta 自述的"实际渲染进 prompt"直接矛盾。
+                meta["replaced_by_summary"] = True
+                meta["memory_ids"] = []
+                meta["note_ids"] = []
+                meta["groups"] = {}
             else:
                 text = text[:MAX_INJECT_CHARS] + "\n…（记忆注入超出预算，已截断）"
         except Exception:
             text = text[:MAX_INJECT_CHARS] + "\n…（记忆注入超出预算，已截断）"
-    return text
+    return _ret(text)
 
 
 def reset_counter(conv_id: str = ""):
@@ -731,12 +825,18 @@ def _maybe_refresh_gram_cache():
     _build_gram_cache()
 
 
-def search_related_items(query: str, limit: int = 15, include_notes: bool = True):
+def search_related_items(query: str, limit: int = 15, include_notes: bool = True,
+                         return_scores: bool = False):
     """语义联想召回：记忆（全量字符 n-gram 重叠打分）+ 笔记（TF-IDF 余弦）。
 
     返回 (memories: list[dict], notes: list[dict])，均已按相关性降序。
     记忆召回覆盖「字符重叠/子序列相关」（如「跑步」↔「每周跑步三次」），
     比 mem_search 的精确子串 LIKE 更宽，实现「联想」；笔记用 _semantic_similarity 打分。
+
+    `return_scores=True` 时改为返回 `([(score, mem), ...], notes)` —— 供
+    `build_memory_injection` 做「**全局按相关度**装填预算」用（2026-10-09）：
+    先按 type 分组再装填，会让前排分组的低分条目挤掉后排分组的高分条目。
+    默认 `False`，既有调用方的契约与返回结构**完全不变**。
     """
     _maybe_refresh_idf()
     _maybe_refresh_gram_cache()
@@ -746,7 +846,7 @@ def search_related_items(query: str, limit: int = 15, include_notes: bool = True
         q_grams |= _ngrams(query, n)
 
     memories: list[dict] = []
-    scored = []
+    scored: list[tuple[float, dict]] = []
     if q_grams:
         for item in _gram_cache:
             s = _score_query_overlap(q_grams, item["grams"])
@@ -758,6 +858,10 @@ def search_related_items(query: str, limit: int = 15, include_notes: bool = True
     # 联想无强命中（top 分数 < 1.0，即不足一个默认 IDF 权重的 gram 重叠）时，按重要度兜底
     if not memories or (scored and scored[0][0] < 1.0):
         memories = mem_for_inject(limit=limit)
+        # 兜底路径无语境分数 → 用 importance 作伪分数，保持「降序」语义一致
+        scored = [(float(m.get("importance") or 0), m) for m in memories]
+    else:
+        scored = scored[:limit]
 
     notes: list[dict] = []
     if include_notes and q_grams:
@@ -773,7 +877,78 @@ def search_related_items(query: str, limit: int = 15, include_notes: bool = True
             logger.warning("笔记联想召回失败: %s", e)
 
     # 注：引用回写不在此处 —— build_memory_injection 会在实际渲染进 prompt 后统一回写。
+    if return_scores:
+        return scored, notes
     return memories, notes
+
+
+def recall_by_association(query: str, limit: int = 10, min_hits_3gram: int = 2) -> list[dict]:
+    """口语/换词场景的联想召回 —— **只返回实质相关项，不做高重要度兜底**。
+
+    与 `search_related_items` 的差别在「无强命中时怎么办」：
+      - 后者的兜底是「联想不给力就按重要度补一批」，服务于**注入**场景（宁滥勿缺）；
+      - 本函数服务于**检索**场景（用户/模型明确在找某条信息），兜底会把不相干的
+        记忆当作「找回来的结果」返回 —— 那是噪音，会污染模型判断。故宁可返回空。
+
+    🔴 判据（2026-10-09 生产库实测标定）：**必须有实质短语命中** ——
+    至少一个 4-gram，或 ≥ 2 个 3-gram。**刻意不用总分阈值**。
+
+    标定依据（生产库 2189 条；8 正 + 8 负样本）：
+      纯噪声串「zzz_绝不存在的词_qqq」在**总分**上拿到 **20.70**，高于部分真查询
+      （真样本 top1 区间 12.14~97.90，负样本 7.08~**42.86** → **完全重叠**）。
+      根因：`_score_query_overlap` 对重叠 gram 的 IDF 权重**求和且不按长度归一化**
+      → 长记忆与任何查询都能重叠更多 gram → 分数主要反映记忆长度而非相关性。
+      ⇒ 与 `A1-记忆向量召回` 复核（向量侧）同一结论：**绝对分数阈值不可用**。
+      换用「最长命中短语」后：正样本 3/4 通过、**负样本 0/6 通过**（完全分离）。
+      ⚠️ 样本量小（8+8），阈值待 A1 标定集扩充后复校。
+
+    已知边界（2026-10-09 独立复核确认，**有意接受**）：
+      1. 「无短语重合但含实词」的追问会漏 —— 例「我是不是说过黄金怎么操作」：
+         整句词法 0 命中、本函数亦 0（库内无「黄金怎么操作」这种短语），
+         尽管库里有 53 条含「黄金」的记忆。
+         ⚠️ 这类查询**不能**靠"反正词法通道会兜住"来辩解 ——
+         `_handle_search_memory` 拿到的是**整句**，不会自动拆出「黄金」。
+         真正的解法是 `A1-记忆向量召回`（向量对「黄金怎么操作」↔
+         「黄金交易只看 6 个指标」有高相似度，不依赖字面短语）。
+      2. 查询长度 ≤4 字符时判据几乎不成立（3 字查询只有 1 个 3-gram，永远到不了
+         `o3>=2`）→ 3 字母缩写（MT5/DXY/OIL）若词法空手，本函数也返回空；
+         这类查询本就该走词法（`MT5` 词法命中 11 条）。
+      3. 大小写敏感：gram 不做小写归一（与 `_build_gram_cache` 共用缓存，
+         归一化会改变 `search_related_items` 的行为）→「mt5指标」不命中、「MT5指标」命中。
+      4. 只取 content、不含 keywords（与既有 gram 缓存一致）→ 仅 keywords 含该短语的
+         记忆在本函数不可见（`mem_search` 的 keywords LIKE 通道可覆盖）。
+    边界 2/3/4 均为**故意不动**：改共用缓存会波及 `search_related_items` 与注入排序，
+    必须另行标定；边界 1 由 A1 覆盖。
+    """
+    if not query or not query.strip():
+        return []
+
+    def _ngrams_n(text: str, n: int) -> set:
+        return set(text[i:i + n] for i in range(len(text) - n + 1))
+
+    q2 = _ngrams_n(query, 2)
+    q3 = _ngrams_n(query, 3)
+    q4 = _ngrams_n(query, 4)
+    if not q3:
+        return []  # 查询短于 3 字符，无法做短语判据
+
+    _maybe_refresh_idf()
+    _maybe_refresh_gram_cache()
+
+    scored = []
+    for item in _gram_cache:
+        m = item["grams"]
+        o4 = len(q4 & m)
+        o3 = len(q3 & m)
+        if o4 < 1 and o3 < min_hits_3gram:
+            continue
+        o2 = len(q2 & m)
+        scored.append((o4, o3, o2, _score_query_overlap(q2 | q3 | q4, m), item["mem"]))
+    if not scored:
+        return []
+    # 排序：短语越长越优先 → 同级命中越多越优先 → 2-gram → IDF 总分
+    scored.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3]))
+    return [m for *_, m in scored[:limit]]
 
 
 def mem_touch(memory_id: int):
@@ -880,24 +1055,54 @@ def mem_consolidate():
     #   新判据：**必须先有 last_touched_at（确实被引用过），才谈得上「很久没被引用」**。
     #   从未被引用的记忆不衰减 —— 它们缺的是引用信号，不是「过时」，不该被惩罚。
     #   user_edited=1 的豁免下推到 SQL，不再依赖 Python 侧 continue。
+    #
+    # 2026-10-17 审计 A4-R1 修复（速率，不是判据）：
+    #   上面 B3 修好了「谁该被砍」，但没修「多久砍一次」——本函数由 scheduler
+    #   每 6 小时调用一次，而衰减**不回写 last_touched_at**，所以同一批记忆
+    #   每 6 小时都会被重新命中：importance=5 在 24 小时内被砍到 1。
+    #   现加窗口守卫：整个 DECAY_DAYS 周期最多跑一次（上次执行日期存 settings）。
+    #   注意这是**改动最少**的止血；更彻底的做法是给每条记忆记 last_decay_at
+    #   （按条计算过期窗口），但那是加列迁移，不在本次范围。
     cutoff = (datetime.now() - timedelta(days=DECAY_DAYS)).strftime("%Y-%m-%d")
-    with db() as c:
-        rows = c.execute(
-            "SELECT id FROM memories "
-            "WHERE importance > 1 "
-            "  AND COALESCE(archived, 0) = 0 "
-            "  AND COALESCE(user_edited, 0) = 0 "
-            "  AND COALESCE(last_touched_at, '') <> '' "
-            "  AND last_touched_at < ?",
-            (cutoff,)
-        ).fetchall()
-        decayed = 0
-        for r in rows:
-            c.execute(
-                "UPDATE memories SET importance = importance - 1 WHERE id = ?",
-                (r["id"],)
-            )
-            decayed += 1
+
+    decay_due = True
+    last_decay_run = None
+    try:
+        last_decay_run = settings_get(_DECAY_LAST_RUN_KEY)
+    except Exception as exc:  # 读不到就当作该跑（不能因为 kv 表问题停掉整个 consolidate）
+        logger.warning("读取衰减上次执行日期失败，本次照常执行：%s", exc)
+    if last_decay_run:
+        try:
+            elapsed = (datetime.now().date() - datetime.strptime(str(last_decay_run)[:10], "%Y-%m-%d").date()).days
+            decay_due = elapsed >= DECAY_DAYS
+        except (ValueError, TypeError):
+            decay_due = True
+
+    decayed = 0
+    if decay_due:
+        with db() as c:
+            rows = c.execute(
+                "SELECT id FROM memories "
+                "WHERE importance > 1 "
+                "  AND COALESCE(archived, 0) = 0 "
+                "  AND COALESCE(user_edited, 0) = 0 "
+                "  AND COALESCE(last_touched_at, '') <> '' "
+                "  AND last_touched_at < ?",
+                (cutoff,)
+            ).fetchall()
+            for r in rows:
+                c.execute(
+                    "UPDATE memories SET importance = importance - 1 WHERE id = ?",
+                    (r["id"],)
+                )
+                decayed += 1
+        # 只有真的跑过一轮才记日期（否则空跑一次也会把窗口重置 30 天）
+        try:
+            settings_put(_DECAY_LAST_RUN_KEY, datetime.now().strftime("%Y-%m-%d"))
+        except Exception as exc:
+            logger.warning("写入衰减执行日期失败：%s", exc)
+    else:
+        logger.info("记忆衰减跳过：上次执行于 %s，不足 %d 天", last_decay_run, DECAY_DAYS)
 
     # 定期更新 IDF 权重（低频操作）
     if merged > 0:

@@ -474,6 +474,21 @@ interface CacheStats {
   by_kind: { kind: string; calls: number; hit: number; prompt: number }[]
 }
 
+/** 单个 RAG 集合的统计（后端 GET /api/knowledge/collections） */
+interface KnowledgeCollection {
+  collection: string
+  chunks: number
+  docs: number
+}
+
+/** 集合列表 + 默认集合 + 本地入库能力（后端 GET /api/knowledge/collections） */
+interface KnowledgeCollections {
+  collections: KnowledgeCollection[]
+  default: string
+  local_ingest_enabled: boolean
+  ingest_roots: string[]
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, {
     headers: { 'Content-Type': 'application/json' },
@@ -547,10 +562,13 @@ export const api = {
   clearAllConversationBackgrounds: () =>
     request<{ success: boolean; cleared: number }>('/conversations/backgrounds', { method: 'DELETE' }),
   // 学习对话工厂 — 从笔记/记忆/文档一键创建学习对话
-  startLearning: (sourceType: 'note' | 'memory' | 'document', sourceId: number) =>
+  // collection 仅对 document 源生效：指定文档所属的 RAG 集合。
+  startLearning: (sourceType: 'note' | 'memory' | 'document', sourceId: number, collection?: string) =>
     request<{ success: boolean; conversation_id: string; title: string }>('/learning/start', {
       method: 'POST',
-      body: JSON.stringify({ source_type: sourceType, source_id: sourceId }),
+      body: JSON.stringify(collection
+        ? { source_type: sourceType, source_id: sourceId, collection }
+        : { source_type: sourceType, source_id: sourceId }),
     }),
 
   // Chat (SSE via POST fetch)
@@ -859,15 +877,46 @@ export const api = {
 
   // ── Transform API ── 记忆/笔记/行程互转
   transform: (sourceType: string, sourceId: number, targetType: string) =>
-    request<{ success: boolean; source_type: string; source_id: number; target_type: string; created_id: number; created_item: any; preview: any }>(
+    request<{ success: boolean; source_type: string; target_type: string; id: number; item: any }>(
       '/transform', { method: 'POST', body: JSON.stringify({ source_type: sourceType, source_id: sourceId, target_type: targetType }) }
     ),
 
   // ── Knowledge API ── 转发到外部 api_gateway
+  // 多集合改造：所有读取/检索/入库接口支持 collection 参数（省略则后端用默认集合）。
   knowledgeHealth: () => request<{ status: string; service?: string; version?: string }>('/knowledge/health'),
-  knowledgeListDocs: () => request<{ docs: Array<{ item_id: number; title: string; chunks: number; source?: string }> }>('/knowledge/documents'),
-  knowledgeSearch: (question: string, top_k = 5) =>
-    request<{ answer?: string; error?: string }>('/knowledge/search', { method: 'POST', body: JSON.stringify({ question, top_k }) }),
+
+  // 集合清单（后端 GET /api/knowledge/collections）：含每个集合的 chunks/docs 统计 + 默认集合名
+  listCollections: () => request<KnowledgeCollections>('/knowledge/collections'),
+  // 归档非默认集合（后端会改名保留）；默认集合返回 400 {"code":"PROTECTED"}
+  archiveCollection: async (name: string) => {
+    const res = await fetch(BASE + `/knowledge/collections/${encodeURIComponent(name)}/archive`, { method: 'POST' })
+    const text = await res.text()
+    let json: any
+    try {
+      json = text ? JSON.parse(text) : {}
+    } catch {
+      throw new Error(`归档失败：服务返回非 JSON 响应 (${res.status})`)
+    }
+    if (!res.ok) {
+      const msg = json.error
+        || (json.code === 'PROTECTED' ? '默认集合受保护，无法归档' : (json.detail || json.code || `归档失败 (${res.status})`))
+      throw new Error(msg)
+    }
+    return json as { success?: boolean; archived?: string; [k: string]: any }
+  },
+
+  knowledgeListDocs: (collection?: string) =>
+    request<{ docs: Array<{ item_id: number; title: string; chunks: number; source?: string }> }>(
+      `/knowledge/documents${collection ? `?collection=${encodeURIComponent(collection)}` : ''}`),
+  // 逐段阅读：取某文档在指定集合下的所有 chunk
+  knowledgeChunks: (itemId: number, collection?: string) =>
+    request<{ chunks: any[] }>(
+      `/knowledge/documents/${itemId}/chunks${collection ? `?collection=${encodeURIComponent(collection)}` : ''}`),
+  knowledgeSearch: (question: string, top_k = 5, collection?: string) =>
+    request<{ answer?: string; error?: string }>('/knowledge/search', {
+      method: 'POST',
+      body: JSON.stringify(collection ? { question, top_k, collection } : { question, top_k }),
+    }),
   knowledgeWiki: (question: string) =>
     request<{ answer?: string; error?: string }>('/knowledge/wiki', { method: 'POST', body: JSON.stringify({ question }) }),
   knowledgeCreateTask: (type: string, payload: Record<string, any>) =>
@@ -876,10 +925,10 @@ export const api = {
     request<Record<string, any>>(`/knowledge/tasks/${id}`),
   knowledgeListTasks: (status?: string, limit = 20) =>
     request<{ tasks: any[] }>(`/knowledge/tasks${status ? `?status=${status}&limit=${limit}` : `?limit=${limit}`}`),
-  knowledgeIngest: async (file: File) => {
+  knowledgeIngest: async (file: File, collection?: string) => {
     const fd = new FormData()
     fd.append('file', file)
-    const res = await fetch(BASE + '/knowledge/ingest', { method: 'POST', body: fd })
+    const res = await fetch(BASE + '/knowledge/ingest' + (collection ? `?collection=${encodeURIComponent(collection)}` : ''), { method: 'POST', body: fd })
     const text = await res.text()
     let json: any
     try {
@@ -894,7 +943,7 @@ export const api = {
   },
 }
 
-export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, PeriodicSummary, Skill, SkillSuggestion, ModuleSkill, McpServer, McpHealthResult, McpHealthSnapshot, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats, CacheStats }
+export type { Conversation, Message, Schedule, Note, Memory, Proposal, Settings, AnalysisDocument, CreatedSchedule, CalendarData, CalendarDay, MarketIndicator, CFTCPosition, MarketReport, MarketPrediction, HitRateResult, ConversationSummary, Goal, GoalStats, CalendarTemplate, CalendarWeek, CalendarMonth, DistillResult, DistillFile, PeriodicSummary, Skill, SkillSuggestion, ModuleSkill, McpServer, McpHealthResult, McpHealthSnapshot, ImportSkillResult, ImportMcpResult, SkillFileEntry, ModulesStats, CacheStats, KnowledgeCollection, KnowledgeCollections }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    已归档：市场分析域（2026-09-16）

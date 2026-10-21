@@ -1,7 +1,9 @@
 import sqlite3
 import os
+from pathlib import Path
 
-DB = r"D:\下载文件\新建文件夹\zenith-v2\data\zenith.db"
+# 2026-10-21 开源分发：改用相对本文件推导，不再硬编码本机绝对路径
+DB = str(Path(__file__).resolve().parents[2] / "data" / "zenith.db")
 print(f"DB: {DB}")
 print(f"文件大小: {os.path.getsize(DB)/1024/1024:.2f} MB\n")
 

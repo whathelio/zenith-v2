@@ -31,11 +31,10 @@ import argparse
 import json
 import os
 import sqlite3
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, List, Protocol, Tuple
+from typing import List, Protocol, Tuple
 
 # ------------------------------------------------------------------
 # CONFIG（可用环境变量覆盖）
@@ -638,7 +637,6 @@ def ingest_pdf(pdf_path: str | Path, title: str | None = None) -> dict:
 
     store = get_store()
     embedder = get_embedder()
-    import time as _t
     item_id = abs(hash(p.name + str(p.stat().st_mtime))) % 1000000
     title = title or p.stem
     ids = [f"{item_id}_{i}" for i in range(len(chunks))]

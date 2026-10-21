@@ -1,7 +1,9 @@
 import os
 import re
+from pathlib import Path
 
-BE = r"D:\下载文件\新建文件夹\zenith-v2\backend"
+# 2026-10-21 开源分发：改用相对本文件推导
+BE = os.path.join(str(Path(__file__).resolve().parents[2]), "backend")
 routers = []
 for base, dirs, fs in os.walk(BE):
     if "_archived" in base:

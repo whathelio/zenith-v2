@@ -1024,6 +1024,24 @@ def msg_del_one(msg_id: int) -> int:
         return cur.rowcount
 
 
+def msg_del_after(conv_id: str, msg_id: int) -> int:
+    """删除指定会话内 id > msg_id 的所有消息（编辑重发时截断其后历史）。
+
+    与 msg_del_from 的区别：删除范围**只由显式 conversation_id 决定**，不依赖
+    「传入的 id 属于哪个会话」。历史缺陷（P0-1 残留）：`/chat/edit` 曾调用
+    `msg_del_from(msg_id + 1)` —— 当 `msg_id + 1` 恰好属于**另一个会话**时
+    （messages.id 全局自增、跨会话连续），会误删该会话的消息（实测跨会话丢数据）。
+    """
+    with db() as c:
+        cur = c.execute(
+            "DELETE FROM messages WHERE conversation_id = ? AND id > ?",
+            (conv_id, msg_id),
+        )
+        if cur.rowcount:
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conv_id))
+        return cur.rowcount
+
+
 def msg_archive(cid: str, msg_ids: list[int]) -> int:
     """归档消息（压缩后保留原文，避免破坏 regenerate/edit 语义）。返回归档数量。"""
     ids = [int(i) for i in msg_ids if int(i) > 0]

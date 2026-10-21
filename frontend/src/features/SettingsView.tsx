@@ -60,6 +60,8 @@ export default function SettingsView() {
   const bgInputRef = useRef<HTMLInputElement>(null)
   const [convBgCount, setConvBgCount] = useState(0)     // 设了独立背景的对话数
   const [notice, setNotice] = useState('')              // 操作结果提示（非错误）
+  // 加载时 GET 到的 providers 原始快照（含掩码 api_key），供提交前回填被清空的 key
+  const initialProvidersRef = useRef<Settings['providers']>([])
 
   useEffect(() => { loadSettings() }, [])
 
@@ -68,6 +70,8 @@ export default function SettingsView() {
       const s = await api.getSettings()
       const merged = { ...defaultSettings, ...s }
       setSettings(merged)
+      // 保留一份未受用户编辑影响的原始 providers（含掩码串），保存时用于回填被清空的 key
+      initialProvidersRef.current = JSON.parse(JSON.stringify(s.providers || []))
       // 全局背景预览
       setBgPreview((s as any).background_image ? `/api/settings/background-image?t=${Date.now()}` : '')
       // key 输入框初始为空（后端返回掩码），让用户自己填
@@ -105,7 +109,23 @@ export default function SettingsView() {
       if (apiKeyInput.trim()) {
         toSave.api_key = apiKeyInput.trim()
       }
-      await api.updateSettings(toSave)
+      // 审计 0-2：providers[].api_key 被清空时不能提交空串——后端只还原「掩码格式」，
+      // 空串会被当成新值把真实密钥覆盖掉。这里回填加载时 GET 到的原始值（通常是掩码串，
+      // 后端 restore_masked_fields 会还原成真值）；无原始值（新增 provider / 原本未配置）
+      // 则整个字段省略，而不是发空串。对齐规则与后端一致：只认同名，对不上就当新条目。
+      toSave.providers = (settings.providers || []).map(p => {
+        if (p.api_key && p.api_key.trim()) return p
+        const originals = initialProvidersRef.current
+        const original = originals.find(o => o.name === p.name)
+        const rest: Record<string, any> = { ...p }
+        delete rest.api_key
+        return (original?.api_key ? { ...rest, api_key: original.api_key } : rest) as Settings['providers'][number]
+      })
+      const res = await api.updateSettings(toSave)
+      if (!res || res.success !== true) {
+        setError('保存未生效：服务端未确认成功')
+        return
+      }
       setSaved(true)
       setApiKeyInput('')  // 清空输入框
       setTimeout(() => setSaved(false), 3000)
@@ -449,7 +469,7 @@ export default function SettingsView() {
                   </select>
                 </div>
                 <div className="form-group">
-                  <label className="form-label">后台 Provider（蒸馏/记��提取）</label>
+                  <label className="form-label">后台 Provider（蒸馏/记忆提取）</label>
                   <select className="form-input" value={settings.background_provider}
                     onChange={e => update('background_provider', e.target.value)}>
                     <option value="">自动（同默认）</option>

@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import database as db
-from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news, cache, summaries, academic, processes, market, mt5
+from .routers import memories, notes, goals, schedules, distill, knowledge, settings, chat, audit, modules, news, cache, summaries, academic, processes, market, mt5, trade, browser
 from .database import conv_update_summary
 from .config import load_config, save_config, ensure_dirs, DEFAULT_CONFIG, is_code_execution_enabled
 from .validators.sanitize_guard import GUIDE_SHIELD, refusal_text
@@ -210,8 +210,12 @@ _MAX_BG_LEN = 2000  # 背景截断上限（中文约 1.5k tokens）
 @app.post("/api/learning/start")
 async def start_learning(data: dict = Body(default=None)):
     """从笔记/记忆/文档创建学习对话。
-    入参: {source_type: "note"|"memory"|"document", source_id: int}
+    入参: {source_type: "note"|"memory"|"document", source_id: int, collection?: str}
     流程: 读内容 → 截断 → 按类型生成苏格拉底引导背景 → 建对话 → 返回 conv_id
+
+    collection 仅对 source_type="document" 有意义（2026-10-08 多集合回归修复 #2）：
+    item_id 是「按文件名稳定哈希」得出的，**同一文件在不同集合里 id 相同**，
+    不传 collection 时 get_doc_chunks 会落到默认集合，可能取到另一个集合的同名段落。
     """
     if not data:
         raise HTTPException(400, "缺少参数")
@@ -240,7 +244,7 @@ async def start_learning(data: dict = Body(default=None)):
     else:  # document — 知识库文档（整本逐段学习）
         try:
             from .knowledge_service import get_doc_chunks
-            doc = await get_doc_chunks(int(source_id))
+            doc = await get_doc_chunks(int(source_id), (data or {}).get("collection") or None)
         except Exception as e:
             raise HTTPException(503, f"知识库服务不可用: {e}")
         if doc.get("error") or not doc.get("chunks"):
@@ -1316,6 +1320,8 @@ app.include_router(academic.router)
 app.include_router(processes.router)
 app.include_router(market.router)
 app.include_router(mt5.router)
+app.include_router(trade.router)
+app.include_router(browser.router)
 
 
 @app.get("/{full_path:path}")

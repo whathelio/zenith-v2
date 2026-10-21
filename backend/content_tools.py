@@ -60,7 +60,9 @@ def _is_video_url(url: str) -> bool:
 def _is_bilibili_url(url: str) -> bool:
     """判断是否为 B站视频页面（需要走 API 而非静态抓取）"""
     host = urlparse(url).hostname or ""
-    return "bilibili.com" in host
+    # 精确匹配 bilibili.com 及其子域；避免 "bilibili.com" 子串误命中
+    # （如 notbilibili.com / bilibili.com.evil.com）。
+    return host == "bilibili.com" or host.endswith(".bilibili.com")
 
 
 def _extract_bvid(url: str) -> str:
@@ -135,7 +137,9 @@ async def _fetch_bilibili_subtitles(bvid: str, cid: int = 0) -> str:
     if not subtitle_list:
         return ""
 
-    # 优先中文 → 其他语言兜底
+    # 优先中文；无中文时循环自然结束后 sub_url 落在「最后一个」条目的 URL 上兜底。
+    # 注意：下方 `if not sub_url: subtitle_list[0]` 仅在最后一条 URL 为空时才会生效，
+    # 因此实际非中文兜底取的是末尾条目而非首个（行为无隐患，仅与旧注释语序不符）。
     sub_url = ""
     for sub in subtitle_list:
         sub_url = sub.get("subtitle_url", "")
@@ -249,7 +253,8 @@ def _get_wav_duration(wav_path: str) -> float:
         )
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", r.stderr)
         if m:
-            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 10
+            # FFmpeg 的 Duration 小数为百分秒（2 位），故 /100；此前 /10 会放大 10 倍。
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 100
     except Exception:
         pass
     return 0.0

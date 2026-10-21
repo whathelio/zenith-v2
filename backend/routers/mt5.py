@@ -100,17 +100,34 @@ def mt5_account():
 
 
 @router.get("/history/deals")
-def mt5_history_deals(days: int = 7, limit: int = 200):
-    """历史成交记录（deals — 实际成交，含盈亏 / 手续费 / 库存费）"""
+def mt5_history_deals(days: int = 7, limit: int = 200,
+                      date_from: str = "", date_to: str = ""):
+    """历史成交记录（deals — 实际成交，含盈亏 / 手续费 / 库存费 / 平仓原因）
+
+    两种用法：
+    - 相对：`?days=30`
+    - 绝对：`?date_from=2025-01-01&date_to=2025-12-31`（可跨出 365 天上限）
+    """
     from ..mt5_service import get_trade_history
-    return get_trade_history(days, limit)
+    return get_trade_history(days, limit, date_from or None, date_to or None)
 
 
 @router.get("/history/orders")
-def mt5_history_orders(days: int = 7, limit: int = 200):
+def mt5_history_orders(days: int = 7, limit: int = 200,
+                       date_from: str = "", date_to: str = ""):
     """历史订单（orders — 委托指令，区别于 deals 成交）"""
     from ..mt5_service import get_order_history
-    return get_order_history(days, limit)
+    return get_order_history(days, limit, date_from or None, date_to or None)
+
+
+@router.get("/history/span")
+def mt5_history_span():
+    """探测该账户在 MT5 终端里可读的历史范围（最早/最晚 deal）
+
+    先查这个再决定查询区间，避免用不同 days 反复试探。
+    """
+    from ..mt5_service import get_history_span
+    return get_history_span()
 
 
 @router.get("/pending-orders")

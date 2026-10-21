@@ -51,12 +51,38 @@ jobs:
             Copy-Item config/config.yaml.example config/config.yaml
           }
 
-      # ⚠️ --exit-zero：存量代码有 15 处未清的 lint 错误（12 F401 未用 import /
-      #    2 F541 空 f-string / 1 F841 未用变量）。先只报告不阻塞，
-      #    待清理后**删掉 --exit-zero**即可变成硬门禁。
-      #    （另有 F841 类错误无法自动修，需人工处理。）
-      - name: Lint（暂不阻塞）
-        run: ruff check . --exit-zero
+      # 硬门禁：2026-10-14 存量 lint 已全部清零（22 处：F401/F541/F841），
+      # 删除 --exit-zero → 任何新增 lint 违规都会直接让 CI 失败。
+      - name: Lint
+        run: ruff check .
 
       - name: 测试与覆盖率
         run: pytest tests/ -q --timeout=120 --cov=backend --cov-report=term
+
+  # 2026-10-17 新增（审计 0.5 / B4-R3）：此前 CI **只检查后端**，前端零门禁。
+  # 后果见审计 0-1：`api.ts` 声明了 4 个后端从不返回的字段，tsc 全程放行，
+  # 直到用户点一次「⇄ 转化为」才整站白屏。前端类型检查必须是硬门禁。
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 用 `npm install` 而不是 `npm ci`：package-lock.json 里有一条幽灵依赖
+      # （lucide-react，见审计 B4-S8），`npm ci` 会因 lock 与 package.json 不一致直接失败。
+      # 修好 lock 之后应改回 `npm ci`（更快、可复现）。
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 类型检查（硬门禁）
+        run: npm run typecheck
